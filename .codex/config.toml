@@ -1,0 +1,7 @@
+[workspace]
+name = "yijie-infra"
+stack = "Local Docker Compose"
+
+[rules]
+no_production_secrets = true
+cloud_provider_requires_confirmation = true

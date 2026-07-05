@@ -1,0 +1,52 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: yijie-postgres
+    environment:
+      POSTGRES_USER: yijie
+      POSTGRES_PASSWORD: yijie
+      POSTGRES_DB: yijie_api
+    ports:
+      - "5432:5432"
+    volumes:
+      - yijie_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U yijie -d yijie_api"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: yijie-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - yijie_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  pgvector:
+    image: pgvector/pgvector:pg16
+    container_name: yijie-pgvector
+    environment:
+      POSTGRES_USER: yijie
+      POSTGRES_PASSWORD: yijie
+      POSTGRES_DB: yijie_knowledge
+    ports:
+      - "5433:5432"
+    volumes:
+      - yijie_pgvector_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U yijie -d yijie_knowledge"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  yijie_postgres_data:
+  yijie_redis_data:
+  yijie_pgvector_data:
