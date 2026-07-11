@@ -1,0 +1,18 @@
+{
+  "name": "@yijie/infra",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "pnpm@11.7.0",
+  "engines": {
+    "node": ">=24 <27",
+    "pnpm": ">=11 <12"
+  },
+  "scripts": {
+    "validate": "node scripts/validate-compose.mjs",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "devDependencies": {
+    "yaml": "2.9.0"
+  }
+}

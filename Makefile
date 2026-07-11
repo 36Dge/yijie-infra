@@ -10,6 +10,7 @@ lint:
 	./scripts/plan.sh
 
 test:
+	pnpm test
 	./scripts/plan.sh
 
 plan:
