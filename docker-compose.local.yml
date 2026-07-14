@@ -7,7 +7,7 @@ services:
       POSTGRES_PASSWORD: yijie
       POSTGRES_DB: yijie_api
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - yijie_postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -20,7 +20,7 @@ services:
     image: redis:7-alpine
     container_name: yijie-redis
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - yijie_redis_data:/data
     healthcheck:
@@ -37,11 +37,17 @@ services:
       POSTGRES_PASSWORD: yijie
       POSTGRES_DB: yijie_knowledge
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     volumes:
       - yijie_pgvector_data:/var/lib/postgresql/data
+      - ./init/pgvector/001-enable-vector.sql:/docker-entrypoint-initdb.d/001-enable-vector.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U yijie -d yijie_knowledge"]
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready -U yijie -d yijie_knowledge &&
+          psql -U yijie -d yijie_knowledge -Atc
+          "SELECT 1 FROM pg_extension WHERE extname = 'vector'" | grep -q 1
       interval: 10s
       timeout: 5s
       retries: 5

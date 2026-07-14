@@ -1,10 +1,13 @@
-.PHONY: dev-up dev-down lint test plan apply deploy rollback
+.PHONY: dev-up dev-down dev-status lint test plan apply deploy rollback
 
 dev-up:
-	docker compose -f docker-compose.local.yml up -d
+	docker compose -f docker-compose.local.yml up -d --wait
 
 dev-down:
 	docker compose -f docker-compose.local.yml down
+
+dev-status:
+	docker compose -f docker-compose.local.yml ps
 
 lint:
 	./scripts/plan.sh

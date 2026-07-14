@@ -21,7 +21,20 @@ export function validateCompose(compose) {
   }
   if (serviceNames.length !== required.length) throw new Error("Unexpected services in local Compose file.");
 
-  const hostPorts = serviceNames.flatMap((name) => compose.services[name].ports ?? []).map((port) => String(port).split(":")[0]);
+  const publishedPorts = serviceNames.flatMap((name) => compose.services[name].ports ?? []).map(String);
+  for (const port of publishedPorts) {
+    if (!port.startsWith("127.0.0.1:")) throw new Error("Local service ports must bind to the IPv4 loopback interface.");
+  }
+  const hostPorts = publishedPorts.map((port) => port.split(":").at(-2));
   if (new Set(hostPorts).size !== hostPorts.length) throw new Error("Local service host ports must be unique.");
-  if (!compose.services.pgvector.ports.includes("5433:5432")) throw new Error("pgvector must be exposed on host port 5433.");
+  if (!compose.services.pgvector.ports.includes("127.0.0.1:5433:5432")) {
+    throw new Error("pgvector must be exposed on loopback host port 5433.");
+  }
+  const pgvectorVolumes = compose.services.pgvector.volumes.map(String);
+  if (!pgvectorVolumes.some((volume) => volume.includes("001-enable-vector.sql"))) {
+    throw new Error("pgvector must initialize the vector extension.");
+  }
+  if (!compose.services.pgvector.healthcheck.test.join(" ").includes("pg_extension")) {
+    throw new Error("pgvector healthcheck must verify the vector extension.");
+  }
 }
