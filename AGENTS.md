@@ -73,6 +73,16 @@
 - 观测、告警和 SLO 根据服务目标设计，不因目录存在就假定工具已经选定；
 - 任何云端实现必须同步更新 ADR、环境、安全、部署和回滚文档。
 
+## 服务契约与部署接口
+
+- 每个任务先标记 `contract-impact = none | additive | semantic | breaking`；分类覆盖跨进程、跨仓、跨版本及持久化/重放边界，`none` 必须说明没有可观察变化；
+- 按 `breaking > semantic > additive > none` 的最高风险唯一选择；任一受支持交互可能失效即 breaking，不确定时不能假定 additive/none；
+- HTTP/RPC/event/tool 的业务 wire contract 属于 `yijie-contracts`，Infra 不在 Helm、gateway、mock 或监控配置中发明第二份 schema；
+- 环境变量、端口、probe、service discovery、TLS/IAM 和资源身份是 deployment interface，由服务仓与本仓共同治理，不强制进入 `yijie-contracts`；改变其名称、默认值、可见性、ready 语义或权限也属于跨仓 `semantic/breaking` 影响；
+- topic 的 channel/payload 语义属于 AsyncAPI，partition、retention、IAM 和物理拓扑属于 Infra；
+- 仅当 Infra 变更实际暴露或依赖某项业务 wire contract 时，才要求该契约先形成不可变引用、服务实现固定并验证；其它 deployment interface 按本仓评审。破坏性变化使用并行配置、迁移、观测和清理，禁止多仓硬切；
+- 兄弟元仓存在时同时遵循 `../yijie/docs/dev/contract-first.md`，但不得把服务私有数据库 schema 或第三方原始协议错误复制到中央契约仓。
+
 ## 必须先确认的决策
 
 - 新本地服务、镜像版本、端口、volume、数据库、extension 和资源限制；
@@ -110,6 +120,7 @@ make rollback   # 当前只停止本地 Compose，不是数据回滚
 - 变更保持在已确认环境范围，没有擅自引入云或生产假设；
 - 本地端口、healthcheck、volume、extension 和数据保留语义正确；
 - secret、网络、权限和破坏性操作满足最小权限及显式确认要求；
+- 当 `contract-impact != none` 时，服务/部署权威源、适用的不可变版本、发布顺序、观测和回滚可追踪；`none` 只需分类理由；
 - `make lint`、`make test` 及与改动相关的运行验证通过；
 - 部署、回滚和 readiness 没有被占位脚本或单一退出码夸大；
 - 未配置的云、备份、观测、生产安全和恢复能力被如实说明。
