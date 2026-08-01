@@ -4,3 +4,4 @@
 !.env.example
 *.log
 node_modules/
+environments/nonproduction/feat-125.local.yaml

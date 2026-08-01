@@ -1,0 +1,50 @@
+schema_version: 1
+feature: FEAT-125-authoritative-permission-projection
+environment: nonproduction
+
+data_policy:
+  classification: synthetic_only
+  real_users: false
+  real_tenants: false
+  merchant_data: false
+
+contracts:
+  version: 0.3.0-candidate
+  full_commit: 9ec34abd6e7dfb5a23b0154d467694167224ebbb
+  access_token_audience: https://api.yijie.ai
+
+identity:
+  issuer: https://identity.feat-125.nonprod.example.invalid/
+  authorization_endpoint: https://identity.feat-125.nonprod.example.invalid/oauth2/authorize
+  token_endpoint: https://identity.feat-125.nonprod.example.invalid/oauth2/token
+  jwks_uri: https://identity.feat-125.nonprod.example.invalid/.well-known/jwks.json
+  revocation_endpoint: https://identity.feat-125.nonprod.example.invalid/oauth2/revoke
+  public_client_id: replace-with-nonproduction-public-client-id
+  redirect_uri_template: http://127.0.0.1:{ephemeral-port}/oauth/callback
+  authorization_code_flow: true
+  pkce_method: S256
+  id_token_alg: RS256
+  access_token_alg: RS256
+  access_token_ttl_seconds: 600
+  refresh_rotation: required
+  refresh_reuse_revokes_family: required
+
+api:
+  origin: https://api.feat-125.nonprod.example.invalid/
+  implementation_full_commit: 360a526b679147472e7cc82ca7ac9db9d18a371d
+  permission_projection_enabled: false
+  postgres:
+    major_version: 16
+    migration_version: 2
+    data: synthetic_only
+    bootstrap: synthetic_audited_idempotent_required
+
+desktop:
+  implementation_full_commit: 3798c67d260237928730758c7ec4c1fbe6fcf7d2
+  native_auth_enabled: false
+  permission_consumer_enabled: false
+
+activation:
+  production: false
+  release: false
+  requires_online_preflight: true

@@ -10,6 +10,7 @@
   },
   "scripts": {
     "validate": "node scripts/validate-compose.mjs",
+    "validate:feat-125-template": "node scripts/validate-feat-125-nonprod.mjs --mode template environments/nonproduction/feat-125.template.yaml",
     "test": "node --test tests/*.test.mjs"
   },
   "devDependencies": {
