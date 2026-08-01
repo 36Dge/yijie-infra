@@ -8,13 +8,23 @@
 
 `yijie-infra` 管理易界项目的本地开发依赖，并为未来 IaC、CI/CD、观测和安全配置保留边界。
 
-当前唯一已确认和实现的范围是 local Docker Compose：
+当前已确认和实现的范围是 local Docker Compose：
 
 - `postgres:16-alpine`，绑定 `127.0.0.1:5432`，数据库 `yijie_api`；
 - `redis:7-alpine`，绑定 `127.0.0.1:6379`；
 - `pgvector/pgvector:pg16`，绑定 `127.0.0.1:5433`，数据库 `yijie_knowledge`；
 - 三个命名 volume 用于保存本地数据；
 - pgvector 首次创建新 volume 时通过 init SQL 启用 `vector` extension。
+
+FEAT-125 G3-NP-LOCAL 还批准了一个默认不启动的 `feat-125-local` profile：
+
+- digest-pinned Keycloak 26.7.0、专用 PostgreSQL 16.13 与 Caddy 2.11.4；
+- 只发布 Caddy 的 `127.0.0.1:8443` 与 `127.0.0.1:9443`；
+- issuer 固定为 `https://localhost:8443/realms/yijie-local`，API 宿主机 upstream 固定为 `127.0.0.1:18080`；
+- 只允许固定 synthetic identity，不允许真实用户、真实租户或商家数据；
+- Caddy CA 私钥留在命名 volume，只导出 owner-only、单一 public CA PEM；
+- local API projection 可以开启，但 Desktop consumer、production 与 release 必须保持关闭；
+- macOS Keychain trust、真实 bearer JWT 生命周期、S7/G5 与生产激活不属于本轮 PASS。
 
 当前没有 Terraform、Kubernetes、Helm、云环境、Secret Manager、生产网络、正式观测或发布流水线。`scripts/deploy.sh` 只是提示占位，成功退出不代表发生了部署；`scripts/rollback.sh` 只停止本地 Compose，不是应用或数据回滚。
 
@@ -39,7 +49,11 @@
 - `scripts/apply.sh`：本地 `docker compose up -d`，不等待健康检查；
 - `scripts/rollback.sh`：本地 `docker compose down`，保留 volume；
 - `scripts/deploy.sh`：云部署占位，不是有效部署入口；
-- `environments/`、`deploy/`、`observability/`、`security/`、`ci/`：待方案确认的占位目录。
+- `config/feat-125-local/`：固定 Caddy 与 Keycloak realm 资产；
+- `environments/local/feat-125.local-lab.template.yaml`：可提交的 local-lab 权威模板；
+- `environments/local/generated/` 与 local secrets/config：全部 ignored，不得提交；
+- `docs/feat-125-local-lab.md`：G3-NP-LOCAL 权威执行与证据边界；
+- `deploy/`、`observability/`、`security/`、`ci/`：未在上述 local scope 中实现的占位目录。
 
 数据库表、索引和业务 migration 应分别放在 `yijie-api` 与 `yijie-knowledge`，不要继续追加到 Docker init 脚本。init SQL 在已有命名 volume 上不会重新执行。
 
@@ -54,6 +68,10 @@
 - `docker compose down --volumes`、`docker volume rm`、`docker system prune` 等删除本地数据的命令必须先获得用户明确批准；
 - 修改 init SQL 后，不能通过静默删除 volume 强制生效，应采用应用 migration 或说明需要用户选择的数据重建步骤；
 - Docker volume 数据位于 Docker Desktop 管理空间，不位于 Git 仓库中。
+- FEAT-125 profile 必须显式指定，不得让普通 `make dev-up` 隐式启动 Keycloak/Caddy；
+- FEAT-125 stop/rollback 保留专用 PostgreSQL 与 Caddy volumes，删除这些 volume 仍需单独批准；
+- API 的 local-lab profile 必须只绑定 `127.0.0.1:18080`，Caddy edge 与 direct API 两层都必须对 legacy Tasks 返回 404。
+- FEAT-125 API 状态只允许写入 `127.0.0.1:5432/yijie_api_feat125_local`；不得把 shared `yijie_api`、其它本地数据库或任意远端 DSN 当作 local-lab 证据。
 
 ## Secret 与网络安全
 
@@ -63,6 +81,9 @@
 - 增加出站网络、host mount、Docker socket、privileged、host network 或广泛 capability 前必须做安全评审；
 - 服务账户、IAM、网络分区、TLS、备份、审计和数据保留必须在生产部署前明确；
 - 基础设施日志和观测数据必须执行 token、DSN、PII 和商家数据脱敏。
+- FEAT-125 secrets 必须由本机生成、ignored、owner-only，脚本不得打印 credential；
+- local CA 必须小于等于 64 KiB、只含一个 CA certificate、权限为 `0400` 或 `0600`，禁止 private key、bundle 和 symlink；
+- G3 online 仅通过 Node `NODE_EXTRA_CA_CERTS` 使用该 CA，禁止 insecure TLS；Keychain trust helper 只能在后续单独批准后人工执行。
 
 ## 未来环境与变更原则
 
@@ -104,6 +125,11 @@ make test       # Node 测试和静态/语义 Compose 校验
 make dev-up     # 启动并等待三项本地依赖健康
 make dev-status # 查看容器和健康状态
 make dev-down   # 停止容器但保留数据 volume
+make feat-125-local-template # 静态验证 local-lab 权威模板与资产
+make feat-125-local-up       # 显式启动并等待 FEAT-125 三项服务健康
+make feat-125-local-stop     # 仅停止 FEAT-125 profile，保留 volume
+make feat-125-local-status   # 查看 FEAT-125 profile 状态
+make feat-125-local-api-db   # 幂等创建/核验专用 synthetic API 逻辑数据库
 make plan       # 当前仅为本地 Compose plan
 make apply      # 当前仅启动本地 Compose且不等待健康
 make deploy     # 当前占位，不能视为部署
@@ -111,6 +137,8 @@ make rollback   # 当前只停止本地 Compose，不是数据回滚
 ```
 
 - Compose、init SQL 或脚本改动至少执行 `make lint && make test`；
+- G3-NP-LOCAL PASS 还要求 synthetic bootstrap、offline ready 与 online preflight；模板或 Compose PASS 不等于环境 PASS；
+- dirty API/Desktop candidate 必须记录 base commit 与双采样的 deterministic tree digest，ready 时重新计算并比对，禁止把旧 HEAD 写成本轮完整 SHA；
 - 需要启动验证时执行 `make dev-up` 和 `make dev-status`，测试完成后按任务要求决定是否保留服务；
 - 不为纯文档审核启动、停止或删除用户当前运行的容器；
 - 无 Docker 时静态检查通过必须标记为“未执行 Docker 语义/运行验证”；只有 Docker CLI 但缺少 Compose v2 时命令会失败，应如实报告缺失前置条件。

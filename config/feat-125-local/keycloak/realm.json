@@ -1,0 +1,123 @@
+{
+  "realm": "yijie-local",
+  "displayName": "Yijie FEAT-125 Local Lab",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "registrationEmailAsUsername": false,
+  "rememberMe": false,
+  "verifyEmail": false,
+  "loginWithEmailAllowed": false,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": false,
+  "editUsernameAllowed": false,
+  "bruteForceProtected": true,
+  "permanentLockout": false,
+  "maxFailureWaitSeconds": 900,
+  "minimumQuickLoginWaitSeconds": 60,
+  "waitIncrementSeconds": 60,
+  "quickLoginCheckMilliSeconds": 1000,
+  "maxDeltaTimeSeconds": 43200,
+  "failureFactor": 5,
+  "defaultSignatureAlgorithm": "RS256",
+  "accessTokenLifespan": 600,
+  "accessTokenLifespanForImplicitFlow": 0,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 36000,
+  "revokeRefreshToken": true,
+  "refreshTokenMaxReuse": 0,
+  "clients": [
+    {
+      "clientId": "https://api.yijie.ai",
+      "name": "Yijie API audience",
+      "description": "Bearer-only audience marker for the FEAT-125 contract.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "bearerOnly": true,
+      "publicClient": false,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "fullScopeAllowed": false,
+      "redirectUris": [],
+      "webOrigins": []
+    },
+    {
+      "clientId": "yijie-desktop-feat-125-local",
+      "name": "Yijie Desktop FEAT-125 local native client",
+      "description": "Synthetic-only public native client; no client secret is permitted.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "bearerOnly": false,
+      "publicClient": true,
+      "consentRequired": false,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "frontchannelLogout": false,
+      "fullScopeAllowed": false,
+      "redirectUris": [
+        "http://127.0.0.1/oauth/callback"
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "oauth2.device.authorization.grant.enabled": "false",
+        "oidc.ciba.grant.enabled": "false"
+      },
+      "protocolMappers": [
+        {
+          "name": "yijie-api-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "https://api.yijie.ai",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true",
+            "userinfo.token.claim": "false"
+          }
+        }
+      ],
+      "defaultClientScopes": [
+        "profile",
+        "email",
+        "roles"
+      ],
+      "optionalClientScopes": [
+        "offline_access"
+      ]
+    }
+  ],
+  "users": [
+    {
+      "id": "12500000-0000-4000-8000-000000000001",
+      "username": "feat125-synthetic-user-a",
+      "email": "user-a@feat-125.synthetic.invalid",
+      "enabled": true,
+      "emailVerified": true,
+      "requiredActions": [],
+      "attributes": {
+        "data_classification": [
+          "synthetic_only"
+        ]
+      }
+    },
+    {
+      "id": "12500000-0000-4000-8000-000000000002",
+      "username": "feat125-synthetic-user-b",
+      "email": "user-b@feat-125.synthetic.invalid",
+      "enabled": true,
+      "emailVerified": true,
+      "requiredActions": [],
+      "attributes": {
+        "data_classification": [
+          "synthetic_only"
+        ]
+      }
+    }
+  ]
+}

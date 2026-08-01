@@ -1,0 +1,82 @@
+schema_version: 1
+feature: FEAT-125-authoritative-permission-projection
+environment: local_lab
+
+data_policy:
+  classification: synthetic_only
+  real_users: false
+  real_tenants: false
+  merchant_data: false
+
+contracts:
+  version: 0.3.0-candidate
+  full_commit: 9ec34abd6e7dfb5a23b0154d467694167224ebbb
+  access_token_audience: https://api.yijie.ai
+
+identity:
+  issuer: https://localhost:8443/realms/yijie-local
+  authorization_endpoint: https://localhost:8443/realms/yijie-local/protocol/openid-connect/auth
+  token_endpoint: https://localhost:8443/realms/yijie-local/protocol/openid-connect/token
+  jwks_uri: https://localhost:8443/realms/yijie-local/protocol/openid-connect/certs
+  revocation_endpoint: https://localhost:8443/realms/yijie-local/protocol/openid-connect/revoke
+  public_client_id: yijie-desktop-feat-125-local
+  redirect_uri_template: http://127.0.0.1:{ephemeral-port}/oauth/callback
+  authorization_code_flow: true
+  pkce_method: S256
+  id_token_alg: RS256
+  access_token_alg: RS256
+  access_token_ttl_seconds: 600
+  refresh_rotation: required
+  refresh_reuse_revokes_family: provider_limit_documented
+
+api:
+  origin: https://localhost:9443/
+  service_profile: feat-125-local-lab
+  implementation_evidence:
+    state: committed
+    full_commit: 360a526b679147472e7cc82ca7ac9db9d18a371d
+    base_commit: null
+    candidate_tree_sha256: null
+  health_environment: nonproduction
+  permission_projection_enabled: true
+  postgres:
+    major_version: 16
+    host: 127.0.0.1
+    port: 5432
+    database: yijie_api_feat125_local
+    sslmode: disable
+    migration_version: 2
+    data: synthetic_only
+    bootstrap_profile: feat-125-local-lab
+    bootstrap: synthetic_audited_idempotent_required
+
+desktop:
+  implementation_evidence:
+    state: committed
+    full_commit: 3798c67d260237928730758c7ec4c1fbe6fcf7d2
+    base_commit: null
+    candidate_tree_sha256: null
+  native_auth_enabled: false
+  permission_consumer_enabled: false
+
+tls:
+  ca_certificate_path: environments/local/generated/feat-125-caddy-root.crt
+  ca_certificate_sha256: replace-with-exported-caddy-root-ca-sha256
+  insecure_skip_verify: false
+
+runtime:
+  compose_profile: feat-125-local
+  identity_https_port: 8443
+  api_https_port: 9443
+  api_upstream: http://host.docker.internal:18080
+  api_direct_origin: http://127.0.0.1:18080/
+  legacy_tasks_ingress: edge_404_and_api_handler_absent_required
+  keycloak_image: quay.io/keycloak/keycloak:26.7.0@sha256:0f198be292568439d700cdbfb893e69a6009bb43a94a06a945b1d3d506c76b13
+  keycloak_postgres_image: postgres:16.13-alpine@sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50
+  caddy_image: caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648
+
+activation:
+  local: true
+  production: false
+  release: false
+  requires_online_preflight: true
