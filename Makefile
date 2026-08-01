@@ -1,4 +1,4 @@
-.PHONY: dev-up dev-down dev-status feat-125-nonprod-template feat-125-nonprod-ready feat-125-nonprod-online feat-125-local-template feat-125-local-worktree-reference feat-125-local-init-secrets feat-125-local-up feat-125-local-stop feat-125-local-status feat-125-local-provision-users feat-125-local-api-db feat-125-local-prepare feat-125-local-trust-ca feat-125-local-ca-status feat-125-local-untrust-ca feat-125-local-ready feat-125-local-online lint test plan apply deploy rollback
+.PHONY: dev-up dev-down dev-status feat-125-nonprod-template feat-125-nonprod-ready feat-125-nonprod-online feat-125-local-template feat-125-local-worktree-reference feat-125-local-init-secrets feat-125-local-up feat-125-local-stop feat-125-local-status feat-125-local-provision-users feat-125-local-api-db feat-125-local-prepare feat-125-local-trust-ca feat-125-local-ca-status feat-125-local-untrust-ca feat-125-local-ready feat-125-local-online feat-125-s7-bearer-matrix lint test plan apply deploy rollback
 
 dev-up:
 	docker compose -f docker-compose.local.yml up -d --wait
@@ -85,6 +85,10 @@ feat-125-local-online:
 			--api-repository "$(if $(API_REPO),$(API_REPO),../yijie-api)" \
 			--desktop-repository "$(if $(DESKTOP_REPO),$(DESKTOP_REPO),../yijie-desktop)" \
 			"$(CONFIG)"
+
+feat-125-s7-bearer-matrix:
+	NODE_EXTRA_CA_CERTS="$(CURDIR)/environments/local/generated/feat-125-caddy-root.crt" \
+		node scripts/feat-125-s7-bearer-matrix.mjs
 
 lint:
 	./scripts/plan.sh

@@ -83,6 +83,7 @@
         }
       ],
       "defaultClientScopes": [
+        "basic",
         "profile",
         "email",
         "roles"
@@ -97,6 +98,8 @@
       "id": "12500000-0000-4000-8000-000000000001",
       "username": "feat125-synthetic-user-a",
       "email": "user-a@feat-125.synthetic.invalid",
+      "firstName": "Synthetic",
+      "lastName": "User A",
       "enabled": true,
       "emailVerified": true,
       "requiredActions": [],
@@ -110,6 +113,8 @@
       "id": "12500000-0000-4000-8000-000000000002",
       "username": "feat125-synthetic-user-b",
       "email": "user-b@feat-125.synthetic.invalid",
+      "firstName": "Synthetic",
+      "lastName": "User B",
       "enabled": true,
       "emailVerified": true,
       "requiredActions": [],

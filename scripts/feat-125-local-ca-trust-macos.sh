@@ -15,15 +15,28 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 node "$repo_dir/scripts/validate-feat-125-local-ca-binding.mjs"
 
-keychain="$(security default-keychain -d user | tr -d '"')"
+keychain="$(
+  security default-keychain -d user |
+    sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//'
+)"
+if [[ -z "$keychain" || ! -e "$keychain" ]]; then
+  echo "The macOS user default Keychain path is unavailable" >&2
+  exit 1
+fi
 fingerprint="$(openssl x509 -in "$ca_file" -noout -fingerprint -sha1 | sed 's/^.*=//' | tr -d ':')"
+trust_settings_file="$(mktemp -t feat-125-trust-settings.XXXXXX)"
+trap 'rm -f "$trust_settings_file"' EXIT
 is_installed() {
   security find-certificate -Z -a "$keychain" 2>/dev/null | grep "$fingerprint" >/dev/null
+}
+is_trusted() {
+  security trust-settings-export "$trust_settings_file" >/dev/null 2>&1 &&
+    plutil -extract "trustList.$fingerprint" xml1 -o - "$trust_settings_file" >/dev/null 2>&1
 }
 
 case "$action" in
   status)
-    if is_installed; then
+    if is_installed && is_trusted; then
       echo "FEAT-125 Caddy root CA is trusted in $keychain (SHA-1 $fingerprint)"
     else
       echo "FEAT-125 Caddy root CA is not trusted in $keychain (SHA-1 $fingerprint)"
@@ -31,11 +44,15 @@ case "$action" in
     fi
     ;;
   install)
-    if is_installed; then
+    if is_installed && is_trusted; then
       echo "FEAT-125 Caddy root CA is already trusted (SHA-1 $fingerprint)"
       exit 0
     fi
-    security add-trusted-cert -d -r trustRoot -k "$keychain" "$ca_file"
+    security add-trusted-cert -r trustRoot -k "$keychain" "$ca_file"
+    if ! is_installed || ! is_trusted; then
+      echo "The exact FEAT-125 CA was not installed with user-domain trust settings" >&2
+      exit 1
+    fi
     echo "Trusted only the exported FEAT-125 public root CA (SHA-1 $fingerprint)"
     ;;
   remove)

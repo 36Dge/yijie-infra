@@ -21,13 +21,19 @@ test("local provisioner uses fixed HTTPS identities and revokes its admin refres
   });
 
   assert.deepEqual(result, { provisionedUsers: 2, validatedClients: 2 });
-  assert.equal(requests.length, 13);
+  assert.equal(requests.length, 15);
   assert.deepEqual(
     requests.map(({ url, method }) => [url.origin, url.pathname, method]),
     [
       ["https://localhost:8443", "/realms/master/protocol/openid-connect/token", "POST"],
       ["https://localhost:8443", "/admin/realms/yijie-local", "GET"],
       ["https://localhost:8443", "/admin/realms/yijie-local/clients", "GET"],
+      ["https://localhost:8443", "/admin/realms/yijie-local/client-scopes", "GET"],
+      [
+        "https://localhost:8443",
+        "/admin/realms/yijie-local/client-scopes/basic-scope-id/protocol-mappers/models",
+        "GET",
+      ],
       [
         "https://localhost:8443",
         "/admin/realms/yijie-local/clients/desktop-client-id/protocol-mappers/models",
@@ -104,12 +110,31 @@ test("local provisioner treats exact client scope sets as order-independent", as
   const result = await provisionFeat125LocalUsers({
     secrets: secretValues,
     fetchImpl: successfulFetch(requests, {
-      desktopDefaultScopes: ["roles", "profile", "email"],
+      desktopDefaultScopes: ["roles", "basic", "profile", "email"],
     }),
   });
 
   assert.deepEqual(result, { provisionedUsers: 2, validatedClients: 2 });
   assert.equal(requests.some(({ url }) => url.pathname.endsWith("/reset-password")), true);
+});
+
+test("local provisioner migrates only the exact legacy Desktop scope set missing basic", async () => {
+  const requests = [];
+  const result = await provisionFeat125LocalUsers({
+    secrets: secretValues,
+    fetchImpl: successfulFetch(requests, {
+      desktopDefaultScopes: ["profile", "email", "roles"],
+    }),
+  });
+
+  assert.deepEqual(result, { provisionedUsers: 2, validatedClients: 2 });
+  assert.equal(
+    requests.some(
+      ({ url, method }) =>
+        url.pathname.endsWith("/default-client-scopes/basic-scope-id") && method === "PUT",
+    ),
+    true,
+  );
 });
 
 test("local provisioner migrates only the exact default profile and empty synthetic attributes", async () => {
@@ -119,6 +144,7 @@ test("local provisioner migrates only the exact default profile and empty synthe
     fetchImpl: successfulFetch(requests, {
       defaultUserProfile: true,
       userAttributesMissing: true,
+      userNamesMissing: true,
     }),
   });
 
@@ -134,6 +160,24 @@ test("local provisioner migrates only the exact default profile and empty synthe
       ({ url, method }) =>
         /^\/admin\/realms\/yijie-local\/users\/[^/]+$/.test(url.pathname) &&
         !url.pathname.endsWith("/users/profile") &&
+        method === "PUT",
+    ).length,
+    2,
+  );
+});
+
+test("local provisioner reconciles only the exact legacy-empty synthetic names", async () => {
+  const requests = [];
+  const result = await provisionFeat125LocalUsers({
+    secrets: secretValues,
+    fetchImpl: successfulFetch(requests, { userNamesMissing: true }),
+  });
+
+  assert.deepEqual(result, { provisionedUsers: 2, validatedClients: 2 });
+  assert.equal(
+    requests.filter(
+      ({ url, method }) =>
+        /^\/admin\/realms\/yijie-local\/users\/[^/]+$/.test(url.pathname) &&
         method === "PUT",
     ).length,
     2,
@@ -165,8 +209,10 @@ test("local provisioner rejects reviewed realm client scope and user metadata dr
     ["realm brute-force policy", { realmFailureFactor: 6 }],
     ["client protocol", { desktopProtocol: "saml" }],
     ["client scopes", { desktopDefaultScopes: ["profile", "email"] }],
+    ["client mapper", { desktopMapperDrift: true }],
     ["user required action", { userRequiredActions: ["UPDATE_PASSWORD"] }],
     ["user classification", { userDataClassification: ["internal"] }],
+    ["user name", { userFirstName: "Unexpected" }],
   ]) {
     await t.test(name, async () => {
       const requests = [];
@@ -205,11 +251,14 @@ function successfulFetch(
     wrongFirstUserId = false,
     desktopDirectGrantEnabled = false,
     desktopProtocol = "openid-connect",
-    desktopDefaultScopes = ["profile", "email", "roles"],
+    desktopDefaultScopes = ["basic", "profile", "email", "roles"],
+    desktopMapperDrift = false,
     defaultUserProfile = false,
     profileDrift = false,
     realmFailureFactor = 5,
     userAttributesMissing = false,
+    userNamesMissing = false,
+    userFirstName,
     userRequiredActions = [],
     userDataClassification = ["synthetic_only"],
     revocationStatus = 200,
@@ -217,6 +266,7 @@ function successfulFetch(
   } = {},
 ) {
   let reviewedProfileApplied = !defaultUserProfile;
+  let activeDesktopDefaultScopes = [...desktopDefaultScopes];
   const reconciledUsers = new Set();
   return async (input, init = {}) => {
     const url = new URL(input);
@@ -285,29 +335,40 @@ function successfulFetch(
           desktopClient({
             directAccessGrantsEnabled: desktopDirectGrantEnabled,
             protocol: desktopProtocol,
-            defaultClientScopes: desktopDefaultScopes,
+            defaultClientScopes: activeDesktopDefaultScopes,
           }),
         ]);
       }
       assert.equal(clientId, "https://api.yijie.ai");
       return jsonResponse([apiAudienceClient()]);
     }
-    if (url.pathname.endsWith("/protocol-mappers/models")) {
+    if (url.pathname.endsWith("/client-scopes")) {
       return jsonResponse([
         {
-          name: "yijie-api-audience",
+          id: "basic-scope-id",
+          name: "basic",
           protocol: "openid-connect",
-          protocolMapper: "oidc-audience-mapper",
-          consentRequired: false,
-          config: {
-            "included.client.audience": "https://api.yijie.ai",
-            "id.token.claim": "false",
-            "access.token.claim": "true",
-            "introspection.token.claim": "true",
-            "userinfo.token.claim": "false",
+          attributes: {
+            "include.in.token.scope": "false",
+            "display.on.consent.screen": "false",
           },
         },
       ]);
+    }
+    if (url.pathname.endsWith("/default-client-scopes/basic-scope-id")) {
+      assert.equal(method, "PUT");
+      activeDesktopDefaultScopes = [...activeDesktopDefaultScopes, "basic"];
+      return new Response(null, { status: 204 });
+    }
+    if (url.pathname.endsWith("/protocol-mappers/models")) {
+      if (url.pathname.includes("/client-scopes/basic-scope-id/")) {
+        return jsonResponse(basicClientScopeMappers());
+      }
+      const mappers = desktopTokenMappers();
+      if (desktopMapperDrift) {
+        mappers[0].config["included.client.audience"] = "https://drifted.example.invalid";
+      }
+      return jsonResponse(mappers);
     }
     if (url.pathname.endsWith("/users/profile")) {
       if (method === "PUT") {
@@ -328,6 +389,8 @@ function successfulFetch(
           id: wrongFirstUserId && index === 0 ? "drifted-user-id" : user.id,
           username: user.username,
           email: user.email,
+          firstName: userNamesMissing ? undefined : user.firstName,
+          lastName: userNamesMissing ? undefined : user.lastName,
           enabled: true,
           emailVerified: true,
         })),
@@ -346,6 +409,14 @@ function successfulFetch(
         id: fixedUser.id,
         username: fixedUser.username,
         email: fixedUser.email,
+        firstName:
+          userNamesMissing && !reconciledUsers.has(fixedUser.id)
+            ? undefined
+            : (userFirstName ?? fixedUser.firstName),
+        lastName:
+          userNamesMissing && !reconciledUsers.has(fixedUser.id)
+            ? undefined
+            : fixedUser.lastName,
         enabled: true,
         emailVerified: true,
         requiredActions: userRequiredActions,
@@ -395,6 +466,8 @@ function reviewedSyntheticUser(user) {
     id: user.id,
     username: user.username,
     email: user.email,
+    firstName: user.firstName,
+    lastName: user.lastName,
     enabled: true,
     emailVerified: true,
     requiredActions: [],
@@ -405,7 +478,7 @@ function reviewedSyntheticUser(user) {
 function desktopClient({
   directAccessGrantsEnabled = false,
   protocol = "openid-connect",
-  defaultClientScopes = ["profile", "email", "roles"],
+  defaultClientScopes = ["basic", "profile", "email", "roles"],
 } = {}) {
   return {
     id: "desktop-client-id",
@@ -433,6 +506,54 @@ function desktopClient({
     defaultClientScopes,
     optionalClientScopes: ["offline_access"],
   };
+}
+
+function desktopTokenMappers() {
+  return [
+    {
+      name: "yijie-api-audience",
+      protocol: "openid-connect",
+      protocolMapper: "oidc-audience-mapper",
+      consentRequired: false,
+      config: {
+        "included.client.audience": "https://api.yijie.ai",
+        "id.token.claim": "false",
+        "access.token.claim": "true",
+        "introspection.token.claim": "true",
+        "userinfo.token.claim": "false",
+      },
+    },
+  ];
+}
+
+function basicClientScopeMappers() {
+  return [
+    {
+      name: "auth_time",
+      protocol: "openid-connect",
+      protocolMapper: "oidc-usersessionmodel-note-mapper",
+      consentRequired: false,
+      config: {
+        "user.session.note": "AUTH_TIME",
+        "introspection.token.claim": "true",
+        "userinfo.token.claim": "true",
+        "id.token.claim": "true",
+        "access.token.claim": "true",
+        "claim.name": "auth_time",
+        "jsonType.label": "long",
+      },
+    },
+    {
+      name: "sub",
+      protocol: "openid-connect",
+      protocolMapper: "oidc-sub-mapper",
+      consentRequired: false,
+      config: {
+        "introspection.token.claim": "true",
+        "access.token.claim": "true",
+      },
+    },
+  ];
 }
 
 function apiAudienceClient() {

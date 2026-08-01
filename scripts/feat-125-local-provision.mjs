@@ -18,6 +18,7 @@ const REVOCATION_ENDPOINT = `${IDENTITY_ORIGIN}/realms/master/protocol/openid-co
 const ADMIN_CLIENT_ID = "admin-cli";
 const DESKTOP_CLIENT_ID = "yijie-desktop-feat-125-local";
 const API_AUDIENCE_CLIENT_ID = "https://api.yijie.ai";
+const BASIC_CLIENT_SCOPE = "basic";
 const MAX_JSON_BYTES = 65_536;
 const USER_PROFILE_ENDPOINT = new URL("/admin/realms/yijie-local/users/profile", IDENTITY_ORIGIN);
 
@@ -131,12 +132,16 @@ export const SYNTHETIC_USERS = Object.freeze([
     id: "12500000-0000-4000-8000-000000000001",
     username: "feat125-synthetic-user-a",
     email: "user-a@feat-125.synthetic.invalid",
+    firstName: "Synthetic",
+    lastName: "User A",
     passwordKey: "FEAT125_SYNTHETIC_USER_A_PASSWORD",
   }),
   Object.freeze({
     id: "12500000-0000-4000-8000-000000000002",
     username: "feat125-synthetic-user-b",
     email: "user-b@feat-125.synthetic.invalid",
+    firstName: "Synthetic",
+    lastName: "User B",
     passwordKey: "FEAT125_SYNTHETIC_USER_B_PASSWORD",
   }),
 ]);
@@ -192,9 +197,11 @@ export async function provisionFeat125LocalUsers({ secrets, fetchImpl = globalTh
     }
 
     const desktopClient = await getExactClient(DESKTOP_CLIENT_ID, adminHeaders, fetchImpl);
-    if (!matchesDesktopClient(desktopClient)) {
+    const desktopClientState = classifyDesktopClient(desktopClient);
+    if (desktopClientState === "drifted") {
       throw new Error("live Desktop OIDC client drifted from the reviewed public-client profile");
     }
+    const basicClientScope = await getReviewedBasicClientScope(adminHeaders, fetchImpl);
     const mappers = await getJson(
       new URL(
         `/admin/realms/yijie-local/clients/${encodeURIComponent(desktopClient.id)}/protocol-mappers/models`,
@@ -243,19 +250,40 @@ export async function provisionFeat125LocalUsers({ secrets, fetchImpl = globalTh
         throw new Error("live synthetic user metadata drifted from the reviewed identity");
       }
       const attributeState = syntheticAttributeState(liveUser);
-      if (attributeState === "drifted") {
+      const nameState = syntheticNameState(liveUser, user);
+      if (attributeState === "drifted" || nameState === "drifted") {
         throw new Error("live synthetic user metadata drifted from the reviewed identity");
       }
-      liveUserStates.push({ user, attributeState });
+      liveUserStates.push({ user, attributeState, nameState });
     }
 
-    // Do not mutate even the local realm profile until both the complete
-    // inventory and each fixed synthetic identity have passed read-only
-    // checks. This keeps the known default-to-reviewed migration fail closed.
+    // Do not mutate the local client, realm profile, or users until the complete
+    // client/scope/user inventory has passed its read-only checks.
+    if (desktopClientState === "legacy-missing-basic") {
+      const scopeResponse = await request(
+        new URL(
+          `/admin/realms/yijie-local/clients/${encodeURIComponent(desktopClient.id)}/default-client-scopes/${encodeURIComponent(basicClientScope.id)}`,
+          IDENTITY_ORIGIN,
+        ),
+        { method: "PUT", headers: adminHeaders },
+        "Desktop basic client-scope migration",
+        fetchImpl,
+      );
+      if (scopeResponse.status !== 204) {
+        await scopeResponse.body?.cancel();
+        throw new Error(`Desktop basic client-scope migration returned HTTP ${scopeResponse.status}`);
+      }
+      await scopeResponse.body?.cancel();
+      const migratedDesktopClient = await getExactClient(DESKTOP_CLIENT_ID, adminHeaders, fetchImpl);
+      if (classifyDesktopClient(migratedDesktopClient) !== "ready") {
+        throw new Error("Desktop basic client-scope migration did not reach the reviewed profile");
+      }
+    }
+
     await ensureReviewedUserProfile(adminHeaders, fetchImpl);
 
-    for (const { user, attributeState } of liveUserStates) {
-      if (attributeState !== "legacy-empty") {
+    for (const { user, attributeState, nameState } of liveUserStates) {
+      if (attributeState !== "legacy-empty" && nameState !== "legacy-empty") {
         continue;
       }
       const updateResponse = await request(
@@ -415,6 +443,8 @@ function matchesFixedSyntheticUser(actual, expected) {
       id: actual?.id,
       username: actual?.username,
       email: actual?.email,
+      firstName: actual?.firstName,
+      lastName: actual?.lastName,
       enabled: actual?.enabled,
       emailVerified: actual?.emailVerified,
       requiredActions: actual?.requiredActions,
@@ -424,6 +454,8 @@ function matchesFixedSyntheticUser(actual, expected) {
       id: expected.id,
       username: expected.username,
       email: expected.email,
+      firstName: expected.firstName,
+      lastName: expected.lastName,
       enabled: true,
       emailVerified: true,
       requiredActions: [],
@@ -464,11 +496,22 @@ function syntheticAttributeState(actual) {
   return "drifted";
 }
 
+function syntheticNameState(actual, expected) {
+  if (actual?.firstName === expected.firstName && actual?.lastName === expected.lastName) {
+    return "ready";
+  }
+  const firstNameMissing = actual?.firstName === undefined || actual?.firstName === null || actual?.firstName === "";
+  const lastNameMissing = actual?.lastName === undefined || actual?.lastName === null || actual?.lastName === "";
+  return firstNameMissing && lastNameMissing ? "legacy-empty" : "drifted";
+}
+
 function reviewedSyntheticUser(user) {
   return {
     id: user.id,
     username: user.username,
     email: user.email,
+    firstName: user.firstName,
+    lastName: user.lastName,
     enabled: true,
     emailVerified: true,
     requiredActions: [],
@@ -490,7 +533,17 @@ async function getExactClient(clientId, headers, fetchImpl) {
   return matches[0];
 }
 
-function matchesDesktopClient(client) {
+function classifyDesktopClient(client) {
+  if (matchesDesktopClient(client, ["basic", "email", "profile", "roles"])) {
+    return "ready";
+  }
+  if (matchesDesktopClient(client, ["email", "profile", "roles"])) {
+    return "legacy-missing-basic";
+  }
+  return "drifted";
+}
+
+function matchesDesktopClient(client, defaultClientScopes) {
   return (
     typeof client?.id === "string" &&
     client.id.length > 0 &&
@@ -547,11 +600,100 @@ function matchesDesktopClient(client) {
           "oauth2.device.authorization.grant.enabled": "false",
           "oidc.ciba.grant.enabled": "false",
         },
-        defaultClientScopes: ["email", "profile", "roles"],
+        defaultClientScopes,
         optionalClientScopes: ["offline_access"],
       },
     )
   );
+}
+
+async function getReviewedBasicClientScope(headers, fetchImpl) {
+  const scopes = await getJson(
+    new URL("/admin/realms/yijie-local/client-scopes", IDENTITY_ORIGIN),
+    headers,
+    "live realm client scopes",
+    fetchImpl,
+  );
+  const matches = Array.isArray(scopes)
+    ? scopes.filter((scope) => scope?.name === BASIC_CLIENT_SCOPE)
+    : [];
+  if (
+    matches.length !== 1 ||
+    typeof matches[0]?.id !== "string" ||
+    matches[0].id.length === 0 ||
+    !exactProjection(
+      {
+        name: matches[0]?.name,
+        protocol: matches[0]?.protocol,
+        attributes: matches[0]?.attributes,
+      },
+      {
+        name: BASIC_CLIENT_SCOPE,
+        protocol: "openid-connect",
+        attributes: {
+          "include.in.token.scope": "false",
+          "display.on.consent.screen": "false",
+        },
+      },
+    )
+  ) {
+    throw new Error("live basic client scope drifted from the reviewed Keycloak profile");
+  }
+  const mappers = await getJson(
+    new URL(
+      `/admin/realms/yijie-local/client-scopes/${encodeURIComponent(matches[0].id)}/protocol-mappers/models`,
+      IDENTITY_ORIGIN,
+    ),
+    headers,
+    "live basic client-scope mappers",
+    fetchImpl,
+  );
+  if (!matchesBasicClientScopeMappers(mappers)) {
+    throw new Error("live basic client-scope mappers drifted from the reviewed Keycloak profile");
+  }
+  return matches[0];
+}
+
+function matchesBasicClientScopeMappers(mappers) {
+  if (!Array.isArray(mappers) || mappers.length !== 2) {
+    return false;
+  }
+  const projected = mappers
+    .map((mapper) => ({
+      name: mapper?.name,
+      protocol: mapper?.protocol,
+      protocolMapper: mapper?.protocolMapper,
+      consentRequired: mapper?.consentRequired,
+      config: mapper?.config,
+    }))
+    .sort((left, right) => String(left.name).localeCompare(String(right.name)));
+  return exactProjection(projected, [
+    {
+      name: "auth_time",
+      protocol: "openid-connect",
+      protocolMapper: "oidc-usersessionmodel-note-mapper",
+      consentRequired: false,
+      config: {
+        "user.session.note": "AUTH_TIME",
+        "introspection.token.claim": "true",
+        "userinfo.token.claim": "true",
+        "id.token.claim": "true",
+        "access.token.claim": "true",
+        "claim.name": "auth_time",
+        "jsonType.label": "long",
+      },
+    },
+    {
+      name: "sub",
+      protocol: "openid-connect",
+      protocolMapper: "oidc-sub-mapper",
+      consentRequired: false,
+      config: {
+        "introspection.token.claim": "true",
+        "access.token.claim": "true",
+      },
+    },
+  ]);
 }
 
 function matchesApiAudienceClient(client) {
