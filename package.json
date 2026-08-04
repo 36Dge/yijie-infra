@@ -9,11 +9,12 @@
     "pnpm": ">=11 <12"
   },
   "scripts": {
-    "validate": "pnpm validate:compose && pnpm validate:feat-125-local-assets && pnpm validate:feat-125-local-template && pnpm validate:feat-125-template",
+    "validate": "pnpm validate:compose && pnpm validate:feat-125-local-assets && pnpm validate:feat-125-local-template && pnpm validate:feat-125-template && pnpm validate:feat-126-s10",
     "validate:compose": "node scripts/validate-compose.mjs",
     "validate:feat-125-local-assets": "node scripts/validate-feat-125-local-assets.mjs",
     "validate:feat-125-local-template": "node scripts/validate-feat-125-local.mjs --mode template environments/local/feat-125.local-lab.template.yaml",
     "validate:feat-125-template": "node scripts/validate-feat-125-nonprod.mjs --mode template environments/nonproduction/feat-125.template.yaml",
+    "validate:feat-126-s10": "node scripts/validate-feat-126-s10.mjs",
     "test": "node --test tests/*.test.mjs"
   },
   "devDependencies": {

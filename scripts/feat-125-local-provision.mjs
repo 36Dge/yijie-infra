@@ -146,8 +146,16 @@ export const SYNTHETIC_USERS = Object.freeze([
   }),
 ]);
 
-export async function provisionFeat125LocalUsers({ secrets, fetchImpl = globalThis.fetch }) {
-  if (!(secrets instanceof Map) || typeof fetchImpl !== "function") {
+export async function provisionFeat125LocalUsers({
+  secrets,
+  fetchImpl = globalThis.fetch,
+  administratorUsername = "feat125-admin",
+}) {
+  if (
+    !(secrets instanceof Map) ||
+    typeof fetchImpl !== "function" ||
+    !/^[a-z0-9-]{3,64}$/.test(administratorUsername)
+  ) {
     throw new Error("local synthetic user provisioning requires validated secrets and Fetch API");
   }
 
@@ -163,7 +171,7 @@ export async function provisionFeat125LocalUsers({ secrets, fetchImpl = globalTh
       new URLSearchParams({
         client_id: ADMIN_CLIENT_ID,
         grant_type: "password",
-        username: "feat125-admin",
+        username: administratorUsername,
         password: administratorPassword,
       }),
       "bootstrap admin token",
