@@ -36,6 +36,12 @@ project="yijie-feat126-s10-$compact_run_id"
 run_root="$repo_dir/environments/local/generated/feat-126-s10/$run_id"
 secrets_file="$run_root/infra-secrets.env"
 ca_file="$run_root/caddy-root.crt"
+rejected_marker="$run_root/REJECTED"
+
+if [[ -e "$rejected_marker" && "$action" != "stop" && "$action" != "status" ]]; then
+  echo "Refusing to use a rejected FEAT-126 S10E run" >&2
+  exit 1
+fi
 
 node "$repo_dir/scripts/validate-feat-126-s10-secrets.mjs" "$secrets_file"
 compose=(

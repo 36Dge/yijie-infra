@@ -58,6 +58,7 @@ test("FEAT-126 S10E static assets keep no-pull, no-volume-delete, and no-trust-i
   assert.match(script, /--pull never/);
   assert.doesNotMatch(script, /down[^\n]*--volumes|docker volume rm|docker system prune/);
   assert.match(script, /canonical lowercase UUIDv4/);
+  assert.match(script, /Refusing to use a rejected FEAT-126 S10E run/);
   assert.match(runtimeVerifier, /spawnSync/);
   assert.doesNotMatch(runtimeVerifier, /console\.(log|error)\([^\n]*environment/i);
   assert.doesNotMatch(runtimeVerifier, /\.Config\.Env/);

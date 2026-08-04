@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { lstat, readFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, lstat, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -25,6 +26,14 @@ const runRoot = resolve(
 );
 const secretsPath = resolve(runRoot, "infra-secrets.env");
 const caPath = resolve(runRoot, "caddy-root.crt");
+try {
+  await access(resolve(runRoot, "REJECTED"), constants.F_OK);
+  throw new Error("Refusing to provision a rejected FEAT-126 S10E run");
+} catch (error) {
+  if (error?.code !== "ENOENT") {
+    throw error;
+  }
+}
 if (resolve(process.env.NODE_EXTRA_CA_CERTS ?? "") !== caPath) {
   throw new Error("NODE_EXTRA_CA_CERTS must point to this run's exported public CA");
 }

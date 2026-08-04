@@ -76,6 +76,9 @@ Deleting those volumes requires a separate explicit Owner authorization and an e
   run's empty API database, but Infra must not copy business migration SQL.
 - A missing image, digest drift, noncanonical run ID, unsafe secrets file, unexpected port owner,
   unhealthy service, CA validation failure, or resource-label mismatch is a hard stop.
+- A run whose evidence or credential handling is rejected must have an owner-only regular
+  `REJECTED` marker in its run root. Compose start/config/export, provisioning, migration and
+  runtime verification then fail closed; only status/stop remain available for containment.
 - No curl fixture or empty row count may be presented as Desktop-to-Public-Tasks E2E evidence.
 - S10E completion does not authorize S10P1 or S10B and does not change G3/G4/G6.
 

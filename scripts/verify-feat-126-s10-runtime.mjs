@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { lstat, readFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { access, lstat, readFile } from "node:fs/promises";
 import https from "node:https";
 import net from "node:net";
 import { resolve } from "node:path";
@@ -35,6 +36,17 @@ const secretsPath = resolve(
   runId,
   "infra-secrets.env",
 );
+try {
+  await access(
+    resolve(repositoryRoot, "environments/local/generated/feat-126-s10", runId, "REJECTED"),
+    constants.F_OK,
+  );
+  throw new Error("Refusing to verify a rejected FEAT-126 S10E run");
+} catch (error) {
+  if (error?.code !== "ENOENT") {
+    throw error;
+  }
+}
 
 function exactSet(actual, expected, label) {
   if (actual.size !== expected.size || [...actual].some((value) => !expected.has(value))) {

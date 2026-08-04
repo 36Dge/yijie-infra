@@ -24,6 +24,11 @@ if [[ -n "$(git -C "$api_repo" status --porcelain)" ]]; then
 fi
 
 secrets_file="$repo_dir/environments/local/generated/feat-126-s10/$run_id/infra-secrets.env"
+rejected_marker="$repo_dir/environments/local/generated/feat-126-s10/$run_id/REJECTED"
+if [[ -e "$rejected_marker" ]]; then
+  echo "Refusing to migrate a rejected FEAT-126 S10E run" >&2
+  exit 1
+fi
 node "$repo_dir/scripts/validate-feat-126-s10-secrets.mjs" "$secrets_file"
 set -a
 # shellcheck disable=SC1090
