@@ -216,11 +216,11 @@ export async function provisionFeat125LocalUsers({
         IDENTITY_ORIGIN,
       ),
       adminHeaders,
-      "live Desktop audience mapper",
+      "live Desktop token mappers",
       fetchImpl,
     );
-    if (!matchesAudienceMapper(mappers)) {
-      throw new Error("live Desktop audience mapper drifted from the reviewed API audience");
+    if (!matchesDesktopTokenMappers(mappers)) {
+      throw new Error("live Desktop token mappers drifted from the reviewed API token profile");
     }
 
     const apiAudienceClient = await getExactClient(
@@ -741,19 +741,24 @@ function matchesApiAudienceClient(client) {
   );
 }
 
-function matchesAudienceMapper(mappers) {
-  if (!Array.isArray(mappers) || mappers.length !== 1) {
+function matchesDesktopTokenMappers(mappers) {
+  if (!Array.isArray(mappers) || mappers.length !== 2) {
     return false;
   }
-  const mapper = mappers[0];
-  return exactProjection(
-    {
+  const projected = mappers
+    .map((mapper) => ({
       name: mapper?.name,
       protocol: mapper?.protocol,
       protocolMapper: mapper?.protocolMapper,
       consentRequired: mapper?.consentRequired,
       config: mapper?.config,
-    },
+    }))
+    .sort((left, right) => String(left.name).localeCompare(String(right.name)));
+  return exactProjection(projected, reviewedDesktopTokenMappers());
+}
+
+function reviewedDesktopTokenMappers() {
+  return [
     {
       name: "yijie-api-audience",
       protocol: "openid-connect",
@@ -767,7 +772,22 @@ function matchesAudienceMapper(mappers) {
         "userinfo.token.claim": "false",
       },
     },
-  );
+    {
+      name: "yijie-api-not-before",
+      protocol: "openid-connect",
+      protocolMapper: "oidc-usersessionmodel-note-mapper",
+      consentRequired: false,
+      config: {
+        "user.session.note": "AUTH_TIME",
+        "introspection.token.claim": "true",
+        "userinfo.token.claim": "false",
+        "id.token.claim": "false",
+        "access.token.claim": "true",
+        "claim.name": "nbf",
+        "jsonType.label": "long",
+      },
+    },
+  ];
 }
 
 async function ensureReviewedUserProfile(headers, fetchImpl) {

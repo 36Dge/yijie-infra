@@ -30,7 +30,10 @@ still published only on `127.0.0.1`; it never uses host networking or a shared e
 identity, and system/user CA trust are not used. All three image references include exact versions
 and SHA-256 digests; `up` uses `--pull never` and fails if any image is absent.
 
-The Keycloak realm asset is reused as a configuration authority only. Its database and Caddy state
+The Keycloak realm asset is reused as a configuration authority only. Its Desktop public client
+uses Keycloak's built-in user-session-note mapper to project the numeric `AUTH_TIME` session value
+as access-token `nbf`; this keeps the API's required-claim verifier unchanged and avoids a static
+not-before value, script mapper, alternate signer, or hand-built bearer. Its database and Caddy state
 are new run-scoped volumes. The fixed users and tenant material are synthetic; secrets are generated
 locally into an ignored regular file with mode `0600`, are never printed, and are not written to Git.
 
@@ -59,7 +62,8 @@ issuer and the Caddy Tasks 404 boundary. Docker inspection stays in-process and 
 only a content-free pass/fail result; it never prints container environments or secret values.
 
 The provisioning command adapts this run's generated credentials to the single existing reviewed
-synthetic realm authority; it does not create a second identity standard. The migration command
+synthetic realm authority and verifies the live Desktop audience/`nbf` mapper projection; it does
+not create a second identity standard. The migration command
 requires the exact approved API commit and a clean worktree, then applies the API-owned migrations
 only to `yijie_api_feat126_s10`. Neither command prints credentials or copies application schema into
 Infra.

@@ -90,15 +90,43 @@ export function validateRealm(realm) {
   if (desktop.attributes?.["pkce.code.challenge.method"] !== "S256") {
     throw new Error("Desktop public client must require PKCE S256.");
   }
-  const audienceMapper = desktop.protocolMappers?.find(
-    (mapper) => mapper.protocolMapper === "oidc-audience-mapper",
+  const tokenMappers = [...(desktop.protocolMappers ?? [])].sort((left, right) =>
+    String(left?.name).localeCompare(String(right?.name)),
   );
-  if (
-    audienceMapper?.config?.["included.client.audience"] !== FEAT_125_LOCAL_AUDIENCE ||
-    audienceMapper.config["access.token.claim"] !== "true" ||
-    audienceMapper.config["id.token.claim"] !== "false"
-  ) {
-    throw new Error("Desktop access tokens must contain only the exact FEAT-125 API audience mapping.");
+  const expectedTokenMappers = [
+    {
+      name: "yijie-api-audience",
+      protocol: "openid-connect",
+      protocolMapper: "oidc-audience-mapper",
+      consentRequired: false,
+      config: {
+        "included.client.audience": FEAT_125_LOCAL_AUDIENCE,
+        "id.token.claim": "false",
+        "access.token.claim": "true",
+        "introspection.token.claim": "true",
+        "userinfo.token.claim": "false",
+      },
+    },
+    {
+      name: "yijie-api-not-before",
+      protocol: "openid-connect",
+      protocolMapper: "oidc-usersessionmodel-note-mapper",
+      consentRequired: false,
+      config: {
+        "user.session.note": "AUTH_TIME",
+        "introspection.token.claim": "true",
+        "userinfo.token.claim": "false",
+        "id.token.claim": "false",
+        "access.token.claim": "true",
+        "claim.name": "nbf",
+        "jsonType.label": "long",
+      },
+    },
+  ];
+  if (JSON.stringify(tokenMappers) !== JSON.stringify(expectedTokenMappers)) {
+    throw new Error(
+      "Desktop access tokens must contain only the exact API audience and dynamic numeric nbf mappings.",
+    );
   }
 }
 

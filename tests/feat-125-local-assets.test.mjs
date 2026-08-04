@@ -32,6 +32,34 @@ test("realm rejects committed credential material", async () => {
   assert.throws(() => validateRealm(changed), /forbidden credential field/);
 });
 
+test("realm rejects a missing or static Desktop nbf mapping", async () => {
+  const { realm } = await loadFeat125LocalAssets();
+  const missing = structuredClone(realm);
+  const missingDesktop = missing.clients.find(
+    (client) => client.clientId === "yijie-desktop-feat-125-local",
+  );
+  missingDesktop.protocolMappers = missingDesktop.protocolMappers.filter(
+    (mapper) => mapper.name !== "yijie-api-not-before",
+  );
+  assert.throws(() => validateRealm(missing), /dynamic numeric nbf/);
+
+  const hardcoded = structuredClone(realm);
+  const hardcodedDesktop = hardcoded.clients.find(
+    (client) => client.clientId === "yijie-desktop-feat-125-local",
+  );
+  const nbfMapper = hardcodedDesktop.protocolMappers.find(
+    (mapper) => mapper.name === "yijie-api-not-before",
+  );
+  nbfMapper.protocolMapper = "oidc-hardcoded-claim-mapper";
+  nbfMapper.config = {
+    "claim.name": "nbf",
+    "claim.value": "0",
+    "jsonType.label": "long",
+    "access.token.claim": "true",
+  };
+  assert.throws(() => validateRealm(hardcoded), /dynamic numeric nbf/);
+});
+
 test("Caddyfile rejects insecure upstream TLS bypass", async () => {
   const { caddyfile } = await loadFeat125LocalAssets();
   assert.throws(

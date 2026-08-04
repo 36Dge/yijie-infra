@@ -64,7 +64,7 @@ https://localhost:8443/realms/yijie-local
 
 Desktop client `yijie-desktop-feat-125-local` 是无 secret 的 public/native client，只允许 Authorization Code Flow，强制 PKCE `S256`，禁用 implicit、password/direct grant 和 service account。Access token 使用 `RS256`，TTL 为 600 秒，audience 固定为 `https://api.yijie.ai`。
 
-Keycloak 26.7.0 的官方 `RedirectUtilsTest.testVerifyRedirectUriNative` 证明：登记不带端口的 `http://127.0.0.1/oauth/callback` 后，运行时 `http://127.0.0.1:<随机端口>/oauth/callback` 会被接受，同时 path 仍做完整字符串匹配。因此 realm 不使用 `*`，也不放宽 callback path。
+Keycloak 26.7.0 的官方 `RedirectUtilsTest.testVerifyRedirectUriNative` 证明：登记不带端口的 `http://127.0.0.1/oauth/callback` 后，运行时 `http://127.0.0.1:<随机端口>/oauth/callback` 会被接受，同时 path 仍做完整字符串匹配。因此 realm 不使用 `*`，也不放宽 callback path。Desktop access token 另通过 Keycloak 内置 user-session-note mapper 将 numeric `AUTH_TIME` 投影为 `nbf`；禁止用静态 `nbf=0`、script mapper、手工 bearer 或放宽 API required-claim verifier 代替。
 
 realm 只包含两个没有 credential 的固定合成用户：
 
