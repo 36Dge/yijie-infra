@@ -18,15 +18,20 @@ import {
 } from "../scripts/feat-126-s10-secrets.mjs";
 import { validateBootstrapResults } from "../scripts/verify-feat-126-s10-bootstrap-results.mjs";
 import {
+  DockerPreflightError,
   expectedImmutableImages,
   parsePinnedImage,
   parseInspectOutput,
-  verifyLocalImageAvailability,
+  validateImageSnapshot,
 } from "../scripts/verify-feat-126-s10-images.mjs";
 import {
   API_CANDIDATE_AUTHORITY_FILE,
   ensureApiCandidateAuthority,
 } from "../scripts/feat-126-s10-api-candidate.mjs";
+
+function hasDockerCode(code) {
+  return (error) => error instanceof DockerPreflightError && error.code === code;
+}
 
 test("FEAT-126 S10E services are immutable, default-off, project-scoped, and synthetic-only", async () => {
   const compose = await loadCompose();
@@ -91,7 +96,7 @@ test("FEAT-126 S10 image preflight derives repository digests from the reviewed 
     "postgres@sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50",
   );
   assert.equal(expectedImmutableImages().length, 3);
-  assert.throws(() => parsePinnedImage("postgres:latest"), /pin is malformed/);
+  assert.throws(() => parsePinnedImage("postgres:latest"), hasDockerCode("image_identity_invalid"));
   const digest = "sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50";
   assert.throws(
     () =>
@@ -99,66 +104,46 @@ test("FEAT-126 S10 image preflight derives repository digests from the reviewed 
         first: `postgres:16.13-alpine@${digest}`,
         second: `postgres:other-version@${digest}`,
       }),
-    /conflicting version tags/,
+    hasDockerCode("image_identity_invalid"),
   );
-  assert.throws(() => parseInspectOutput(""), /invalid result/);
-  assert.throws(() => parseInspectOutput("{}\n{}"), /invalid result/);
-  assert.throws(() => parseInspectOutput("not-json"), /invalid JSON/);
+  assert.throws(() => parseInspectOutput(""), hasDockerCode("inspect_payload_invalid"));
+  assert.throws(() => parseInspectOutput("{}\n{}"), hasDockerCode("inspect_payload_invalid"));
+  assert.throws(() => parseInspectOutput("not-json"), hasDockerCode("inspect_payload_invalid"));
 });
 
-test("FEAT-126 S10 image preflight accepts only exact local repository digests", () => {
-  const inspected = [];
-  assert.equal(
-    verifyLocalImageAvailability({
-      inspect: (digestReference) => {
-        inspected.push(digestReference);
-        return {
-          Id: digestReference.slice(digestReference.indexOf("sha256:")),
-          RepoDigests: [digestReference],
-          Descriptor: { digest: digestReference.slice(digestReference.indexOf("sha256:")) },
-        };
-      },
-    }),
-    3,
-  );
-  assert.equal(inspected.length, 3);
-
+test("FEAT-126 S10 image identity requires exact digest, descriptor, and platform", () => {
+  const image = parsePinnedImage(FEAT_126_S10_IMAGES["feat126-s10-api-db"]);
+  const capability = { architecture: "arm64", os: "linux" };
+  const snapshot = {
+    Id: `sha256:${"1".repeat(64)}`,
+    RepoDigests: [image.digestReference],
+    Descriptor: { digest: image.digest },
+    Os: "linux",
+    Architecture: "arm64",
+    Config: { Volumes: { "/var/lib/postgresql/data": {} } },
+  };
+  const identity = validateImageSnapshot(snapshot, image, capability);
+  assert.deepEqual(identity.volumes, ["/var/lib/postgresql/data"]);
   assert.throws(
-    () =>
-      verifyLocalImageAvailability({
-        inspect: (digestReference) => ({
-          Id: digestReference.slice(digestReference.indexOf("sha256:")),
-          RepoDigests: [],
-        }),
-      }),
-    /repository digest does not match/,
+    () => validateImageSnapshot({ ...snapshot, RepoDigests: [] }, image, capability),
+    hasDockerCode("image_repository_mismatch"),
   );
   assert.throws(
     () =>
-      verifyLocalImageAvailability({
-        inspect: (digestReference) => ({
-          Id: digestReference.slice(digestReference.indexOf("sha256:")),
-          RepoDigests: [digestReference],
-          Descriptor: { digest: `sha256:${"0".repeat(64)}` },
-        }),
-      }),
-    /descriptor does not match/,
+      validateImageSnapshot(
+        { ...snapshot, Descriptor: { digest: `sha256:${"0".repeat(64)}` } },
+        image,
+        capability,
+      ),
+    hasDockerCode("image_digest_mismatch"),
   );
   assert.throws(
-    () =>
-      verifyLocalImageAvailability({
-        inspect: () => {
-          throw new Error("unavailable");
-        },
-      }),
-    /unavailable/,
+    () => validateImageSnapshot({ ...snapshot, Architecture: "amd64" }, image, capability),
+    hasDockerCode("image_platform_mismatch"),
   );
   assert.throws(
-    () =>
-      verifyLocalImageAvailability({
-        inspect: (digestReference) => ({ Id: "invalid", RepoDigests: [digestReference] }),
-      }),
-    /identity is invalid/,
+    () => validateImageSnapshot({ ...snapshot, Id: "invalid" }, image, capability),
+    hasDockerCode("image_identity_invalid"),
   );
 });
 

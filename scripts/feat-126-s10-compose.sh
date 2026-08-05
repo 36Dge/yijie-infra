@@ -52,7 +52,7 @@ case "$action" in
     echo "Validated FEAT-126 S10E Compose for run $run_id"
     ;;
   up)
-    node "$repo_dir/scripts/verify-feat-126-s10-images.mjs"
+    node "$repo_dir/scripts/verify-feat-126-s10-images.mjs" "$run_id"
     FEAT126_S10_RUN_ID="$run_id" "${compose[@]}" up \
       --detach --wait --pull never "${services[@]}"
     echo "FEAT-126 S10E isolated dependencies are ready for run $run_id"

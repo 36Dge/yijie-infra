@@ -1,4 +1,4 @@
-.PHONY: dev-up dev-down dev-status feat-125-nonprod-template feat-125-nonprod-ready feat-125-nonprod-online feat-125-local-template feat-125-local-worktree-reference feat-125-local-init-secrets feat-125-local-up feat-125-local-stop feat-125-local-status feat-125-local-provision-users feat-125-local-api-db feat-125-local-prepare feat-125-local-trust-ca feat-125-local-ca-status feat-125-local-untrust-ca feat-125-local-ready feat-125-local-online feat-125-s7-bearer-matrix feat-126-s10-init-secrets feat-126-s10-config feat-126-s10-up feat-126-s10-stop feat-126-s10-status feat-126-s10-export-ca feat-126-s10-verify-runtime feat-126-s10-provision-users feat-126-s10-api-migrate feat-126-s10-api-bootstrap lint test plan apply deploy rollback
+.PHONY: dev-up dev-down dev-status feat-125-nonprod-template feat-125-nonprod-ready feat-125-nonprod-online feat-125-local-template feat-125-local-worktree-reference feat-125-local-init-secrets feat-125-local-up feat-125-local-stop feat-125-local-status feat-125-local-provision-users feat-125-local-api-db feat-125-local-prepare feat-125-local-trust-ca feat-125-local-ca-status feat-125-local-untrust-ca feat-125-local-ready feat-125-local-online feat-125-s7-bearer-matrix feat-126-s10-init-secrets feat-126-s10-config feat-126-s10-verify-images feat-126-s10-up feat-126-s10-stop feat-126-s10-status feat-126-s10-export-ca feat-126-s10-verify-runtime feat-126-s10-provision-users feat-126-s10-api-migrate feat-126-s10-api-bootstrap lint test plan apply deploy rollback
 
 dev-up:
 	docker compose -f docker-compose.local.yml up -d --wait
@@ -97,6 +97,10 @@ feat-126-s10-init-secrets:
 feat-126-s10-config:
 	@test -n "$(RUN_ID)" || (echo "RUN_ID is required" >&2; exit 2)
 	./scripts/feat-126-s10-compose.sh config "$(RUN_ID)"
+
+feat-126-s10-verify-images:
+	@test -n "$(RUN_ID)" || (echo "RUN_ID is required" >&2; exit 2)
+	node scripts/verify-feat-126-s10-images.mjs "$(RUN_ID)"
 
 feat-126-s10-up:
 	@test -n "$(RUN_ID)" || (echo "RUN_ID is required" >&2; exit 2)

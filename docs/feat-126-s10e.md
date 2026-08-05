@@ -46,6 +46,7 @@ locally into an ignored regular file with mode `0600`, are never printed, and ar
 ```bash
 make feat-126-s10-init-secrets RUN_ID=<canonical-lowercase-uuidv4>
 make feat-126-s10-config RUN_ID=<same-run-id>
+make feat-126-s10-verify-images RUN_ID=<same-run-id>
 make feat-126-s10-up RUN_ID=<same-run-id>
 make feat-126-s10-status RUN_ID=<same-run-id>
 make feat-126-s10-export-ca RUN_ID=<same-run-id>
@@ -104,6 +105,26 @@ therefore `none` even though the local deployment helper interface is stricter.
 `stop` removes this run's containers and networks but intentionally retains the four named volumes.
 Deleting those volumes requires a separate explicit Owner authorization and an exact run manifest;
 `docker compose down --volumes`, `docker volume rm`, and prune commands are not part of S10E.
+
+## S10BD1 capability and immutable resolver corrective
+
+- Authorization: `LIA-126-017`, explicitly consumed for S10BD1 only.
+- `contract-impact = semantic` for the private FEAT-126 local deployment interface. The existing
+  public/private business wire, durable schema, Runtime pin and default/production behavior do not
+  change; central G2A is N/A.
+- The verifier checks Docker CLI/server capability in the same process and context before any image
+  or container command. Failures are reduced to the reviewed closed classes; raw Docker stderr,
+  socket/context paths and command payloads are never emitted.
+- Each original Compose `version-tag@digest` remains the only authority. Two read-only snapshots
+  must agree on image Id, mandatory Descriptor digest, RepoDigests, repository and Linux/server
+  architecture. A tag-only lookup is diagnostic and can never satisfy the gate.
+- After identity succeeds, the verifier performs one bounded `docker create --pull=never` probe per
+  unique image. The probe uses `--network none`, run-scoped names and labels, overrides every image
+  volume with tmpfs, never starts the container and removes only an exact owned identity. Unknown
+  outcomes are reconciled before cleanup; a foreign or mismatched resource is never removed.
+- The probe does not pull, retag, restart Docker, switch image stores, publish ports, create networks,
+  delete existing volumes or weaken the immutable pins. S10BD1 completion is not S10B evidence and
+  does not authorize S10B-R4 or S11.
 
 ## Readiness and failure rules
 
