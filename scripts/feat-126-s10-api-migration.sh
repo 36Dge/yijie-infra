@@ -4,8 +4,12 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 run_id="${1:-}"
 api_repo="${2:-}"
-expected_api_sha="a64f9f591fb594818c1778e30c6941e2574b3264"
+expected_api_sha="${3:-}"
 
+if [[ "$#" -ne 3 ]]; then
+  echo "usage: feat-126-s10-api-migration <RUN_ID> <API_REPO> <API_SHA>" >&2
+  exit 2
+fi
 if [[ ! "$run_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; then
   echo "RUN_ID must be a canonical lowercase UUIDv4" >&2
   exit 2
@@ -14,21 +18,19 @@ if [[ -z "$api_repo" || ! -d "$api_repo/.git" ]]; then
   echo "API_REPO must be a local yijie-api worktree" >&2
   exit 2
 fi
-if [[ "$(git -C "$api_repo" rev-parse HEAD)" != "$expected_api_sha" ]]; then
-  echo "Refusing to migrate with an unexpected yijie-api commit" >&2
-  exit 1
-fi
-if [[ -n "$(git -C "$api_repo" status --porcelain)" ]]; then
-  echo "Refusing to migrate with a dirty yijie-api worktree" >&2
-  exit 1
+if [[ ! "$expected_api_sha" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "API_SHA must be a full lowercase commit SHA" >&2
+  exit 2
 fi
 
-secrets_file="$repo_dir/environments/local/generated/feat-126-s10/$run_id/infra-secrets.env"
-rejected_marker="$repo_dir/environments/local/generated/feat-126-s10/$run_id/REJECTED"
+run_root="$repo_dir/environments/local/generated/feat-126-s10/$run_id"
+secrets_file="$run_root/infra-secrets.env"
+rejected_marker="$run_root/REJECTED"
 if [[ -e "$rejected_marker" ]]; then
   echo "Refusing to migrate a rejected FEAT-126 S10E run" >&2
   exit 1
 fi
+node "$repo_dir/scripts/feat-126-s10-api-candidate.mjs" "$run_id" "$api_repo" "$expected_api_sha"
 node "$repo_dir/scripts/validate-feat-126-s10-secrets.mjs" "$secrets_file"
 set -a
 # shellcheck disable=SC1090

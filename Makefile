@@ -125,7 +125,8 @@ feat-126-s10-provision-users:
 
 feat-126-s10-api-migrate:
 	@test -n "$(RUN_ID)" || (echo "RUN_ID is required" >&2; exit 2)
-	./scripts/feat-126-s10-api-migration.sh "$(RUN_ID)" "$(if $(API_REPO),$(API_REPO),../yijie-api)"
+	@test -n "$(API_SHA)" || (echo "API_SHA is required" >&2; exit 2)
+	./scripts/feat-126-s10-api-migration.sh "$(RUN_ID)" "$(if $(API_REPO),$(API_REPO),../yijie-api)" "$(API_SHA)"
 
 feat-126-s10-api-bootstrap:
 	@test -n "$(RUN_ID)" || (echo "RUN_ID is required" >&2; exit 2)

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -23,6 +23,10 @@ import {
   parseInspectOutput,
   verifyLocalImageAvailability,
 } from "../scripts/verify-feat-126-s10-images.mjs";
+import {
+  API_CANDIDATE_AUTHORITY_FILE,
+  ensureApiCandidateAuthority,
+} from "../scripts/feat-126-s10-api-candidate.mjs";
 
 test("FEAT-126 S10E services are immutable, default-off, project-scoped, and synthetic-only", async () => {
   const compose = await loadCompose();
@@ -191,7 +195,12 @@ test("FEAT-126 S10E validation rejects fixed container names and non-loopback po
 });
 
 test("FEAT-126 S10 bootstrap wrapper fixes the closed profile, manifests, and API-owned verification", async () => {
-  const script = await readFile("scripts/feat-126-s10-api-bootstrap.sh", "utf8");
+  const [script, migration, candidate, makefile] = await Promise.all([
+    readFile("scripts/feat-126-s10-api-bootstrap.sh", "utf8"),
+    readFile("scripts/feat-126-s10-api-migration.sh", "utf8"),
+    readFile("scripts/feat-126-s10-api-candidate.mjs", "utf8"),
+    readFile("Makefile", "utf8"),
+  ]);
   const manifestNames = [
     "user-a-tenant-a.json",
     "user-a-tenant-b.json",
@@ -201,8 +210,15 @@ test("FEAT-126 S10 bootstrap wrapper fixes the closed profile, manifests, and AP
 
   assert.match(script, /profile="feat-126-s10-local-lab"/);
   assert.match(script, /yijie_api_feat126_s10\?sslmode=disable/);
-  assert.match(script, /git -C "\$api_repo" rev-parse HEAD/);
-  assert.match(script, /status --porcelain --untracked-files=all/);
+  assert.match(script, /feat-126-s10-api-candidate\.mjs.*"\$expected_api_sha"/);
+  assert.match(migration, /feat-126-s10-api-candidate\.mjs.*"\$expected_api_sha"/);
+  assert.match(migration, /expected_api_sha="\$\{3:-\}"/);
+  assert.doesNotMatch(migration, /expected_api_sha="[a-f0-9]{40}"/);
+  assert.match(makefile, /feat-126-s10-api-migrate:[\s\S]*API_SHA is required[\s\S]*feat-126-s10-api-migration\.sh[^\n]*"\$\(API_SHA\)"/);
+  assert.match(candidate, /\["-C", apiRepository, "rev-parse", "HEAD"\]/);
+  assert.match(candidate, /"status", "--porcelain", "--untracked-files=all"/);
+  assert.match(candidate, /O_EXCL \| constants\.O_NOFOLLOW/);
+  assert.doesNotMatch(candidate, /DSN|password|token|repository_path/);
   assert.match(script, /ls-files --error-unmatch/);
   assert.match(script, /verify-nonprod-authz --profile "\$profile" --expect empty/);
   assert.match(script, /verify-nonprod-authz --profile "\$profile" --expect complete/);
@@ -213,6 +229,106 @@ test("FEAT-126 S10 bootstrap wrapper fixes the closed profile, manifests, and AP
   assert.doesNotMatch(script, /\*\.json|find .*manifest/);
   for (const name of manifestNames) {
     assert.equal(script.split(name).length - 1, 1);
+  }
+});
+
+test("FEAT-126 S10 migration and bootstrap share one exact run-scoped API candidate", async () => {
+  const runRoot = await realpath(await mkdtemp(join(tmpdir(), "feat126-api-candidate-")));
+  const runId = "12600000-0000-4000-8000-000000000051";
+  const fullCommit = "a".repeat(40);
+  const inspectRepository = () => ({ head: fullCommit, dirty: false });
+  try {
+    await chmod(runRoot, 0o700);
+    const first = await ensureApiCandidateAuthority({
+      runId,
+      apiRepository: "synthetic-api-worktree",
+      apiFullCommit: fullCommit,
+      runRoot,
+      inspectRepository,
+    });
+    assert.deepEqual(first, {
+      schema_version: 1,
+      run_id: runId,
+      api_full_commit: fullCommit,
+    });
+    const authorityPath = join(runRoot, API_CANDIDATE_AUTHORITY_FILE);
+    const metadata = await lstat(authorityPath);
+    assert.equal(metadata.mode & 0o777, 0o600);
+    assert.equal(metadata.nlink, 1);
+
+    assert.deepEqual(
+      await ensureApiCandidateAuthority({
+        runId,
+        apiRepository: "synthetic-api-worktree",
+        apiFullCommit: fullCommit,
+        runRoot,
+        inspectRepository,
+      }),
+      first,
+    );
+    const otherCommit = "b".repeat(40);
+    await assert.rejects(
+      ensureApiCandidateAuthority({
+        runId,
+        apiRepository: "synthetic-api-worktree",
+        apiFullCommit: otherCommit,
+        runRoot,
+        inspectRepository: () => ({ head: otherCommit, dirty: false }),
+      }),
+      /authority is invalid/,
+    );
+    await assert.rejects(
+      ensureApiCandidateAuthority({
+        runId,
+        apiRepository: "synthetic-api-worktree",
+        apiFullCommit: fullCommit,
+        runRoot,
+        inspectRepository: () => ({ head: fullCommit, dirty: true }),
+      }),
+      /authority is invalid/,
+    );
+  } finally {
+    await rm(runRoot, { recursive: true, force: true });
+  }
+});
+
+test("FEAT-126 S10 API candidate authority rejects mode, hardlink, and symlink drift", async () => {
+  const runId = "12600000-0000-4000-8000-000000000052";
+  const fullCommit = "c".repeat(40);
+  const inspectRepository = () => ({ head: fullCommit, dirty: false });
+  for (const fault of ["mode", "hardlink", "symlink"]) {
+    const runRoot = await realpath(await mkdtemp(join(tmpdir(), `feat126-api-candidate-${fault}-`)));
+    try {
+      await chmod(runRoot, 0o700);
+      const authorityPath = join(runRoot, API_CANDIDATE_AUTHORITY_FILE);
+      if (fault === "symlink") {
+        const target = join(runRoot, "foreign.json");
+        await writeFile(target, "{}\n", { mode: 0o600 });
+        await symlink(target, authorityPath);
+      } else {
+        await ensureApiCandidateAuthority({
+          runId,
+          apiRepository: "synthetic-api-worktree",
+          apiFullCommit: fullCommit,
+          runRoot,
+          inspectRepository,
+        });
+        if (fault === "mode") await chmod(authorityPath, 0o640);
+        if (fault === "hardlink") await link(authorityPath, join(runRoot, "authority-link.json"));
+      }
+      await assert.rejects(
+        ensureApiCandidateAuthority({
+          runId,
+          apiRepository: "synthetic-api-worktree",
+          apiFullCommit: fullCommit,
+          runRoot,
+          inspectRepository,
+        }),
+        /authority is invalid/,
+      );
+    } finally {
+      await rm(runRoot, { recursive: true, force: true });
+    }
   }
 });
 

@@ -51,7 +51,7 @@ make feat-126-s10-status RUN_ID=<same-run-id>
 make feat-126-s10-export-ca RUN_ID=<same-run-id>
 make feat-126-s10-verify-runtime RUN_ID=<same-run-id>
 make feat-126-s10-provision-users RUN_ID=<same-run-id>
-make feat-126-s10-api-migrate RUN_ID=<same-run-id> API_REPO=../yijie-api
+make feat-126-s10-api-migrate RUN_ID=<same-run-id> API_REPO=../yijie-api API_SHA=<full-clean-commit-sha>
 make feat-126-s10-api-bootstrap RUN_ID=<same-run-id> API_REPO=../yijie-api API_SHA=<full-clean-commit-sha>
 make feat-126-s10-stop RUN_ID=<same-run-id>
 ```
@@ -85,6 +85,21 @@ only owner-only, run-scoped, content-free count/revision summaries; transient pe
 are removed. It neither contains business SQL nor offers profile, manifest, issuer, database, role,
 or actor overrides. This additive local deployment/security profile has `contract-impact = none` on
 public/private wire, durable schema, and the existing `feat-125-local-lab` profile semantics.
+
+Migration and bootstrap share one run-scoped `api-candidate-authority.json`. The first command uses
+create-new/O_EXCL and no-follow semantics to bind the canonical run ID to one full, clean API commit;
+the other command must match it exactly. The owner-only closed document contains only schema version,
+run ID, and full API commit—never a repository path, DSN, credential, manifest body, or conversation
+content. Missing/short/wrong SHA, dirty worktree, symlink/hardlink, wrong mode/owner, corrupt document,
+or cross-command candidate drift fails before reading the secret file or accessing PostgreSQL. The
+caller cannot use a branch name or separate migration/bootstrap candidate identities.
+
+This corrective change is intentionally breaking for the private FEAT-126 local migration helper:
+the former two-argument invocation now fails closed and every caller must supply the same full
+`API_SHA` already required by bootstrap. The repository-owned Make target is updated in the same
+change. It does not alter a public wire contract, central source contract, production/default
+configuration, durable business schema, or the existing `feat-125-local-lab` profile; G2A impact is
+therefore `none` even though the local deployment helper interface is stricter.
 
 `stop` removes this run's containers and networks but intentionally retains the four named volumes.
 Deleting those volumes requires a separate explicit Owner authorization and an exact run manifest;

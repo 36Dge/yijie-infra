@@ -25,15 +25,6 @@ if [[ ! "$expected_api_sha" =~ ^[0-9a-f]{40}$ ]]; then
   echo "API_SHA must be a full lowercase commit SHA" >&2
   exit 2
 fi
-if [[ "$(git -C "$api_repo" rev-parse HEAD)" != "$expected_api_sha" ]]; then
-  echo "Refusing to bootstrap with an unexpected yijie-api commit" >&2
-  exit 1
-fi
-if [[ -n "$(git -C "$api_repo" status --porcelain --untracked-files=all)" ]]; then
-  echo "Refusing to bootstrap with a dirty yijie-api worktree" >&2
-  exit 1
-fi
-
 run_root="$repo_dir/environments/local/generated/feat-126-s10/$run_id"
 secrets_file="$run_root/infra-secrets.env"
 rejected_marker="$run_root/REJECTED"
@@ -47,6 +38,7 @@ if [[ -e "$evidence_dir" ]]; then
   echo "Refusing to overwrite FEAT-126 S10 bootstrap evidence" >&2
   exit 1
 fi
+node "$repo_dir/scripts/feat-126-s10-api-candidate.mjs" "$run_id" "$api_repo" "$expected_api_sha"
 
 manifest_relative_paths=(
   "config/nonproduction/feat-125-local-lab/user-a-tenant-a.json"
