@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +16,13 @@ import {
   FEAT_126_S10_SECRET_KEYS,
   validateFeat126S10Secrets,
 } from "../scripts/feat-126-s10-secrets.mjs";
+import { validateBootstrapResults } from "../scripts/verify-feat-126-s10-bootstrap-results.mjs";
+import {
+  expectedImmutableImages,
+  parsePinnedImage,
+  parseInspectOutput,
+  verifyLocalImageAvailability,
+} from "../scripts/verify-feat-126-s10-images.mjs";
 
 test("FEAT-126 S10E services are immutable, default-off, project-scoped, and synthetic-only", async () => {
   const compose = await loadCompose();
@@ -56,6 +64,8 @@ test("FEAT-126 S10E static assets keep no-pull, no-volume-delete, and no-trust-i
   ]);
 
   assert.match(script, /--pull never/);
+  assert.match(script, /verify-feat-126-s10-images\.mjs/);
+  assert.doesNotMatch(script, /docker (image )?pull|docker image inspect/);
   assert.doesNotMatch(script, /down[^\n]*--volumes|docker volume rm|docker system prune/);
   assert.match(script, /canonical lowercase UUIDv4/);
   assert.match(script, /Refusing to use a rejected FEAT-126 S10E run/);
@@ -66,6 +76,86 @@ test("FEAT-126 S10E static assets keep no-pull, no-volume-delete, and no-trust-i
   assert.doesNotMatch(caddyfile, /tls_insecure_skip_verify|0\.0\.0\.0|PRIVATE KEY/);
   assert.match(documentation, /contract-impact = additive/);
   assert.match(documentation, /separate explicit Owner authorization/);
+});
+
+test("FEAT-126 S10 image preflight derives repository digests from the reviewed Compose pins", () => {
+  const postgres = parsePinnedImage(FEAT_126_S10_IMAGES["feat126-s10-api-db"]);
+  assert.equal(postgres.repository, "postgres");
+  assert.equal(postgres.tag, "16.13-alpine");
+  assert.equal(
+    postgres.digestReference,
+    "postgres@sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50",
+  );
+  assert.equal(expectedImmutableImages().length, 3);
+  assert.throws(() => parsePinnedImage("postgres:latest"), /pin is malformed/);
+  const digest = "sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50";
+  assert.throws(
+    () =>
+      expectedImmutableImages({
+        first: `postgres:16.13-alpine@${digest}`,
+        second: `postgres:other-version@${digest}`,
+      }),
+    /conflicting version tags/,
+  );
+  assert.throws(() => parseInspectOutput(""), /invalid result/);
+  assert.throws(() => parseInspectOutput("{}\n{}"), /invalid result/);
+  assert.throws(() => parseInspectOutput("not-json"), /invalid JSON/);
+});
+
+test("FEAT-126 S10 image preflight accepts only exact local repository digests", () => {
+  const inspected = [];
+  assert.equal(
+    verifyLocalImageAvailability({
+      inspect: (digestReference) => {
+        inspected.push(digestReference);
+        return {
+          Id: digestReference.slice(digestReference.indexOf("sha256:")),
+          RepoDigests: [digestReference],
+          Descriptor: { digest: digestReference.slice(digestReference.indexOf("sha256:")) },
+        };
+      },
+    }),
+    3,
+  );
+  assert.equal(inspected.length, 3);
+
+  assert.throws(
+    () =>
+      verifyLocalImageAvailability({
+        inspect: (digestReference) => ({
+          Id: digestReference.slice(digestReference.indexOf("sha256:")),
+          RepoDigests: [],
+        }),
+      }),
+    /repository digest does not match/,
+  );
+  assert.throws(
+    () =>
+      verifyLocalImageAvailability({
+        inspect: (digestReference) => ({
+          Id: digestReference.slice(digestReference.indexOf("sha256:")),
+          RepoDigests: [digestReference],
+          Descriptor: { digest: `sha256:${"0".repeat(64)}` },
+        }),
+      }),
+    /descriptor does not match/,
+  );
+  assert.throws(
+    () =>
+      verifyLocalImageAvailability({
+        inspect: () => {
+          throw new Error("unavailable");
+        },
+      }),
+    /unavailable/,
+  );
+  assert.throws(
+    () =>
+      verifyLocalImageAvailability({
+        inspect: (digestReference) => ({ Id: "invalid", RepoDigests: [digestReference] }),
+      }),
+    /identity is invalid/,
+  );
 });
 
 test("FEAT-126 S10E secret validator accepts only distinct owner-only generated values", async () => {
@@ -98,4 +188,79 @@ test("FEAT-126 S10E validation rejects fixed container names and non-loopback po
   const second = structuredClone(await loadCompose());
   second.services["feat126-s10-caddy"].ports[0] = "0.0.0.0:8443:8443";
   assert.throws(() => validateCompose(second), /published ports mismatch|IPv4 loopback/);
+});
+
+test("FEAT-126 S10 bootstrap wrapper fixes the closed profile, manifests, and API-owned verification", async () => {
+  const script = await readFile("scripts/feat-126-s10-api-bootstrap.sh", "utf8");
+  const manifestNames = [
+    "user-a-tenant-a.json",
+    "user-a-tenant-b.json",
+    "user-b-tenant-a.json",
+    "user-b-tenant-b.json",
+  ];
+
+  assert.match(script, /profile="feat-126-s10-local-lab"/);
+  assert.match(script, /yijie_api_feat126_s10\?sslmode=disable/);
+  assert.match(script, /git -C "\$api_repo" rev-parse HEAD/);
+  assert.match(script, /status --porcelain --untracked-files=all/);
+  assert.match(script, /ls-files --error-unmatch/);
+  assert.match(script, /verify-nonprod-authz --profile "\$profile" --expect empty/);
+  assert.match(script, /verify-nonprod-authz --profile "\$profile" --expect complete/);
+  assert.match(script, /go run \.\/cmd\/bootstrap-nonprod-authz-batch/);
+  assert.doesNotMatch(script, /go run \.\/cmd\/bootstrap-nonprod-authz --/);
+  assert.doesNotMatch(script, /set -a/);
+  assert.doesNotMatch(script, /\bpsql\b|SELECT |INSERT |UPDATE |DELETE FROM/i);
+  assert.doesNotMatch(script, /\*\.json|find .*manifest/);
+  for (const name of manifestNames) {
+    assert.equal(script.split(name).length - 1, 1);
+  }
+});
+
+test("FEAT-126 S10 bootstrap result verifier accepts only the exact two-pass matrix", () => {
+  const expected = [
+    ["12500000-0000-4000-8000-000000000001", "12500000-0000-4000-8000-100000000001", "tenant_owner"],
+    ["12500000-0000-4000-8000-000000000001", "12500000-0000-4000-8000-100000000002", "tenant_member"],
+    ["12500000-0000-4000-8000-000000000002", "12500000-0000-4000-8000-100000000001", "tenant_member"],
+    ["12500000-0000-4000-8000-000000000002", "12500000-0000-4000-8000-100000000002", "tenant_owner"],
+  ];
+  const results = [];
+  for (let pass = 0; pass < 2; pass += 1) {
+    for (let index = 0; index < expected.length; index += 1) {
+      results.push({
+        request_id: `feat-125-bootstrap-${randomUUID()}`,
+        state_changed: pass === 0,
+        authorization_revision: pass === 0 && index < 2 ? 2 : 3,
+        authorization_diff: pass === 0 ? ["synthetic.change"] : [],
+        user_id: expected[index][0],
+        tenant_id: expected[index][1],
+        role: expected[index][2],
+      });
+    }
+  }
+
+  const valid = results.map((value) => JSON.stringify(value)).join("\n") + "\n";
+  assert.deepEqual(validateBootstrapResults(valid), {
+    schema_version: 1,
+    profile: "feat-126-s10-local-lab",
+    manifests: 4,
+    executions: 8,
+    changed: 4,
+    unchanged: 4,
+    final_authorization_revision: 3,
+    content_classification: "synthetic_only",
+  });
+
+  const wrongOrder = structuredClone(results);
+  [wrongOrder[0], wrongOrder[1]] = [wrongOrder[1], wrongOrder[0]];
+  assert.throws(
+    () => validateBootstrapResults(wrongOrder.map((value) => JSON.stringify(value)).join("\n") + "\n"),
+    /results are invalid/,
+  );
+
+  const changedReplay = structuredClone(results);
+  changedReplay[4].state_changed = true;
+  assert.throws(
+    () => validateBootstrapResults(changedReplay.map((value) => JSON.stringify(value)).join("\n") + "\n"),
+    /results are invalid/,
+  );
 });

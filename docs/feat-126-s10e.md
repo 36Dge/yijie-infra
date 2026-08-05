@@ -28,7 +28,11 @@ because Docker Desktop does not create its loopback publisher for an internal-on
 still published only on `127.0.0.1`; it never uses host networking or a shared external network. No service sets
 `container_name`. Redis, pgvector, the ordinary local PostgreSQL database, FEAT-125 volumes, real
 identity, and system/user CA trust are not used. All three image references include exact versions
-and SHA-256 digests; `up` uses `--pull never` and fails if any image is absent.
+and SHA-256 digests. Before `up`, a closed preflight derives each unique `repository@digest`
+identity from those reviewed Compose pins and verifies the local Docker object and repository digest.
+This avoids Docker 29's state-sensitive `version-tag@digest` inspect lookup without weakening the
+Compose version labels or digest authority. `up` still uses `--pull never` and fails if any exact
+digest is absent or mismatched; it never falls back to a floating tag or pulls an image.
 
 The Keycloak realm asset is reused as a configuration authority only. Its Desktop public client
 uses Keycloak's built-in user-session-note mapper to project the numeric `AUTH_TIME` session value
@@ -48,6 +52,7 @@ make feat-126-s10-export-ca RUN_ID=<same-run-id>
 make feat-126-s10-verify-runtime RUN_ID=<same-run-id>
 make feat-126-s10-provision-users RUN_ID=<same-run-id>
 make feat-126-s10-api-migrate RUN_ID=<same-run-id> API_REPO=../yijie-api
+make feat-126-s10-api-bootstrap RUN_ID=<same-run-id> API_REPO=../yijie-api API_SHA=<full-clean-commit-sha>
 make feat-126-s10-stop RUN_ID=<same-run-id>
 ```
 
@@ -67,6 +72,19 @@ not create a second identity standard. The migration command
 requires the exact approved API commit and a clean worktree, then applies the API-owned migrations
 only to `yijie_api_feat126_s10`. Neither command prints credentials or copies application schema into
 Infra.
+
+The bootstrap command is the only authoritative FEAT-126 S10 identity/authorization bootstrap entry
+point. It requires a caller-supplied full API commit SHA and a clean matching worktree, fixes the
+closed profile to `feat-126-s10-local-lab`, fixes the issuer and database, and invokes exactly the four
+already reviewed tracked synthetic manifests. The API-owned verifier proves migration v4 and a wholly
+empty authorization/task state before manifest execution, then proves the exact two-user/two-tenant
+matrix after two ordered, API-owned batch transactions. Each four-manifest pass is atomic, so a
+failure cannot retain a partial user, tenant, membership, role, assignment, or bootstrap-audit
+matrix. The second pass must be unchanged and revision-stable. Infra stores
+only owner-only, run-scoped, content-free count/revision summaries; transient per-operation results
+are removed. It neither contains business SQL nor offers profile, manifest, issuer, database, role,
+or actor overrides. This additive local deployment/security profile has `contract-impact = none` on
+public/private wire, durable schema, and the existing `feat-125-local-lab` profile semantics.
 
 `stop` removes this run's containers and networks but intentionally retains the four named volumes.
 Deleting those volumes requires a separate explicit Owner authorization and an exact run manifest;

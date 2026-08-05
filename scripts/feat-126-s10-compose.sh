@@ -12,12 +12,6 @@ services=(
   feat126-s10-keycloak
   feat126-s10-caddy
 )
-images=(
-  "postgres:16.13-alpine@sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50"
-  "quay.io/keycloak/keycloak:26.7.0@sha256:0f198be292568439d700cdbfb893e69a6009bb43a94a06a945b1d3d506c76b13"
-  "caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648"
-)
-
 if [[ "$action" != "config" && "$action" != "up" && "$action" != "stop" && "$action" != "status" && "$action" != "export-ca" ]]; then
   echo "usage: feat-126-s10-compose.sh config|up|stop|status|export-ca RUN_ID" >&2
   exit 2
@@ -58,12 +52,7 @@ case "$action" in
     echo "Validated FEAT-126 S10E Compose for run $run_id"
     ;;
   up)
-    for image in "${images[@]}"; do
-      if ! docker image inspect "$image" >/dev/null 2>&1; then
-        echo "Required immutable image is absent; refusing to pull: $image" >&2
-        exit 1
-      fi
-    done
+    node "$repo_dir/scripts/verify-feat-126-s10-images.mjs"
     FEAT126_S10_RUN_ID="$run_id" "${compose[@]}" up \
       --detach --wait --pull never "${services[@]}"
     echo "FEAT-126 S10E isolated dependencies are ready for run $run_id"
