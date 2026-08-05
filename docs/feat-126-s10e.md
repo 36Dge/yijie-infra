@@ -10,7 +10,8 @@
   repository. `yijie-contracts` is `N/A` because no business request, response, event, or SDK shape
   changes.
 - Owner-approved decision: DESIGN-126-008 / DEC-126-038 Option B.
-- S10P1, S10P2, S10P3, S10B, MiniMax, and all default feature activation remain out of scope.
+- S10BF1 adds only the separately authorized combined S10B-001 preflight runner described below.
+  S10B-R5, S11, MiniMax, and all default feature activation remain out of scope.
 
 ## Isolation model
 
@@ -105,6 +106,30 @@ therefore `none` even though the local deployment helper interface is stricter.
 `stop` removes this run's containers and networks but intentionally retains the four named volumes.
 Deleting those volumes requires a separate explicit Owner authorization and an exact run manifest;
 `docker compose down --volumes`, `docker volume rm`, and prune commands are not part of S10E.
+
+## S10BF1 single combined preflight
+
+`make feat-126-s10b-preflight` is the sole S10B-001 combined-preflight entry point. It requires a
+fresh canonical run UUID and seven caller-reviewed full commit SHAs for Governance, Contracts, API,
+Host, Desktop, Runtime, and Infra. It derives the seven sibling repositories from the workspace,
+requires each exact worktree to be clean, checks all fixed loopback ports, and then composes the
+accepted image resolver, S10E dependencies, TLS/OIDC runtime inventory, synthetic identity,
+migration, closed bootstrap, API build/readiness, Host/fake build, and fake readiness gates.
+
+The runner deliberately has no dataset or fixture command-line argument, environment variable, or
+Make variable. It builds and invokes the Host-owned `feat126-fake-readiness` probe, which selects the
+frozen case internally and returns a closed projection with separate `dataset_id` and
+`fixture_case_id` fields plus the dataset digest. Infra validates the closed shape and run binding;
+it does not copy either identity into a second authority or construct the fake request headers.
+
+The command records only full candidate SHAs, closed step names, the Host-owned content-free
+readiness identity, cleanup state, and the explicit fact that S10B-R5 was not executed. API and fake
+logs are owner-only, bounded, and scanned against the run's generated secrets. API/fake processes
+and Compose containers/networks are stopped before the command returns; named volumes and the
+owner-only ignored run record remain under the existing disclosure. Any mismatch creates a closed
+`REJECTED` marker and fails without printing child stderr, secrets, DSN, token, source paths, or
+fixture content. This private deployment/test tooling has no central-contract, IPC, durable-schema,
+Host business-wire, or Runtime-pin impact.
 
 ## S10BD1 capability and immutable resolver corrective
 
