@@ -55,6 +55,10 @@ make feat-126-s10-verify-runtime RUN_ID=<same-run-id>
 make feat-126-s10-provision-users RUN_ID=<same-run-id>
 make feat-126-s10-api-migrate RUN_ID=<same-run-id> API_REPO=../yijie-api API_SHA=<full-clean-commit-sha>
 make feat-126-s10-api-bootstrap RUN_ID=<same-run-id> API_REPO=../yijie-api API_SHA=<full-clean-commit-sha>
+make feat-126-s10-api-runtime-profile
+make feat-126-s10b-api-continuation RUN_ID=<same-run-id> \
+  GOVERNANCE_SHA=<full-sha> CONTRACTS_SHA=<full-sha> API_SHA=<full-sha> \
+  HOST_SHA=<full-sha> DESKTOP_SHA=<full-sha> RUNTIME_SHA=<full-sha> INFRA_SHA=<full-sha>
 make feat-126-s10-stop RUN_ID=<same-run-id>
 ```
 
@@ -123,13 +127,52 @@ frozen case internally and returns a closed projection with separate `dataset_id
 it does not copy either identity into a second authority or construct the fake request headers.
 
 The command records only full candidate SHAs, closed step names, the Host-owned content-free
-readiness identity, cleanup state, and the explicit fact that S10B-R5 was not executed. API and fake
-logs are owner-only, bounded, and scanned against the run's generated secrets. API/fake processes
-and Compose containers/networks are stopped before the command returns; named volumes and the
-owner-only ignored run record remain under the existing disclosure. Any mismatch creates a closed
-`REJECTED` marker and fails without printing child stderr, secrets, DSN, token, source paths, or
-fixture content. This private deployment/test tooling has no central-contract, IPC, durable-schema,
-Host business-wire, or Runtime-pin impact.
+readiness identity, the SHA-256 of the verified preflight-built API binary, cleanup state, and the
+explicit fact that S10B-R5 was not executed. The binary is opened without following symlinks and its
+owner, mode, link count and bounded size are checked; a second identity/digest snapshot immediately
+before preflight launch must match. API and fake logs are owner-only, bounded, and scanned against
+the run's generated secrets. API/fake processes and Compose containers/networks are stopped before
+the command returns; named volumes and the owner-only ignored run record remain under the existing
+disclosure. Any mismatch creates a closed `REJECTED` marker and fails without printing child stderr,
+secrets, DSN, token, source paths, or fixture content. This private deployment/test tooling has no
+central-contract, IPC, durable-schema, Host business-wire, or Runtime-pin impact.
+
+## S10B API runtime profile authority corrective
+
+`scripts/feat-126-s10-api-runtime-profile.mjs` is the sole Infra-owned runtime authority for the
+FEAT-126 API process. It exports a closed, versioned projection and a builder that fixes
+`YIJIE_ENV=nonproduction`, `YIJIE_API_SERVICE_PROFILE=feat-126-s10-local-lab`, the loopback API and
+PostgreSQL endpoints, the isolated database, issuer/JWKS, TLS verification, and the two accepted API
+feature gates. `make feat-126-s10-api-runtime-profile` emits only that content-free projection for
+machine inspection. It does not accept a profile, endpoint, database, issuer, or gate override.
+
+The combined preflight imports this authority to construct the API child environment and records the
+same closed projection in its summary. `make feat-126-s10b-api-continuation` is the only accepted API
+continuation entry. It accepts only the canonical run ID and seven full candidate SHAs. The launcher
+derives the summary, secrets, CA, preflight-built API binary and content-free log from fixed paths
+inside that run; profile, endpoint, database, issuer, gate, binary and path overrides do not exist.
+The launcher calls `readApiRuntimeAuthorityFromPreflightSummary`, binds the summary to the same run
+and exact seven-SHA set, and only then passes the returned authority to `buildApiRuntimeEnvironment`.
+Reconstructing the environment in shell, using
+`feat-125-local-lab`, a generic/default/unknown profile, or accepting an operator-provided override
+is a hard failure. The existing FEAT-125 runner and template remain unchanged.
+
+Before spawning, the launcher verifies owner, mode, regular-file, no-symlink, link-count and bounded
+size requirements for the run artifacts. It securely hashes the API binary, requires an exact match
+with `api_binary_sha256` from the closed summary, then repeats the digest and inode/device metadata
+snapshot immediately before spawn. An owner-side accidental replacement or metadata drift therefore
+fails closed rather than running an unbound artifact. It executes only the fixed API binary as a
+foreground child with the closed API environment, forwards termination signals, and propagates its
+exit status. Raw child output is discarded with a strict capacity ceiling; only content-free
+lifecycle records are written to the owner-only run log. This entry starts neither Compose nor
+another component. Its presence and test-harness PASS do not claim that S10B-002 through S10B-012,
+a fresh four-component run, G4, or G6 has executed or passed.
+
+This corrective has `contract-impact = semantic` for the private FEAT-126 deployment interface:
+previous FEAT-126 preflight behavior selected the FEAT-125 API runtime profile, whereas the corrected
+chain selects the dedicated FEAT-126 runtime profile. Public HTTP/event contracts, central SDKs,
+durable schema, private IPC, Host wire, Runtime pin, production/default configuration, immutable
+image pins, `--pull never`, and cleanup semantics do not change; central G2A impact is `none`.
 
 ## S10BD1 capability and immutable resolver corrective
 

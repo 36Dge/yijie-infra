@@ -1,5 +1,7 @@
 import { lstat, open } from "node:fs/promises";
 
+import { FEAT_126_S10_API_RUNTIME_AUTHORITY } from "./feat-126-s10-api-runtime-profile.mjs";
+
 const MAX_RESULTS_BYTES = 128 * 1024;
 const RESULT_KEYS = [
   "authorization_diff",
@@ -55,7 +57,7 @@ export function validateBootstrapResults(text) {
 
   return {
     schema_version: 1,
-    profile: "feat-126-s10-local-lab",
+    profile: FEAT_126_S10_API_RUNTIME_AUTHORITY.service_profile,
     manifests: 4,
     executions: 8,
     changed: 4,

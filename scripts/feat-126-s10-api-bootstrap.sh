@@ -6,7 +6,7 @@ repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 run_id="${1:-}"
 api_repo="${2:-}"
 expected_api_sha="${3:-}"
-profile="feat-126-s10-local-lab"
+profile="$(node "$repo_dir/scripts/feat-126-s10-api-runtime-profile.mjs" --service-profile)"
 issuer="https://localhost:8443/realms/yijie-local"
 
 if [[ "$#" -ne 3 ]]; then
@@ -99,4 +99,4 @@ node "$repo_dir/scripts/verify-feat-126-s10-bootstrap-results.mjs" "$results_fil
 ) >"$evidence_dir/post-state.json"
 
 rm -f -- "$results_file"
-printf '%s\n' '{"status":"passed","profile":"feat-126-s10-local-lab","content_classification":"synthetic_only"}'
+printf '{"status":"passed","profile":"%s","content_classification":"synthetic_only"}\n' "$profile"

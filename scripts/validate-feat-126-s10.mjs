@@ -7,9 +7,14 @@ import {
   loadCompose,
   validateCompose,
 } from "./compose-model.mjs";
+import {
+  FEAT_126_S10_API_RUNTIME_AUTHORITY,
+  validateApiRuntimeAuthority,
+} from "./feat-126-s10-api-runtime-profile.mjs";
 
 const compose = await loadCompose();
 validateCompose(compose);
+validateApiRuntimeAuthority(FEAT_126_S10_API_RUNTIME_AUTHORITY);
 
 for (const name of FEAT_126_S10_SERVICES) {
   const service = compose.services[name];

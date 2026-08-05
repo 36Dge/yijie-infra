@@ -193,7 +193,8 @@ test("FEAT-126 S10 bootstrap wrapper fixes the closed profile, manifests, and AP
     "user-b-tenant-b.json",
   ];
 
-  assert.match(script, /profile="feat-126-s10-local-lab"/);
+  assert.match(script, /profile="\$\(node "\$repo_dir\/scripts\/feat-126-s10-api-runtime-profile\.mjs" --service-profile\)"/);
+  assert.doesNotMatch(script, /profile="feat-125-local-lab"/);
   assert.match(script, /yijie_api_feat126_s10\?sslmode=disable/);
   assert.match(script, /feat-126-s10-api-candidate\.mjs.*"\$expected_api_sha"/);
   assert.match(migration, /feat-126-s10-api-candidate\.mjs.*"\$expected_api_sha"/);

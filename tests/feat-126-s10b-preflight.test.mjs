@@ -7,6 +7,13 @@ import {
   readExpectedSHAs,
   validateProbeResult,
 } from "../scripts/feat-126-s10b-preflight.mjs";
+import {
+  buildApiRuntimeEnvironment,
+  FEAT_126_S10_API_RUNTIME_AUTHORITY,
+  Feat126S10ApiRuntimeProfileError,
+  readApiRuntimeAuthorityFromPreflightSummary,
+  validateApiRuntimeAuthority,
+} from "../scripts/feat-126-s10-api-runtime-profile.mjs";
 
 const RUN_ID = "12600000-0000-4000-8000-000000000057";
 const DATASET_SHA = "a".repeat(64);
@@ -95,4 +102,103 @@ test("S10BF1-004 combines accepted S10E, identity, migration, bootstrap, API and
   assert.match(runner, /preflight_cleanup_incomplete/);
   assert.match(runner, /preflight_secret_leak_detected/);
   assert.doesNotMatch(runner, /docker (?:image )?pull|docker system prune|docker volume rm/);
+});
+
+test("S10B runtime profile authority is closed to the dedicated FEAT-126 profile", () => {
+  assert.equal(
+    FEAT_126_S10_API_RUNTIME_AUTHORITY.service_profile,
+    "feat-126-s10-local-lab",
+  );
+  assert.deepEqual(
+    validateApiRuntimeAuthority(FEAT_126_S10_API_RUNTIME_AUTHORITY),
+    FEAT_126_S10_API_RUNTIME_AUTHORITY,
+  );
+
+  for (const serviceProfile of ["feat-125-local-lab", "local-lab", "default", "unknown"]) {
+    assert.throws(
+      () =>
+        validateApiRuntimeAuthority({
+          ...FEAT_126_S10_API_RUNTIME_AUTHORITY,
+          service_profile: serviceProfile,
+        }),
+      (error) =>
+        error instanceof Feat126S10ApiRuntimeProfileError &&
+        error.code === "api_runtime_profile_authority_invalid",
+    );
+  }
+  assert.throws(
+    () =>
+      validateApiRuntimeAuthority({
+        ...FEAT_126_S10_API_RUNTIME_AUTHORITY,
+        operator_override: true,
+      }),
+    (error) => error instanceof Feat126S10ApiRuntimeProfileError,
+  );
+});
+
+test("S10B preflight and continuation environment derive from one runtime authority", async () => {
+  const environment = buildApiRuntimeEnvironment({
+    databasePassword: "a".repeat(64),
+    localCaPemPath: "/owner-only/run/caddy-root.crt",
+    localCaSha256: "b".repeat(64),
+  });
+  assert.equal(environment.YIJIE_ENV, "nonproduction");
+  assert.equal(environment.YIJIE_API_SERVICE_PROFILE, "feat-126-s10-local-lab");
+  assert.equal(environment.YIJIE_API_PORT, "18080");
+  assert.match(environment.YIJIE_API_POSTGRES_DSN, /127\.0\.0\.1:5432\/yijie_api_feat126_s10\?sslmode=disable$/);
+  assert.equal(environment.YIJIE_API_PERMISSION_PROJECTION_ENABLED, "true");
+  assert.equal(environment.YIJIE_API_SECURE_TASKS_ENABLED, "true");
+
+  const summary = {
+    schema_version: 1,
+    status: "passed",
+    scope: "S10B-001-combined-preflight",
+    run_id: RUN_ID,
+    api_runtime_authority: FEAT_126_S10_API_RUNTIME_AUTHORITY,
+  };
+  assert.deepEqual(
+    readApiRuntimeAuthorityFromPreflightSummary(summary, RUN_ID),
+    FEAT_126_S10_API_RUNTIME_AUTHORITY,
+  );
+  assert.throws(
+    () =>
+      readApiRuntimeAuthorityFromPreflightSummary(
+        {
+          ...summary,
+          api_runtime_authority: {
+            ...FEAT_126_S10_API_RUNTIME_AUTHORITY,
+            service_profile: "feat-125-local-lab",
+          },
+        },
+        RUN_ID,
+      ),
+    (error) => error instanceof Feat126S10ApiRuntimeProfileError,
+  );
+  assert.throws(
+    () =>
+      readApiRuntimeAuthorityFromPreflightSummary(
+        summary,
+        "12600000-0000-4000-8000-000000000058",
+      ),
+    (error) => error instanceof Feat126S10ApiRuntimeProfileError,
+  );
+
+  const [runner, makefile] = await Promise.all([
+    readFile("scripts/feat-126-s10b-preflight.mjs", "utf8"),
+    readFile("Makefile", "utf8"),
+  ]);
+  assert.match(runner, /buildApiRuntimeEnvironment/);
+  assert.match(runner, /api_binary_sha256: result\.apiBinarySha256/);
+  assert.match(runner, /inspectApiBinary/);
+  assert.match(runner, /api_runtime_authority: result\.apiRuntimeAuthority/);
+  assert.doesNotMatch(runner, /feat-125-local-lab/);
+  assert.match(makefile, /feat-126-s10-api-runtime-profile:/);
+  assert.match(makefile, /node scripts\/feat-126-s10-api-runtime-profile\.mjs/);
+});
+
+test("S10B machine-readable runtime authority accepts no profile override", async () => {
+  const source = await readFile("scripts/feat-126-s10-api-runtime-profile.mjs", "utf8");
+  assert.match(source, /process\.argv\[2\] === "--service-profile"/);
+  assert.doesNotMatch(source, /process\.env.*SERVICE_PROFILE/);
+  assert.doesNotMatch(source, /--service-profile=/);
 });

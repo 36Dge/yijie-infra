@@ -10,6 +10,12 @@ import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { validateFeat126S10Secrets } from "./feat-126-s10-secrets.mjs";
+import { inspectApiBinary, sameApiBinarySnapshot } from "./feat-126-s10-api-binary.mjs";
+import {
+  buildApiRuntimeEnvironment,
+  FEAT_126_S10_API_RUNTIME_AUTHORITY,
+  validateApiRuntimeAuthority,
+} from "./feat-126-s10-api-runtime-profile.mjs";
 
 const INFRA_ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const WORKSPACE_ROOT = resolve(INFRA_ROOT, "..");
@@ -230,6 +236,12 @@ async function writeClosedJSON(path, value) {
 
 async function execute(runId, expectedSHAs) {
   if (!RUN_ID_PATTERN.test(runId ?? "")) fail("preflight_run_id_invalid");
+  let apiRuntimeAuthority;
+  try {
+    apiRuntimeAuthority = validateApiRuntimeAuthority(FEAT_126_S10_API_RUNTIME_AUTHORITY);
+  } catch {
+    fail("preflight_api_runtime_profile_authority_invalid");
+  }
   for (const [role, repository] of Object.entries(REPOSITORIES)) {
     inspectRepository(role, repository, expectedSHAs[role]);
   }
@@ -309,27 +321,41 @@ async function execute(runId, expectedSHAs) {
       cwd: REPOSITORIES.host,
       env: buildEnvironment,
     });
+    const apiBinaryPath = resolve(binRoot, "yijie-api");
+    let apiBinarySnapshot;
+    try {
+      apiBinarySnapshot = await inspectApiBinary(apiBinaryPath);
+    } catch {
+      fail("preflight_api_binary_invalid");
+    }
     completed.push("api_binary", "host_binary", "fake_binary", "probe_binary");
 
     const secrets = await validateFeat126S10Secrets(secretsPath);
     const ca = await readFile(caPath);
     const caPin = sha256(ca);
+    let apiEnvironment;
+    try {
+      apiEnvironment = buildApiRuntimeEnvironment({
+        authority: apiRuntimeAuthority,
+        databasePassword: secrets.get("FEAT126_S10_API_DB_PASSWORD"),
+        localCaPemPath: caPath,
+        localCaSha256: caPin,
+      });
+    } catch {
+      fail("preflight_api_runtime_profile_authority_invalid");
+    }
+    let launchBinarySnapshot;
+    try {
+      launchBinarySnapshot = await inspectApiBinary(apiBinaryPath);
+    } catch {
+      fail("preflight_api_binary_invalid");
+    }
+    if (!sameApiBinarySnapshot(apiBinarySnapshot, launchBinarySnapshot)) {
+      fail("preflight_api_binary_drift");
+    }
     apiProcess = startProcess(
-      resolve(binRoot, "yijie-api"),
-      {
-        YIJIE_ENV: "nonproduction",
-        YIJIE_API_SERVICE_PROFILE: "feat-125-local-lab",
-        YIJIE_API_PORT: "18080",
-        YIJIE_API_POSTGRES_DSN: `postgres://yijie:${secrets.get("FEAT126_S10_API_DB_PASSWORD")}@127.0.0.1:5432/yijie_api_feat126_s10?sslmode=disable`,
-        YIJIE_API_DB_MIN_CONNS: "1",
-        YIJIE_API_DB_MAX_CONNS: "4",
-        YIJIE_API_PERMISSION_PROJECTION_ENABLED: "true",
-        YIJIE_API_SECURE_TASKS_ENABLED: "true",
-        YIJIE_API_ACCESS_ISSUER: "https://localhost:8443/realms/yijie-local",
-        YIJIE_API_ACCESS_JWKS_URL: "https://localhost:8443/realms/yijie-local/protocol/openid-connect/certs",
-        YIJIE_API_LOCAL_CA_PEM_PATH: caPath,
-        YIJIE_API_LOCAL_CA_SHA256: caPin,
-      },
+      apiBinaryPath,
+      apiEnvironment,
       resolve(logRoot, "api.log"),
     );
     await waitForAPI(apiProcess);
@@ -379,7 +405,15 @@ async function execute(runId, expectedSHAs) {
       [...secrets.values()],
     );
     completed.push("content_free_logs");
-    return { readiness, completed, runRoot, logRoot, evidenceRoot };
+    return {
+      readiness,
+      apiRuntimeAuthority,
+      apiBinarySha256: launchBinarySnapshot.sha256,
+      completed,
+      runRoot,
+      logRoot,
+      evidenceRoot,
+    };
   } catch (error) {
     failure = error instanceof S10BPreflightError ? error : new S10BPreflightError("preflight_internal_failure");
     throw failure;
@@ -428,6 +462,8 @@ async function main() {
     scope: "S10B-001-combined-preflight",
     run_id: runId,
     repositories: expectedSHAs,
+    api_binary_sha256: result.apiBinarySha256,
+    api_runtime_authority: result.apiRuntimeAuthority,
     fake_readiness: result.readiness,
     completed: result.completed,
     cleanup: "passed",
