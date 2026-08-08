@@ -208,6 +208,58 @@ image pins, `--pull never`, and cleanup semantics do not change; central G2A imp
 - No curl fixture or empty row count may be presented as Desktop-to-Public-Tasks E2E evidence.
 - S10E completion does not authorize S10P1 or S10B and does not change G3/G4/G6.
 
+## S10BEP1 closed resolver result propagation
+
+The combined preflight invokes the resolver child with the fixed Node executable and the fixed
+`verify-feat-126-s10-images.mjs --closed-result-v1 <RUN_ID>` command. The ordinary
+`make feat-126-s10-verify-images` command and the Compose `up` path keep their existing
+human-readable output and remain the compatibility path for older callers. After a validated closed
+pass and evidence write, the parent reruns the reviewed read-only `feat-126-s10-config` wrapper to
+recheck Compose 5.3.0, the canonical secret file, the `REJECTED` guard, and rendered configuration.
+It then builds the dependency start command from the shared fixed Compose profile and service
+authority, with the canonical run-scoped secret path and `--pull never`, so that the resolver is not
+run a second time through the human path. Both recheck and direct start retain the existing
+`preflight_dependencies_failed` boundary. The preflight exposes no operator input for this internal
+transition, and tests lock the exact resolver -> recheck -> fixed start ordering and full arguments.
+
+Closed mode emits exactly one UTF-8 JSON line and no stderr. A pass contains only
+`schema_version`, `status`, `run_id`, `image_count`, and `probe_count` (all three unique images and
+probes are required). A failure contains only `schema_version`, `status`, `run_id`, `failure_class`,
+`phase`, `target`, and `cleanup_state`; the twelve S10BD1 failure classes and explicit legal
+phase/target/cleanup tuples are defined and validated by the resolver module itself, rather than as
+independent Cartesian allowlists. A validation failure followed by successful owned cleanup retains
+its original leaf with `probe_validate/.../removed`; an opaque cleanup failure becomes
+`resolver_probe_cleanup_incomplete`. The parent imports the protocol as a namespace and validates
+all required exports before use, so a new parent paired with an old child fails as
+`preflight_image_resolver_result_invalid`. The parent also rejects duplicate JSON keys and requires
+exactly one trailing LF, in addition to the 2048-byte line limit, 4096-byte child buffer, 120-second
+timeout, empty stderr, exact exit/status relation, and run binding.
+
+After validation, the parent writes the envelope once to the ignored run artifact
+`preflight-evidence/image-resolver-result.v1.json` using create-new/no-follow semantics and mode
+`0600`. A validated leaf is projected to `preflight_image_resolver_<leaf>` in the existing exact
+three-field `REJECTED` marker. Process, timeout, framing, oversize, and evidence failures use only
+the five parent-only closed classes. No child stderr, command, socket/path, image pin/digest,
+container ID, secret, DSN, token, or cleanup instruction is copied or acted upon; cleanup-incomplete
+and unknown outcomes remain stop-only. The `images` gate is added to `completed` only after the
+validated envelope and evidence write succeed.
+
+Repository verification passes `pnpm test` 128/128, `pnpm validate`, the targeted 34/34
+S10BD1/S10BF1/S10BEP1 matrix, Node syntax, `git diff --check`, and full `make lint`/`make test`,
+including the Compose semantic tail. On 2026-08-09, reviewed Docker client/server 29.6.1, Compose
+5.3.0, and daemon access passed the execution gate. Canonical run
+`624bd64c-b378-4d53-97c0-05790e7e4657` then completed the isolated parent path with an exact passed
+v1 envelope for three immutable identities and three no-start probes. The sole 0600 evidence file has
+SHA-256 `e13f633fb331e3b0c0d08f22e16f7126980555ae849a73766a7bcc2259be6b34`; it contains only the five
+success fields and no log, secret, path, image, or container payload. All three exact image
+Id/RepoDigest/platform snapshots matched before and after the run, daemon state remained six
+containers/zero running/six images, and run-scoped containers, networks, volumes, and fixed listeners
+were all zero after execution. No service, S10B-R7, or other runtime action was executed;
+`s10b_r7_executed=false`. S10BEP1-014 is PASS, and DEC-126-062 later accepted the corrective
+Closure and closed S10B-BLK-007. DEC-126-063 separately authorizes only the local Infra and
+Governance clean checkpoints; the commit containing this runbook forms the Infra checkpoint. A
+fresh S10B-R7, S11, MiniMax, feature activation, real data, and remote writes remain unauthorized.
+
 ## Recovery
 
 Stop only the exact derived Compose project. Preserve volumes unless the Owner separately authorizes

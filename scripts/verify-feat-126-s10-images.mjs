@@ -4,12 +4,45 @@ import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
 import { FEAT_126_S10_IMAGES } from "./compose-model.mjs";
+import YAML from "yaml";
 
 const PIN_PATTERN = /^(?<repository>.+):(?<tag>[^/:@]+)@(?<digest>sha256:[a-f0-9]{64})$/;
 const IMAGE_ID_PATTERN = /^sha256:[a-f0-9]{64}$/;
 const CONTAINER_ID_PATTERN = /^[a-f0-9]{64}$/;
 const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const MAX_OUTPUT_BYTES = 1024 * 1024;
+export const CLOSED_RESOLVER_RESULT_SCHEMA_VERSION = 1;
+export const CLOSED_RESOLVER_RESULT_MAX_BYTES = 2048;
+export const CLOSED_RESOLVER_SPAWN_BUFFER_BYTES = 4096;
+export const CLOSED_RESOLVER_TIMEOUT_MS = 120_000;
+
+export const RESOLVER_PHASES = Object.freeze([
+  "capability",
+  "identity_parse",
+  "identity_inspect",
+  "identity_validate",
+  "identity_stability",
+  "probe_precheck",
+  "probe_create",
+  "probe_reconcile",
+  "probe_validate",
+  "probe_cleanup",
+]);
+
+export const RESOLVER_TARGETS = Object.freeze([
+  "docker",
+  "postgres",
+  "keycloak",
+  "caddy",
+]);
+
+export const RESOLVER_CLEANUP_STATES = Object.freeze([
+  "not_applicable",
+  "absent",
+  "removed",
+  "incomplete",
+  "unknown",
+]);
 
 export const DOCKER_FAILURE_CLASSES = Object.freeze([
   "docker_cli_unavailable",
@@ -27,6 +60,78 @@ export const DOCKER_FAILURE_CLASSES = Object.freeze([
 ]);
 
 const FAILURE_CLASS_SET = new Set(DOCKER_FAILURE_CLASSES);
+const RESOLVER_PHASE_SET = new Set(RESOLVER_PHASES);
+const RESOLVER_TARGET_SET = new Set(RESOLVER_TARGETS);
+const RESOLVER_CLEANUP_SET = new Set(RESOLVER_CLEANUP_STATES);
+const resolverContextKey = (phase, target, cleanupState) =>
+  phase + "\u0000" + target + "\u0000" + cleanupState;
+const targetContexts = (phase, cleanupStates) =>
+  RESOLVER_TARGETS.flatMap((target) =>
+    cleanupStates.map((cleanupState) => resolverContextKey(phase, target, cleanupState)),
+  );
+const dockerFailureContexts = [
+  resolverContextKey("capability", "docker", "not_applicable"),
+  ...targetContexts("identity_inspect", ["not_applicable"]),
+  ...targetContexts("probe_precheck", ["unknown"]),
+  ...targetContexts("probe_create", ["unknown"]),
+  ...targetContexts("probe_reconcile", ["unknown"]),
+  ...targetContexts("probe_validate", ["unknown", "removed"]),
+  ...targetContexts("probe_cleanup", ["incomplete", "unknown"]),
+];
+const inspectPayloadContexts = [
+  resolverContextKey("capability", "docker", "not_applicable"),
+  ...targetContexts("identity_inspect", ["not_applicable"]),
+  ...targetContexts("probe_precheck", ["unknown"]),
+  ...targetContexts("probe_reconcile", ["unknown"]),
+  ...targetContexts("probe_validate", ["unknown", "removed"]),
+  ...targetContexts("probe_cleanup", ["incomplete", "unknown"]),
+];
+const identityInvalidContexts = [
+  resolverContextKey("identity_parse", "docker", "not_applicable"),
+  ...targetContexts("identity_inspect", ["not_applicable"]),
+  ...targetContexts("identity_validate", ["not_applicable"]),
+  ...targetContexts("identity_stability", ["not_applicable"]),
+];
+const identityInspectContexts = targetContexts("identity_inspect", ["not_applicable"]);
+const identityValidateContexts = targetContexts("identity_validate", ["not_applicable"]);
+const resolverProbeContexts = [
+  ...RESOLVER_TARGETS.flatMap((target) => [
+    resolverContextKey("probe_precheck", target, "not_applicable"),
+    resolverContextKey("probe_precheck", target, "unknown"),
+    ...["probe_create", "probe_reconcile"].flatMap((phase) =>
+      ["absent", "removed", "unknown"].map((cleanupState) =>
+        resolverContextKey(phase, target, cleanupState),
+      ),
+    ),
+    resolverContextKey("probe_validate", target, "removed"),
+  ]),
+];
+
+// Each failure class is an explicit set of legal tuples. Keeping tuples
+// together prevents an invalid phase/target/cleanup Cartesian product from
+// becoming a valid evidence record.
+export const RESOLVER_FAILURE_CONTEXTS = Object.freeze({
+  docker_cli_unavailable: Object.freeze(dockerFailureContexts),
+  docker_permission_denied: Object.freeze(dockerFailureContexts),
+  docker_daemon_unavailable: Object.freeze(dockerFailureContexts),
+  image_not_found: Object.freeze(identityInspectContexts),
+  image_reference_unresolved: Object.freeze(identityInspectContexts),
+  image_identity_invalid: Object.freeze(identityInvalidContexts),
+  image_repository_mismatch: Object.freeze([
+    ...identityInspectContexts,
+    ...identityValidateContexts,
+  ]),
+  image_digest_mismatch: Object.freeze([
+    ...identityInspectContexts,
+    ...identityValidateContexts,
+  ]),
+  image_platform_mismatch: Object.freeze(identityValidateContexts),
+  inspect_payload_invalid: Object.freeze(inspectPayloadContexts),
+  resolver_probe_failed: Object.freeze(resolverProbeContexts),
+  resolver_probe_cleanup_incomplete: Object.freeze(
+    targetContexts("probe_cleanup", ["incomplete", "unknown"]),
+  ),
+});
 const STATIC_LABELS = Object.freeze({
   "ai.yijie.feature": "FEAT-126",
   "ai.yijie.slice": "S10BD1",
@@ -34,18 +139,242 @@ const STATIC_LABELS = Object.freeze({
 });
 
 export class DockerPreflightError extends Error {
-  constructor(code) {
+  constructor(code, context = {}) {
     if (!FAILURE_CLASS_SET.has(code)) {
       throw new TypeError("unknown closed Docker failure class");
     }
     super("FEAT-126 Docker preflight failed: " + code);
     this.name = "DockerPreflightError";
     this.code = code;
+    this.resolverContext = Object.freeze({ ...context });
   }
 }
 
-function fail(code) {
-  throw new DockerPreflightError(code);
+function fail(code, context = {}) {
+  throw new DockerPreflightError(code, context);
+}
+
+function annotateFailure(error, context, { override = false } = {}) {
+  if (!(error instanceof DockerPreflightError)) {
+    return error;
+  }
+  const existing = error.resolverContext ?? {};
+  error.resolverContext = Object.freeze({
+    phase: override ? context.phase : existing.phase ?? context.phase,
+    target: override ? context.target : existing.target ?? context.target,
+    cleanup_state: override
+      ? context.cleanup_state
+      : existing.cleanup_state ?? context.cleanup_state,
+  });
+  return error;
+}
+
+function withFailureContext(context, operation) {
+  try {
+    return operation();
+  } catch (error) {
+    const annotated = annotateFailure(error, context);
+    if (
+      context.phase === "probe_cleanup" &&
+      annotated instanceof DockerPreflightError &&
+      annotated.code === "resolver_probe_failed"
+    ) {
+      throw new DockerPreflightError("resolver_probe_cleanup_incomplete", {
+        phase: "probe_cleanup",
+        target: context.target,
+        cleanup_state: context.cleanup_state,
+      });
+    }
+    throw annotated;
+  }
+}
+
+function targetForImage(image) {
+  const repository = image?.repository ?? "";
+  if (repository === "postgres" || repository.startsWith("postgres/")) return "postgres";
+  if (repository.includes("keycloak")) return "keycloak";
+  if (repository === "caddy" || repository.startsWith("caddy/")) return "caddy";
+  return "docker";
+}
+
+const CLOSED_SUCCESS_KEYS = Object.freeze([
+  "image_count",
+  "probe_count",
+  "run_id",
+  "schema_version",
+  "status",
+]);
+const CLOSED_FAILURE_KEYS = Object.freeze([
+  "cleanup_state",
+  "failure_class",
+  "phase",
+  "run_id",
+  "schema_version",
+  "status",
+  "target",
+]);
+const CLOSED_RESULT_ERROR_CODES = new Set(["result_invalid", "result_oversize"]);
+
+export class ClosedResolverResultError extends Error {
+  constructor(code) {
+    if (!CLOSED_RESULT_ERROR_CODES.has(code)) {
+      throw new TypeError("unknown closed resolver result error");
+    }
+    super(code);
+    this.name = "ClosedResolverResultError";
+    this.code = code;
+  }
+}
+
+function resultFail(code = "result_invalid") {
+  throw new ClosedResolverResultError(code);
+}
+
+function exactKeys(value, expected) {
+  return JSON.stringify(Object.keys(value).sort()) === JSON.stringify(expected);
+}
+
+function validFailureContext(failureClass, phase, target, cleanupState) {
+  const allowed = RESOLVER_FAILURE_CONTEXTS[failureClass];
+  return (
+    allowed !== undefined &&
+    RESOLVER_PHASE_SET.has(phase) &&
+    RESOLVER_TARGET_SET.has(target) &&
+    RESOLVER_CLEANUP_SET.has(cleanupState) &&
+    allowed.includes(resolverContextKey(phase, target, cleanupState))
+  );
+}
+
+export function validateClosedResolverResult(value, expectedRunId) {
+  if (
+    value === null ||
+    Array.isArray(value) ||
+    typeof value !== "object" ||
+    !RUN_ID_PATTERN.test(expectedRunId ?? "") ||
+    value.schema_version !== CLOSED_RESOLVER_RESULT_SCHEMA_VERSION ||
+    value.run_id !== expectedRunId
+  ) {
+    resultFail();
+  }
+
+  if (value.status === "passed") {
+    if (
+      !exactKeys(value, CLOSED_SUCCESS_KEYS) ||
+      value.image_count !== 3 ||
+      value.probe_count !== 3
+    ) {
+      resultFail();
+    }
+  } else if (value.status === "failed") {
+    if (
+      !exactKeys(value, CLOSED_FAILURE_KEYS) ||
+      !FAILURE_CLASS_SET.has(value.failure_class) ||
+      !validFailureContext(
+        value.failure_class,
+        value.phase,
+        value.target,
+        value.cleanup_state,
+      )
+    ) {
+      resultFail();
+    }
+  } else {
+    resultFail();
+  }
+
+  return Object.freeze({ ...value });
+}
+
+export function parseClosedResolverResult(output, expectedRunId) {
+  const bytes = Buffer.isBuffer(output) ? output : Buffer.from(output ?? "", "utf8");
+  if (bytes.length === 0) resultFail();
+  if (bytes.length > CLOSED_RESOLVER_RESULT_MAX_BYTES) resultFail("result_oversize");
+
+  let framed;
+  try {
+    framed = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    resultFail();
+  }
+  if (framed.includes("\0") || framed.includes("\r")) resultFail();
+  if (!framed.endsWith("\n")) resultFail();
+  const body = framed.slice(0, -1);
+  if (body.length === 0 || body.includes("\n") || body !== body.trim()) resultFail();
+
+  let value;
+  try {
+    // The YAML parser is used only as a duplicate-key detector; JSON.parse
+    // remains the syntax and value authority for this wire format.
+    YAML.parse(body, { version: "1.2", uniqueKeys: true });
+    value = JSON.parse(body);
+  } catch {
+    resultFail();
+  }
+  return validateClosedResolverResult(value, expectedRunId);
+}
+
+export function closedResolverSuccess(runId, result) {
+  return validateClosedResolverResult(
+    {
+      schema_version: CLOSED_RESOLVER_RESULT_SCHEMA_VERSION,
+      status: "passed",
+      run_id: runId,
+      image_count: result?.imageCount,
+      probe_count: result?.probeCount,
+    },
+    runId,
+  );
+}
+
+function defaultFailureContext(failureClass) {
+  if (failureClass === "docker_cli_unavailable") {
+    return { phase: "capability", target: "docker", cleanup_state: "not_applicable" };
+  }
+  if (
+    failureClass === "image_platform_mismatch"
+  ) {
+    return { phase: "identity_validate", target: "docker", cleanup_state: "not_applicable" };
+  }
+  if (failureClass.startsWith("image_") || failureClass === "inspect_payload_invalid") {
+    return { phase: "identity_inspect", target: "docker", cleanup_state: "not_applicable" };
+  }
+  if (failureClass === "resolver_probe_cleanup_incomplete") {
+    return { phase: "probe_cleanup", target: "docker", cleanup_state: "unknown" };
+  }
+  if (failureClass === "resolver_probe_failed") {
+    return { phase: "probe_reconcile", target: "docker", cleanup_state: "unknown" };
+  }
+  return { phase: "capability", target: "docker", cleanup_state: "not_applicable" };
+}
+
+export function closedResolverFailure(runId, error) {
+  const failureClass =
+    error instanceof DockerPreflightError ? error.code : "resolver_probe_failed";
+  const fallback = defaultFailureContext(failureClass);
+  const context = error instanceof DockerPreflightError ? error.resolverContext : {};
+  return validateClosedResolverResult(
+    {
+      schema_version: CLOSED_RESOLVER_RESULT_SCHEMA_VERSION,
+      status: "failed",
+      run_id: runId,
+      failure_class: failureClass,
+      phase: context?.phase ?? fallback.phase,
+      target: context?.target ?? fallback.target,
+      cleanup_state: context?.cleanup_state ?? fallback.cleanup_state,
+    },
+    runId,
+  );
+}
+
+export function mapClosedResolverFailure(failureClass) {
+  if (!FAILURE_CLASS_SET.has(failureClass)) resultFail();
+  return "preflight_image_resolver_" + failureClass;
+}
+
+function writeClosedResolverResult(value) {
+  const output = Buffer.from(JSON.stringify(value) + "\n", "utf8");
+  if (output.length > CLOSED_RESOLVER_RESULT_MAX_BYTES) resultFail("result_oversize");
+  process.stdout.write(output);
 }
 
 function executeDocker(args) {
@@ -418,56 +747,122 @@ export function runResolverProbe({
   ordinal,
   runDocker = executeDocker,
 }) {
-  const probe = buildResolverProbeArgs({
-    image,
-    runId,
-    ordinal,
-    volumes: identity.volumes,
-  });
-  if (inspectContainer(probe.name, runDocker, { allowMissing: true }) !== null) {
-    fail("resolver_probe_failed");
+  const target = targetForImage(image);
+  const probe = withFailureContext(
+    { phase: "probe_precheck", target, cleanup_state: "not_applicable" },
+    () =>
+      buildResolverProbeArgs({
+        image,
+        runId,
+        ordinal,
+        volumes: identity.volumes,
+      }),
+  );
+  const existing = withFailureContext(
+    { phase: "probe_precheck", target, cleanup_state: "unknown" },
+    () => inspectContainer(probe.name, runDocker, { allowMissing: true }),
+  );
+  if (existing !== null) {
+    fail("resolver_probe_failed", {
+      phase: "probe_precheck",
+      target,
+      cleanup_state: "unknown",
+    });
   }
 
-  const created = runDocker(probe.args);
+  const created = withFailureContext(
+    { phase: "probe_create", target, cleanup_state: "unknown" },
+    () => runDocker(probe.args),
+  );
   if (!succeeded(created)) {
     const detail = diagnostic(created);
     if (/permission denied|operation not permitted|access is denied/.test(detail)) {
-      fail("docker_permission_denied");
+      fail("docker_permission_denied", {
+        phase: "probe_create",
+        target,
+        cleanup_state: "unknown",
+      });
     }
     if (
       /cannot connect|is the docker daemon running|docker daemon is not running|daemon unavailable|error during connect|connection refused|dial unix/.test(
         detail,
       )
     ) {
-      fail("docker_daemon_unavailable");
+      fail("docker_daemon_unavailable", {
+        phase: "probe_create",
+        target,
+        cleanup_state: "unknown",
+      });
     }
-    const reconciled = inspectContainer(probe.name, runDocker, { allowMissing: true });
+    const reconciled = withFailureContext(
+      { phase: "probe_reconcile", target, cleanup_state: "unknown" },
+      () => inspectContainer(probe.name, runDocker, { allowMissing: true }),
+    );
+    let cleanupState = "absent";
     if (reconciled) {
       const reconciledId = text(reconciled.Id).replace(/^sha256:/, "");
-      cleanupOwnedProbe({ ...probe, containerId: reconciledId, image }, runDocker);
+      withFailureContext(
+        { phase: "probe_cleanup", target, cleanup_state: "incomplete" },
+        () => cleanupOwnedProbe({ ...probe, containerId: reconciledId, image }, runDocker),
+      );
+      cleanupState = "removed";
     }
-    fail("resolver_probe_failed");
+    fail("resolver_probe_failed", {
+      phase: "probe_create",
+      target,
+      cleanup_state: cleanupState,
+    });
   }
 
   const containerId = text(created.stdout).trim();
   if (!CONTAINER_ID_PATTERN.test(containerId)) {
-    const reconciled = inspectContainer(probe.name, runDocker, { allowMissing: true });
+    const reconciled = withFailureContext(
+      { phase: "probe_reconcile", target, cleanup_state: "unknown" },
+      () => inspectContainer(probe.name, runDocker, { allowMissing: true }),
+    );
+    let cleanupState = "absent";
     if (reconciled) {
       const reconciledId = text(reconciled.Id).replace(/^sha256:/, "");
-      cleanupOwnedProbe({ ...probe, containerId: reconciledId, image }, runDocker);
+      withFailureContext(
+        { phase: "probe_cleanup", target, cleanup_state: "incomplete" },
+        () => cleanupOwnedProbe({ ...probe, containerId: reconciledId, image }, runDocker),
+      );
+      cleanupState = "removed";
     }
-    fail("resolver_probe_failed");
+    fail("resolver_probe_failed", {
+      phase: "probe_reconcile",
+      target,
+      cleanup_state: cleanupState,
+    });
   }
   const context = { ...probe, containerId, image, volumes: identity.volumes };
   let validationError;
   try {
-    validateProbeContainer(inspectContainer(probe.name, runDocker), context);
+    withFailureContext(
+      { phase: "probe_validate", target, cleanup_state: "unknown" },
+      () =>
+        validateProbeContainer(
+          inspectContainer(probe.name, runDocker),
+          context,
+        ),
+    );
   } catch (error) {
     validationError = error;
   }
-  cleanupOwnedProbe(context, runDocker);
+  withFailureContext(
+    { phase: "probe_cleanup", target, cleanup_state: "incomplete" },
+    () => cleanupOwnedProbe(context, runDocker),
+  );
   if (validationError) {
-    throw validationError;
+    throw annotateFailure(
+      validationError,
+      {
+        phase: "probe_validate",
+        target,
+        cleanup_state: "removed",
+      },
+      { override: true },
+    );
   }
 }
 
@@ -478,16 +873,47 @@ export function verifyLocalImageAvailability({
   resolverProbe = true,
 } = {}) {
   if (resolverProbe && !RUN_ID_PATTERN.test(runId ?? "")) {
-    fail("resolver_probe_failed");
+    fail("resolver_probe_failed", {
+      phase: "probe_precheck",
+      target: "docker",
+      cleanup_state: "not_applicable",
+    });
   }
-  const capability = verifyDockerExecutionCapability({ runDocker });
-  const expected = expectedImmutableImages(imageMap);
+  const capability = withFailureContext(
+    { phase: "capability", target: "docker", cleanup_state: "not_applicable" },
+    () => verifyDockerExecutionCapability({ runDocker }),
+  );
+  const expected = withFailureContext(
+    { phase: "identity_parse", target: "docker", cleanup_state: "not_applicable" },
+    () => expectedImmutableImages(imageMap),
+  );
   for (const [ordinal, image] of expected.entries()) {
-    const first = validateImageSnapshot(inspectExactImage(image, runDocker), image, capability);
-    const second = validateImageSnapshot(inspectExactImage(image, runDocker), image, capability);
-    stableIdentity(first, second);
+    const target = targetForImage(image);
+    const firstSnapshot = withFailureContext(
+      { phase: "identity_inspect", target, cleanup_state: "not_applicable" },
+      () => inspectExactImage(image, runDocker),
+    );
+    const first = withFailureContext(
+      { phase: "identity_validate", target, cleanup_state: "not_applicable" },
+      () => validateImageSnapshot(firstSnapshot, image, capability),
+    );
+    const secondSnapshot = withFailureContext(
+      { phase: "identity_inspect", target, cleanup_state: "not_applicable" },
+      () => inspectExactImage(image, runDocker),
+    );
+    const second = withFailureContext(
+      { phase: "identity_validate", target, cleanup_state: "not_applicable" },
+      () => validateImageSnapshot(secondSnapshot, image, capability),
+    );
+    withFailureContext(
+      { phase: "identity_stability", target, cleanup_state: "not_applicable" },
+      () => stableIdentity(first, second),
+    );
     if (resolverProbe) {
-      runResolverProbe({ image, identity: first, runId, ordinal, runDocker });
+      withFailureContext(
+        { phase: "probe_reconcile", target, cleanup_state: "unknown" },
+        () => runResolverProbe({ image, identity: first, runId, ordinal, runDocker }),
+      );
     }
   }
   return Object.freeze({
@@ -508,13 +934,37 @@ function main() {
   );
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  try {
-    main();
-  } catch (error) {
-    const code =
-      error instanceof DockerPreflightError ? error.code : "resolver_probe_failed";
-    process.stderr.write("FEAT-126 Docker preflight failed: " + code + "\n");
+function closedMain() {
+  const runId = process.argv[3] ?? "";
+  if (process.argv.length !== 4 || !RUN_ID_PATTERN.test(runId)) {
     process.exitCode = 1;
+    return;
+  }
+  try {
+    writeClosedResolverResult(
+      closedResolverSuccess(runId, verifyLocalImageAvailability({ runId })),
+    );
+  } catch (error) {
+    try {
+      writeClosedResolverResult(closedResolverFailure(runId, error));
+    } catch {
+      // Invalid protocol construction remains silent and fail-closed.
+    }
+    process.exitCode = 1;
+  }
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  if (process.argv[2] === "--closed-result-v1") {
+    closedMain();
+  } else {
+    try {
+      main();
+    } catch (error) {
+      const code =
+        error instanceof DockerPreflightError ? error.code : "resolver_probe_failed";
+      process.stderr.write("FEAT-126 Docker preflight failed: " + code + "\n");
+      process.exitCode = 1;
+    }
   }
 }

@@ -2,7 +2,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { constants, closeSync, openSync } from "node:fs";
-import { chmod, lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, realpath, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import http from "node:http";
 import net from "node:net";
@@ -16,6 +16,8 @@ import {
   FEAT_126_S10_API_RUNTIME_AUTHORITY,
   validateApiRuntimeAuthority,
 } from "./feat-126-s10-api-runtime-profile.mjs";
+import * as resolverProtocol from "./verify-feat-126-s10-images.mjs";
+import { FEAT_126_S10_PROFILE, FEAT_126_S10_SERVICES } from "./compose-model.mjs";
 
 const INFRA_ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const WORKSPACE_ROOT = resolve(INFRA_ROOT, "..");
@@ -23,6 +25,26 @@ const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-
 const FULL_SHA_PATTERN = /^[0-9a-f]{40}$/;
 const DIGEST_PATTERN = /^[0-9a-f]{64}$/;
 const FIXED_PORTS = Object.freeze([5432, 8443, 9443, 18080, 18082, 1420, 1421]);
+const IMAGE_RESOLVER_SCRIPT = resolve(INFRA_ROOT, "scripts/verify-feat-126-s10-images.mjs");
+const IMAGE_RESOLVER_EVIDENCE_FILE = "image-resolver-result.v1.json";
+const S10_COMPOSE_FILE = resolve(INFRA_ROOT, "docker-compose.local.yml");
+const {
+  CLOSED_RESOLVER_RESULT_MAX_BYTES,
+  CLOSED_RESOLVER_SPAWN_BUFFER_BYTES,
+  CLOSED_RESOLVER_TIMEOUT_MS,
+  ClosedResolverResultError,
+  mapClosedResolverFailure,
+  parseClosedResolverResult,
+} = resolverProtocol;
+// The legacy feat-126-s10-verify-images Make gate remains unchanged; this
+// parent uses the private closed mode for its one authoritative child call.
+export const IMAGE_RESOLVER_PARENT_FAILURE_CLASSES = Object.freeze([
+  "preflight_image_resolver_process_failed",
+  "preflight_image_resolver_timeout",
+  "preflight_image_resolver_result_invalid",
+  "preflight_image_resolver_result_oversize",
+  "preflight_image_resolver_evidence_failed",
+]);
 const REPOSITORIES = Object.freeze({
   governance: resolve(WORKSPACE_ROOT, "yijie"),
   contracts: resolve(WORKSPACE_ROOT, "yijie-contracts"),
@@ -59,6 +81,33 @@ export class S10BPreflightError extends Error {
 
 function fail(code) {
   throw new S10BPreflightError(code);
+}
+
+const IMAGE_RESOLVER_PARENT_FAILURE_SET = new Set(IMAGE_RESOLVER_PARENT_FAILURE_CLASSES);
+
+function resolverParentFail(code) {
+  if (!IMAGE_RESOLVER_PARENT_FAILURE_SET.has(code)) {
+    throw new TypeError("unknown parent resolver failure class");
+  }
+  fail(code);
+}
+
+export function validateResolverProtocolExports(protocol = resolverProtocol) {
+  if (
+    typeof protocol?.parseClosedResolverResult !== "function" ||
+    typeof protocol?.mapClosedResolverFailure !== "function" ||
+    typeof protocol?.ClosedResolverResultError !== "function" ||
+    !Number.isInteger(protocol?.CLOSED_RESOLVER_RESULT_MAX_BYTES) ||
+    !Number.isInteger(protocol?.CLOSED_RESOLVER_SPAWN_BUFFER_BYTES) ||
+    !Number.isInteger(protocol?.CLOSED_RESOLVER_TIMEOUT_MS)
+  ) {
+    resolverParentFail("preflight_image_resolver_result_invalid");
+  }
+  return true;
+}
+
+function requireResolverProtocol() {
+  validateResolverProtocolExports();
 }
 
 export function validateProbeResult(value, runId) {
@@ -234,6 +283,191 @@ async function writeClosedJSON(path, value) {
   await chmod(path, 0o600);
 }
 
+function resolverProcessOutput(value) {
+  if (Buffer.isBuffer(value)) return value;
+  if (typeof value === "string") return Buffer.from(value, "utf8");
+  return Buffer.alloc(0);
+}
+
+export function validateImageResolverProcessResult(result, runId) {
+  requireResolverProtocol();
+  if (result?.error?.code === "ETIMEDOUT") {
+    resolverParentFail("preflight_image_resolver_timeout");
+  }
+  if (result?.error?.code === "ENOBUFS") {
+    resolverParentFail("preflight_image_resolver_result_oversize");
+  }
+  if (result?.error || result?.signal !== null && result?.signal !== undefined) {
+    resolverParentFail("preflight_image_resolver_process_failed");
+  }
+
+  const stdout = resolverProcessOutput(result?.stdout);
+  const stderr = resolverProcessOutput(result?.stderr);
+  if (stdout.length + stderr.length > CLOSED_RESOLVER_SPAWN_BUFFER_BYTES) {
+    resolverParentFail("preflight_image_resolver_result_oversize");
+  }
+  if (stderr.length !== 0) {
+    // A legacy/human child can still exit non-zero, but its text is not a
+    // versioned result. Treat it as a protocol mismatch, never as a leaf.
+    resolverParentFail("preflight_image_resolver_result_invalid");
+  }
+  if (stdout.length > CLOSED_RESOLVER_RESULT_MAX_BYTES) {
+    resolverParentFail("preflight_image_resolver_result_oversize");
+  }
+
+  let envelope;
+  try {
+    envelope = parseClosedResolverResult(stdout, runId);
+  } catch (error) {
+    if (
+      error instanceof ClosedResolverResultError &&
+      error.code === "result_oversize"
+    ) {
+      resolverParentFail("preflight_image_resolver_result_oversize");
+    }
+    resolverParentFail("preflight_image_resolver_result_invalid");
+  }
+
+  if (
+    (envelope.status === "passed" && result.status !== 0) ||
+    (envelope.status === "failed" && result.status !== 1)
+  ) {
+    resolverParentFail("preflight_image_resolver_process_failed");
+  }
+  return Object.freeze({
+    envelope,
+    failureClass:
+      envelope.status === "failed"
+        ? mapClosedResolverFailure(envelope.failure_class)
+        : null,
+  });
+}
+
+export async function writeImageResolverEvidence(path, envelope) {
+  requireResolverProtocol();
+  let handle;
+  try {
+    const validated = parseClosedResolverResult(
+      Buffer.from(`${JSON.stringify(envelope)}\n`, "utf8"),
+      envelope?.run_id,
+    );
+    handle = await open(
+      path,
+      constants.O_WRONLY |
+        constants.O_CREAT |
+        constants.O_EXCL |
+        constants.O_NOFOLLOW,
+      0o600,
+    );
+    await handle.writeFile(`${JSON.stringify(validated)}\n`, { encoding: "utf8" });
+    await handle.chmod(0o600);
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+
+    const metadata = await lstat(path);
+    if (
+      !metadata.isFile() ||
+      metadata.isSymbolicLink() ||
+      metadata.uid !== process.getuid() ||
+      metadata.nlink !== 1 ||
+      (metadata.mode & 0o777) !== 0o600
+    ) {
+      resolverParentFail("preflight_image_resolver_evidence_failed");
+    }
+  } catch {
+    if (handle) {
+      try {
+        await handle.close();
+      } catch {
+        // The create-new artifact remains a fail-closed marker.
+      }
+    }
+    resolverParentFail("preflight_image_resolver_evidence_failed");
+  }
+}
+
+export async function runClosedImageResolver(
+  runId,
+  evidenceRoot,
+  { spawnResolver = spawnSync, writeEvidence = writeImageResolverEvidence } = {},
+) {
+  requireResolverProtocol();
+  let processResult;
+  try {
+    processResult = spawnResolver(
+      process.execPath,
+      [IMAGE_RESOLVER_SCRIPT, "--closed-result-v1", runId],
+      {
+        cwd: INFRA_ROOT,
+        env: commandEnvironment(),
+        encoding: null,
+        shell: false,
+        windowsHide: true,
+        timeout: CLOSED_RESOLVER_TIMEOUT_MS,
+        killSignal: "SIGTERM",
+        maxBuffer: CLOSED_RESOLVER_SPAWN_BUFFER_BYTES,
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+  } catch {
+    resolverParentFail("preflight_image_resolver_process_failed");
+  }
+
+  const outcome = validateImageResolverProcessResult(processResult, runId);
+  try {
+    await writeEvidence(
+      resolve(evidenceRoot, IMAGE_RESOLVER_EVIDENCE_FILE),
+      outcome.envelope,
+    );
+  } catch {
+    resolverParentFail("preflight_image_resolver_evidence_failed");
+  }
+  if (outcome.failureClass) fail(outcome.failureClass);
+  return outcome.envelope;
+}
+
+export function buildPrevalidatedDependencyArguments(runId, secretsPath) {
+  const expectedSecretsPath = resolve(
+    INFRA_ROOT,
+    "environments/local/generated/feat-126-s10",
+    runId ?? "",
+    "infra-secrets.env",
+  );
+  if (
+    !RUN_ID_PATTERN.test(runId ?? "") ||
+    resolve(secretsPath ?? "") !== expectedSecretsPath
+  ) {
+    fail("preflight_dependencies_authority_invalid");
+  }
+  return Object.freeze([
+    "compose",
+    "--project-name",
+    "yijie-feat126-s10-" + runId.replaceAll("-", ""),
+    "--env-file",
+    expectedSecretsPath,
+    "-f",
+    S10_COMPOSE_FILE,
+    "--profile",
+    FEAT_126_S10_PROFILE,
+    "up",
+    "--detach",
+    "--wait",
+    "--pull",
+    "never",
+    ...FEAT_126_S10_SERVICES,
+  ]);
+}
+
+function startPrevalidatedDependencies(runId, secretsPath) {
+  runCommand(
+    "dependencies",
+    "docker",
+    buildPrevalidatedDependencyArguments(runId, secretsPath),
+    { env: commandEnvironment({ FEAT126_S10_RUN_ID: runId }) },
+  );
+}
+
 async function execute(runId, expectedSHAs) {
   if (!RUN_ID_PATTERN.test(runId ?? "")) fail("preflight_run_id_invalid");
   let apiRuntimeAuthority;
@@ -283,8 +517,20 @@ async function execute(runId, expectedSHAs) {
     completed.push("authority", "ports", "secret_init");
 
     runCommand("compose_config", "make", ["feat-126-s10-config", `RUN_ID=${runId}`]);
-    runCommand("image_resolver", "make", ["feat-126-s10-verify-images", `RUN_ID=${runId}`]);
-    runCommand("dependencies", "make", ["feat-126-s10-up", `RUN_ID=${runId}`]);
+    completed.push("compose");
+    await runClosedImageResolver(runId, evidenceRoot);
+    completed.push("images");
+    // Reuse the reviewed wrapper immediately before the direct fixed Compose
+    // start to close the version/secret/rejected-marker TOCTOU window. Its
+    // config action has no image resolver side effect.
+    runCommand("dependencies", "make", [
+      "feat-126-s10-config",
+      `RUN_ID=${runId}`,
+    ]);
+    // The public `make feat-126-s10-up` path retains its human resolver for
+    // compatibility. The parent starts dependencies from a fixed authority so
+    // the closed resolver is not repeated through that human path.
+    startPrevalidatedDependencies(runId, secretsPath);
     dependenciesStarted = true;
     runCommand("dependency_status", "make", ["feat-126-s10-status", `RUN_ID=${runId}`]);
     runCommand("ca_export", "make", ["feat-126-s10-export-ca", `RUN_ID=${runId}`]);
@@ -302,7 +548,7 @@ async function execute(runId, expectedSHAs) {
       `API_REPO=${REPOSITORIES.api}`,
       `API_SHA=${expectedSHAs.api}`,
     ]);
-    completed.push("compose", "images", "dependencies", "tls_oidc", "identity", "migration", "bootstrap");
+    completed.push("dependencies", "tls_oidc", "identity", "migration", "bootstrap");
 
     const buildEnvironment = commandEnvironment({ GOCACHE: resolve(runRoot, "go-build-cache") });
     runCommand("api_build", "go", ["build", "-trimpath", "-o", resolve(binRoot, "yijie-api"), "./cmd/api-server"], {

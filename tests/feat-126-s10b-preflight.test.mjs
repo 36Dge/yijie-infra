@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import test from "node:test";
 
 import {
   S10BPreflightError,
+  buildPrevalidatedDependencyArguments,
   readExpectedSHAs,
   validateProbeResult,
 } from "../scripts/feat-126-s10b-preflight.mjs";
@@ -86,8 +88,8 @@ test("S10BF1-004 combines accepted S10E, identity, migration, bootstrap, API and
   const runner = await readFile("scripts/feat-126-s10b-preflight.mjs", "utf8");
   for (const gate of [
     "feat-126-s10-config",
-    "feat-126-s10-verify-images",
-    "feat-126-s10-up",
+    "runClosedImageResolver",
+    "startPrevalidatedDependencies",
     "feat-126-s10-export-ca",
     "feat-126-s10-verify-runtime",
     "feat-126-s10-provision-users",
@@ -102,6 +104,32 @@ test("S10BF1-004 combines accepted S10E, identity, migration, bootstrap, API and
   assert.match(runner, /preflight_cleanup_incomplete/);
   assert.match(runner, /preflight_secret_leak_detected/);
   assert.doesNotMatch(runner, /docker (?:image )?pull|docker system prune|docker volume rm/);
+  const secretsPath = resolve(
+    `environments/local/generated/feat-126-s10/${RUN_ID}/infra-secrets.env`,
+  );
+  assert.deepEqual(
+    buildPrevalidatedDependencyArguments(RUN_ID, secretsPath),
+    [
+      "compose",
+      "--project-name",
+      "yijie-feat126-s10-" + RUN_ID.replaceAll("-", ""),
+      "--env-file",
+      secretsPath,
+      "-f",
+      resolve("docker-compose.local.yml"),
+      "--profile",
+      "feat-126-s10",
+      "up",
+      "--detach",
+      "--wait",
+      "--pull",
+      "never",
+      "feat126-s10-api-db",
+      "feat126-s10-keycloak-db",
+      "feat126-s10-keycloak",
+      "feat126-s10-caddy",
+    ],
+  );
 });
 
 test("S10B runtime profile authority is closed to the dedicated FEAT-126 profile", () => {
