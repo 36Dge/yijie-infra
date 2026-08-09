@@ -19,6 +19,7 @@ import {
   validateFakeAuthority,
   validateNoLogResult,
 } from "../scripts/feat-126-s10b-orchestrator.mjs";
+import { FEAT_126_S10_API_RUNTIME_AUTHORITY } from "../scripts/feat-126-s10-api-runtime-profile.mjs";
 
 const runId = "019fbd88-cbc3-4bf1-934d-7b05cd693f80";
 const repositories = Object.freeze({
@@ -26,6 +27,12 @@ const repositories = Object.freeze({
   host: "4".repeat(40), desktop: "5".repeat(40), runtime: "6".repeat(40), infra: "7".repeat(40),
 });
 const environment = Object.fromEntries(Object.entries(repositories).map(([role, sha]) => [`FEAT126_S10B_${role.toUpperCase()}_SHA`, sha]));
+const completed = Object.freeze([
+  "authority", "ports", "secret_init", "compose", "images", "dependencies",
+  "tls_oidc", "identity", "migration", "bootstrap", "api_binary", "host_binary",
+  "fake_binary", "probe_binary", "api_health", "api_readiness",
+  "host_owned_fake_authority", "fake_readiness", "content_free_logs",
+]);
 
 function errorCode(fn) {
   try { fn(); } catch (error) { return error instanceof S10BO1OrchestratorError ? error.code : error.message; }
@@ -40,7 +47,26 @@ test("S10BO1-001 accepts only canonical run and exact repository authority", () 
 });
 
 test("S10BO1-002 rejects stale or non-passed same-run preflight", () => {
-  const summary = { schema_version: 1, status: "passed", scope: "S10B-001-combined-preflight", run_id: runId, cleanup: "passed", s10b_r5_executed: false, repositories };
+  const summary = {
+    schema_version: 1,
+    status: "passed",
+    scope: "S10B-001-combined-preflight",
+    run_id: runId,
+    repositories,
+    api_binary_sha256: "a".repeat(64),
+    api_runtime_authority: FEAT_126_S10_API_RUNTIME_AUTHORITY,
+    fake_readiness: {
+      schema_version: 1,
+      status: "ready",
+      run_id: runId,
+      dataset_id: "feat126-title-raw-v1",
+      fixture_case_id: "normal-000",
+      dataset_sha256: "b".repeat(64),
+    },
+    completed,
+    cleanup: "passed",
+    s10b_r5_executed: false,
+  };
   assert.deepEqual(validateRepositorySummary(summary, runId, repositories).repositories, repositories);
   assert.equal(errorCode(() => validateRepositorySummary({ ...summary, run_id: "019fbd88-cbc3-4bf1-934d-7b05cd693f81" }, runId, repositories)), "orchestrator_preflight_authority_invalid");
   assert.equal(errorCode(() => validateRepositorySummary({ ...summary, status: "failed" }, runId, repositories)), "orchestrator_preflight_authority_invalid");
@@ -68,7 +94,9 @@ test("S10BO1-005 closes the abort path without retry", () => {
 
 test("S10BO1-006 plan is content-free and live execution remains separate", () => {
   const plan = buildOrchestratorPlan({ runId, environment, arguments_: [] });
-  assert.equal(plan.execution, "separately-authorized-live-only");
+  assert.equal(plan.execution, "separately-authorized-isolated-live-only");
+  assert.equal(plan.business_cases, "disabled");
+  assert.equal(plan.s10b_r8_executed, false);
   assert.doesNotMatch(JSON.stringify(plan), /secret|bearer|DSN|payload|path|argv|env/);
 });
 
