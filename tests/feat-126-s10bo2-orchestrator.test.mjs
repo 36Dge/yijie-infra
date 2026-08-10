@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { once } from "node:events";
+import { EventEmitter, once } from "node:events";
 import {
   chmod,
   mkdir,
@@ -30,11 +30,13 @@ import {
   createParentIdentityGuard,
   createControlFrameReader,
   createStartupAbortStateMachine,
+  desktopEnvironment,
   encodeControlFrame,
   inspectProcessIdentity,
   loadExistingProcessRecords,
   parseControlFrame,
   parseDarwinProcessLaunchIdentity,
+  readDesktopFrame,
   reconcileProcess,
   runCommand,
   runStartupAbortFlow,
@@ -48,6 +50,7 @@ import {
   validateNoLogResult,
   validateOwnership,
   validateRuntimeProcessEvidence,
+  validateStartupFailureControlFrame,
   writeFrame,
 } from "../scripts/feat-126-s10b-orchestrator.mjs";
 
@@ -267,6 +270,23 @@ test("S10BO2-002 parses one bounded strict component_ready NDJSON frame", () => 
     }),
     value,
   );
+  const startupFailure = {
+    schema_version: 1,
+    run_id: runId,
+    nonce,
+    sequence: 1,
+    kind: "startup_failed",
+    failure_class: "driver_bind_failed",
+  };
+  assert.deepEqual(
+    parseControlFrame(Buffer.from(`${JSON.stringify(startupFailure)}\n`), {
+      runId,
+      nonce,
+      previousSequence: 0,
+      allowedKinds: ["component_ready", "abort_complete", "startup_failed"],
+    }),
+    startupFailure,
+  );
 });
 
 test("S10BO2-003 rejects malformed, duplicate, unknown, multiple, and oversized frames", () => {
@@ -291,6 +311,50 @@ test("S10BO2-003 rejects malformed, duplicate, unknown, multiple, and oversized 
   assert.throws(
     () => parseControlFrame(Buffer.alloc(1025, 0x20), { runId, nonce, previousSequence: 0, allowedKinds: ["component_ready"] }),
     (error) => errorCode(error) === "orchestrator_control_frame_oversize",
+  );
+
+  const startupFailure = {
+    schema_version: 1,
+    run_id: runId,
+    nonce,
+    sequence: 1,
+    kind: "startup_failed",
+    failure_class: "driver_control_monitor_invalid",
+  };
+  const validAuthority = {
+    runId,
+    nonce,
+    previousSequence: 0,
+    allowedKinds: ["component_ready", "abort_complete", "startup_failed"],
+  };
+  assert.deepEqual(
+    validateStartupFailureControlFrame(startupFailure, validAuthority),
+    startupFailure,
+  );
+  for (const malformedAuthority of [
+    null,
+    {},
+    { ...validAuthority, runId: "not-a-uuid" },
+    { ...validAuthority, nonce: "not-a-uuid" },
+    { ...validAuthority, previousSequence: 1 },
+    { ...validAuthority, allowedKinds: null },
+    { ...validAuthority, allowedKinds: ["component_ready"] },
+    { ...validAuthority, allowedKinds: ["startup_failed"] },
+    { ...validAuthority, allowedKinds: ["startup_failed", "startup_failed"] },
+    { ...validAuthority, allowedKinds: ["startup_failed", "unknown"] },
+    { ...validAuthority, unexpected: true },
+  ]) {
+    assert.throws(
+      () => validateStartupFailureControlFrame(startupFailure, malformedAuthority),
+      (error) => errorCode(error) === "orchestrator_control_frame_invalid",
+    );
+  }
+  assert.throws(
+    () => validateStartupFailureControlFrame(
+      { ...startupFailure, failure_class: "driver_control_eof" },
+      validAuthority,
+    ),
+    (error) => errorCode(error) === "orchestrator_control_frame_invalid",
   );
 });
 
@@ -398,6 +462,54 @@ test("S10BO2-005 reader accepts chunked ordered frames and treats EOF as parent-
     closedReader.expectEof(1000),
     (error) => errorCode(error) === "orchestrator_control_trailing_frame",
   );
+
+  const failureStream = new PassThrough();
+  const failureReader = createControlFrameReader(failureStream, { runId, nonce });
+  failureStream.end(`${JSON.stringify({
+    schema_version: 1,
+    run_id: runId,
+    nonce,
+    sequence: 1,
+    kind: "startup_failed",
+    failure_class: "driver_profile_invalid",
+  })}\n`);
+  await assert.rejects(
+    failureReader.next("component_ready", 1000),
+    (error) => errorCode(error) === "driver_profile_invalid",
+  );
+
+  function pendingChild() {
+    const child = new EventEmitter();
+    child.exitCode = null;
+    child.signalCode = null;
+    return child;
+  }
+  const exitAfterFrameStream = new PassThrough();
+  const desktopChild = pendingChild();
+  const desktopContext = {
+    phase: "desktop_spawned",
+    controlReader: createControlFrameReader(exitAfterFrameStream, { runId, nonce }),
+    processes: {
+      api: { child: pendingChild() },
+      fake: { child: pendingChild() },
+      desktop: { child: desktopChild },
+    },
+  };
+  const frameBeforeExit = readDesktopFrame(desktopContext, "component_ready");
+  exitAfterFrameStream.end(`${JSON.stringify({
+    schema_version: 1,
+    run_id: runId,
+    nonce,
+    sequence: 1,
+    kind: "startup_failed",
+    failure_class: "driver_bind_failed",
+  })}\n`);
+  desktopChild.emit("exit", 1, null);
+  await assert.rejects(
+    frameBeforeExit,
+    (error) => errorCode(error) === "driver_bind_failed",
+  );
+  assert.equal(desktopContext.phase, "desktop_starting");
 });
 
 test("S10BO2-006 executes the only allowed spawn and abort order", async () => {
@@ -688,6 +800,69 @@ test("S10BO2-010 async spawn error is observed without an unhandled event", asyn
   assert.equal(context.cleanupUnknown, true);
   await new Promise((resolveWait) => setImmediate(resolveWait));
   assert.equal(context.processes.api.processError, true);
+});
+
+test("S10BO2-010 consumes a Desktop startup leaf written before identity-time exit", async (t) => {
+  const root = await mkdtemp(resolve(tmpdir(), "feat126-s10bo2-startup-leaf-"));
+  t.after(async () => { await rm(root, { recursive: true, force: true }); });
+  await chmod(root, 0o700);
+  const logs = resolve(root, "logs");
+  const evidence = resolve(root, "evidence");
+  await mkdir(logs, { mode: 0o700 });
+  await mkdir(evidence, { mode: 0o700 });
+  const context = {
+    runId,
+    nonce,
+    phase: "desktop_spawned",
+    evidenceRoot: evidence,
+    processes: {},
+    cleanupUnknown: false,
+  };
+  function pendingChild() {
+    const child = new EventEmitter();
+    child.exitCode = null;
+    child.signalCode = null;
+    return child;
+  }
+  context.processes.api = { child: pendingChild() };
+  context.processes.fake = { child: pendingChild() };
+  const frame = `${JSON.stringify({
+    schema_version: 1,
+    run_id: runId,
+    nonce,
+    sequence: 1,
+    kind: "startup_failed",
+    failure_class: "driver_control_monitor_invalid",
+  })}\n`;
+  const childSource = `require("node:fs").writeFileSync(4, ${JSON.stringify(frame)});` +
+    "setTimeout(() => process.exit(0), 50);";
+  const process_ = await spawnOwnedProcess({
+    role: "desktop",
+    binary: process.execPath,
+    arguments_: ["-e", childSource],
+    cwd: "/",
+    environment: { PATH: "/usr/bin:/bin" },
+    logPath: resolve(logs, "desktop.log"),
+    extraStdio: ["pipe", "pipe"],
+    deferIdentityOnExit: true,
+    inspect: async () => {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 200));
+      throw new S10BO1OrchestratorError("orchestrator_process_identity_unknown");
+    },
+    onSpawn(provisional) {
+      context.controlReader = createControlFrameReader(provisional.child.stdio[4], context);
+      context.controlWriter = provisional.child.stdio[3];
+      context.pendingDesktopFrame = context.controlReader.next("component_ready");
+      context.pendingDesktopFrame.catch(() => {});
+    },
+  }, context);
+  assert.equal(process_, context.processes.desktop);
+  assert.equal(process_.earlyExit, true);
+  await assert.rejects(
+    readDesktopFrame(context, "component_ready"),
+    (error) => errorCode(error) === "driver_control_monitor_invalid",
+  );
+  assert.equal(context.phase, "desktop_starting");
 });
 
 test("S10BO2-011 incomplete existing-run evidence and unknown cleanup fail closed", async (t) => {
@@ -1030,4 +1205,15 @@ test("S10BO2-014 source uses direct feature Desktop with FD3/FD4 and keeps busin
   assert.doesNotMatch(source, /spawnOwnedProcess\(\{[\s\S]{0,240}role:\s*"(?:host|runtime)"/);
   assert.match(preflightSource, /FIXED_PORTS[^\n]*18081/);
   assert.doesNotMatch(preflightSource, /FIXED_PORTS[^\n]*(?:1420|1421)/);
+  const projected = desktopEnvironment({
+    runId,
+    nonce,
+    runRoot: "/tmp/feat126-run",
+    secretsPath: "/tmp/feat126-run/infra-secrets.env",
+    binRoot: "/tmp/feat126-bin",
+    caPath: "/tmp/feat126-ca.pem",
+    caSha256: "a".repeat(64),
+  });
+  assert.equal(projected.YIJIE_FEAT126_S10_SECURE_STORAGE_ENABLED, "false");
+  assert.equal(projected.YIJIE_FEAT126_S10_EPHEMERAL_SECRET_BACKEND_ENABLED, "true");
 });

@@ -51,6 +51,7 @@ const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-
 const FULL_SHA_PATTERN = /^[0-9a-f]{40}$/;
 const DIGEST_PATTERN = /^[0-9a-f]{64}$/;
 const CONTROL_KEYS = Object.freeze(["kind", "nonce", "run_id", "schema_version", "sequence"]);
+const STARTUP_FAILURE_CONTROL_KEYS = Object.freeze([...CONTROL_KEYS, "failure_class"]);
 const CONTROL_MAX_BYTES = 1024;
 const CONTROL_TIMEOUT_MS = 60_000;
 const GUARDED_CONTROL_WRITERS = new WeakSet();
@@ -187,6 +188,10 @@ const RUNTIME_LOG_SCAN_V2_KEYS = Object.freeze([
   "hit_origin_set_sha256",
   "hit_rule_set_sha256",
 ]);
+const RUNTIME_LOG_SCAN_V3_KEYS = Object.freeze([
+  ...RUNTIME_LOG_SCAN_V2_KEYS,
+  "hit_origin_rule_set_sha256",
+]);
 const BUSINESS_BOUNDARY_KEYS = Object.freeze([
   "api_after_sha256",
   "api_before_sha256",
@@ -274,7 +279,48 @@ const RUNTIME_PROCESS_EVIDENCE_KEYS = Object.freeze([
 ]);
 const EXISTING_PROCESS_ROLES = Object.freeze(["api", "desktop", "fake", "host", "runtime"]);
 const INFRA_CONTROL_KINDS = Object.freeze(["abort"]);
-const DESKTOP_CONTROL_KINDS = Object.freeze(["abort_complete", "component_ready"]);
+const DESKTOP_CONTROL_KINDS = Object.freeze(["abort_complete", "component_ready", "startup_failed"]);
+const DESKTOP_STARTUP_FAILURE_CLASSES = Object.freeze([
+  "driver_app_data_invalid",
+  "driver_authority_invalid",
+  "driver_bind_failed",
+  "driver_control_channel_invalid",
+  "driver_control_monitor_invalid",
+  "driver_control_projection_invalid",
+  "driver_frontend_startup_invalid",
+  "driver_login_failed",
+  "driver_login_projection_invalid",
+  "driver_nonce_invalid",
+  "driver_profile_invalid",
+  "driver_project_invalid",
+  "driver_project_projection_invalid",
+  "driver_project_revalidation_failed",
+  "driver_readiness_failed",
+  "driver_ready_emit_failed",
+  "driver_run_id_invalid",
+  "driver_secret_authority_invalid",
+  "driver_tauri_startup_invalid",
+]);
+const RUNTIME_LOG_SOURCE_KEYS = Object.freeze([
+  "container_id",
+  "data_classification",
+  "feature",
+  "project",
+  "run_id",
+  "service_role",
+  "slice",
+]);
+const RUNTIME_LOG_SERVICE_ROLES = Object.freeze([
+  "feat126-s10-api-db",
+  "feat126-s10-caddy",
+  "feat126-s10-keycloak",
+  "feat126-s10-keycloak-db",
+]);
+const STRUCTURED_NO_LOG_RULES = Object.freeze([
+  "absolute_local_path",
+  "sensitive_value_field",
+  "unclassified_sensitive_field",
+]);
 const S10_NAMED_VOLUME_KEYS = Object.freeze([
   "feat126_s10_api_postgres_data",
   "feat126_s10_keycloak_postgres_data",
@@ -428,6 +474,12 @@ function fail(code) {
 
 function exactKeys(value, expected) {
   return JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expected].sort());
+}
+
+function asciiCompare(left, right) {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
 }
 
 function ownedByCurrentUser(metadata) {
@@ -807,6 +859,37 @@ export function validateControlFrame(
   });
 }
 
+export function validateStartupFailureControlFrame(frame, authority) {
+  if (
+    authority === null || typeof authority !== "object" || Array.isArray(authority) ||
+    !exactKeys(authority, ["allowedKinds", "nonce", "previousSequence", "runId"]) ||
+    !RUN_ID_PATTERN.test(authority.runId ?? "") ||
+    !RUN_ID_PATTERN.test(authority.nonce ?? "") ||
+    authority.previousSequence !== 0 ||
+    !Array.isArray(authority.allowedKinds) ||
+    new Set(authority.allowedKinds).size !== authority.allowedKinds.length ||
+    authority.allowedKinds.some((kind) => !DESKTOP_CONTROL_KINDS.includes(kind)) ||
+    JSON.stringify([...authority.allowedKinds].sort(asciiCompare)) !== JSON.stringify(
+      [...DESKTOP_CONTROL_KINDS].sort(asciiCompare),
+    ) ||
+    frame === null || typeof frame !== "object" || Array.isArray(frame) ||
+    !exactKeys(frame, STARTUP_FAILURE_CONTROL_KEYS) || frame.schema_version !== 1 ||
+    frame.run_id !== authority.runId || frame.nonce !== authority.nonce ||
+    frame.sequence !== 1 || frame.kind !== "startup_failed" ||
+    !DESKTOP_STARTUP_FAILURE_CLASSES.includes(frame.failure_class)
+  ) {
+    fail("orchestrator_control_frame_invalid");
+  }
+  return Object.freeze({
+    schema_version: 1,
+    run_id: authority.runId,
+    nonce: authority.nonce,
+    sequence: 1,
+    kind: "startup_failed",
+    failure_class: frame.failure_class,
+  });
+}
+
 export function parseControlFrame(output, authority) {
   const bytes = Buffer.isBuffer(output) ? output : Buffer.from(output ?? "", "utf8");
   if (bytes.length === 0) fail("orchestrator_control_frame_invalid");
@@ -831,6 +914,9 @@ export function parseControlFrame(output, authority) {
     frame = JSON.parse(body);
   } catch {
     fail("orchestrator_control_frame_invalid");
+  }
+  if (frame?.kind === "startup_failed") {
+    return validateStartupFailureControlFrame(frame, authority);
   }
   return validateControlFrame(
     frame,
@@ -884,6 +970,12 @@ export function createControlFrameReader(stream, authority) {
         previousSequence,
         allowedKinds: DESKTOP_CONTROL_KINDS,
       });
+      if (frame.kind === "startup_failed") {
+        if (expectedKind !== "component_ready" || previousSequence !== 0) {
+          fail("orchestrator_control_order_invalid");
+        }
+        throw new S10BO1OrchestratorError(frame.failure_class);
+      }
       if (frame.kind !== expectedKind) fail("orchestrator_control_order_invalid");
       previousSequence = frame.sequence;
       return frame;
@@ -1141,17 +1233,29 @@ export function validateNoLogResult(value) {
 export function validateRuntimeLogScan(value, runId) {
   const versionOne = value?.schema_version === 1;
   const versionTwo = value?.schema_version === 2;
+  const versionThree = value?.schema_version === 3;
   const emptySetSha256 = sha256("");
+  const canonicalSourceSetSha256 = sha256(
+    RUNTIME_LOG_SERVICE_ROLES
+      .map((role) => `compose:${role}`)
+      .sort(asciiCompare)
+      .join("\n"),
+  );
   if (
     value === null || Array.isArray(value) || typeof value !== "object" ||
-    (!versionOne && !versionTwo) ||
-    !exactKeys(value, versionTwo ? RUNTIME_LOG_SCAN_V2_KEYS : RUNTIME_LOG_SCAN_V1_KEYS) ||
+    (!versionOne && !versionTwo && !versionThree) ||
+    !exactKeys(
+      value,
+      versionThree
+        ? RUNTIME_LOG_SCAN_V3_KEYS
+        : versionTwo ? RUNTIME_LOG_SCAN_V2_KEYS : RUNTIME_LOG_SCAN_V1_KEYS,
+    ) ||
     value.status !== (value.hit_count === 0 ? "passed" : "failed") ||
     value.run_id !== runId || !Number.isSafeInteger(value.source_count) ||
     value.source_count <= 0 || !Number.isSafeInteger(value.row_count) || value.row_count < 0 ||
     !Number.isSafeInteger(value.hit_count) || value.hit_count < 0 ||
     !DIGEST_PATTERN.test(value.source_set_sha256 ?? "") ||
-    (versionTwo && (
+    ((versionTwo || versionThree) && (
       !DIGEST_PATTERN.test(value.hit_origin_set_sha256 ?? "") ||
       !DIGEST_PATTERN.test(value.hit_rule_set_sha256 ?? "") ||
       (value.hit_count === 0 && (
@@ -1162,6 +1266,13 @@ export function validateRuntimeLogScan(value, runId) {
         value.hit_origin_set_sha256 === emptySetSha256 ||
         value.hit_rule_set_sha256 === emptySetSha256
       ))
+    )) ||
+    (versionThree && (
+      value.source_count !== RUNTIME_LOG_SERVICE_ROLES.length ||
+      value.source_set_sha256 !== canonicalSourceSetSha256 ||
+      !DIGEST_PATTERN.test(value.hit_origin_rule_set_sha256 ?? "") ||
+      (value.hit_count === 0 && value.hit_origin_rule_set_sha256 !== emptySetSha256) ||
+      (value.hit_count > 0 && value.hit_origin_rule_set_sha256 === emptySetSha256)
     ))
   ) fail("orchestrator_no_log_invalid");
   return Object.freeze({ ...value });
@@ -1787,6 +1898,31 @@ function validateFailureClassOrNull(value) {
   return value === null || /^[a-z][a-z0-9_]{0,127}$/.test(value ?? "");
 }
 
+function isClosedDesktopStartupFailure(value) {
+  return value?.phase === "desktop_starting" &&
+    DESKTOP_STARTUP_FAILURE_CLASSES.includes(value.failure_class) &&
+    JSON.stringify(value.process_roles) === JSON.stringify(["api", "desktop", "fake"]);
+}
+
+function requiresCompleteDescendantProcessRoles(value) {
+  return (value.phase === "desktop_starting" && value.process_roles.includes("desktop")) || [
+    "desktop_spawned",
+    "component_ready",
+    "abort_sent",
+    "abort_complete",
+    "desktop_exited",
+  ].includes(value.phase);
+}
+
+export function validateReconcileFailureProcessState(failure) {
+  if (
+    failure && requiresCompleteDescendantProcessRoles(failure) &&
+    failure.process_roles.length !== EXISTING_PROCESS_ROLES.length &&
+    !isClosedDesktopStartupFailure(failure)
+  ) fail("orchestrator_cleanup_unknown");
+  return true;
+}
+
 function validateAttemptPhaseState(value) {
   const rule = ATTEMPT_PHASE_PROCESS_RULES[value.phase];
   const roles = value.process_roles;
@@ -1819,14 +1955,9 @@ function validateAttemptPhaseState(value) {
     if (!value.compose_attempted || retainedVolumeKeys.length !== S10_NAMED_VOLUME_KEYS.length) return false;
   }
   if (
-    ((value.phase === "desktop_starting" && roles.includes("desktop")) || [
-      "desktop_spawned",
-      "component_ready",
-      "abort_sent",
-      "abort_complete",
-      "desktop_exited",
-    ].includes(value.phase)) &&
-    roles.length !== EXISTING_PROCESS_ROLES.length && value.cleanup_failure_class === null
+    requiresCompleteDescendantProcessRoles(value) &&
+    roles.length !== EXISTING_PROCESS_ROLES.length && value.cleanup_failure_class === null &&
+    !isClosedDesktopStartupFailure(value)
   ) return false;
   return true;
 }
@@ -2494,6 +2625,8 @@ export async function spawnOwnedProcess({
   logPath,
   extraStdio = [],
   inspect = inspectProcessIdentity,
+  onSpawn,
+  deferIdentityOnExit = false,
 }, context) {
   let binarySha256;
   try {
@@ -2527,6 +2660,17 @@ export async function spawnOwnedProcess({
     context.cleanupUnknown = true;
     provisional.processError = true;
   });
+  if (onSpawn) {
+    try {
+      await onSpawn(provisional);
+    } catch (error) {
+      context.cleanupUnknown = true;
+      await logHandle.close().catch(() => {});
+      throw error instanceof S10BO1OrchestratorError
+        ? error
+        : new S10BO1OrchestratorError("orchestrator_control_channel_invalid");
+    }
+  }
   try {
     await logHandle.close();
   } catch {
@@ -2539,6 +2683,17 @@ export async function spawnOwnedProcess({
     if (identity.ppid !== process.pid) fail("orchestrator_process_parent_invalid");
   } catch (error) {
     context.cleanupUnknown = true;
+    if (
+      deferIdentityOnExit &&
+      error instanceof S10BO1OrchestratorError &&
+      ["orchestrator_process_exited_early", "orchestrator_process_identity_unknown"].includes(
+        error.code,
+      ) &&
+      (child.exitCode !== null || child.signalCode !== null)
+    ) {
+      provisional.earlyExit = true;
+      return provisional;
+    }
     throw error;
   }
   const record = validateProcessRecord({
@@ -3201,7 +3356,7 @@ async function verifyBusinessBoundary(context) {
   return context.businessBoundary;
 }
 
-function desktopEnvironment(context) {
+export function desktopEnvironment(context) {
   const issuer = "https://localhost:8443/realms/yijie-local";
   const oidc = `${issuer}/protocol/openid-connect`;
   return commandEnvironment({
@@ -3212,7 +3367,7 @@ function desktopEnvironment(context) {
     YIJIE_FEAT126_S10_RUN_ID: context.runId,
     YIJIE_FEAT126_S10_RUN_ROOT: context.runRoot,
     YIJIE_FEAT126_S10P3_REAL_MAIN_CHAIN: "true",
-    YIJIE_FEAT126_S10_SECURE_STORAGE_ENABLED: "true",
+    YIJIE_FEAT126_S10_SECURE_STORAGE_ENABLED: "false",
     YIJIE_FEAT126_S10_EPHEMERAL_SECRET_BACKEND_ENABLED: "true",
     YIJIE_FEAT126_S10_INFRA_SECRETS_PATH: context.secretsPath,
     YIJIE_FEAT126_FAKE_RESPONSES_BASE_URL: "http://127.0.0.1:18082/v1",
@@ -3248,21 +3403,41 @@ async function startDesktop(context) {
     environment: desktopEnvironment(context),
     logPath: resolve(context.logRoot, "desktop-orchestrator.log"),
     extraStdio: ["pipe", "pipe"],
+    deferIdentityOnExit: true,
+    onSpawn(provisional) {
+      context.controlWriter = provisional.child.stdio[3];
+      guardControlWriter(context.controlWriter);
+      context.controlWriter.on("error", () => { context.cleanupUnknown = true; });
+      context.controlReader = createControlFrameReader(provisional.child.stdio[4], context);
+      context.pendingDesktopFrame = context.controlReader.next("component_ready");
+      context.pendingDesktopFrame.catch(() => {});
+    },
   }, context);
-  context.controlWriter = context.processes.desktop.child.stdio[3];
-  guardControlWriter(context.controlWriter);
-  context.controlWriter.on("error", () => { context.cleanupUnknown = true; });
-  context.controlReader = createControlFrameReader(context.processes.desktop.child.stdio[4], context);
 }
 
-async function readDesktopFrame(context, expectedKind) {
+export async function readDesktopFrame(context, expectedKind) {
+  const controlFrame = expectedKind === "component_ready" && context.pendingDesktopFrame
+    ? context.pendingDesktopFrame
+    : context.controlReader.next(expectedKind);
+  if (expectedKind === "component_ready") context.pendingDesktopFrame = null;
   const readers = [
-    context.controlReader.next(expectedKind),
+    controlFrame,
     childExit(context.processes.api.child, "api"),
     childExit(context.processes.fake.child, "fake"),
-    childExit(context.processes.desktop.child, "desktop"),
   ];
-  return await Promise.race(readers);
+  try {
+    const frame = await Promise.race(readers);
+    if (expectedKind === "component_ready" && context.processes.desktop.earlyExit) {
+      fail("orchestrator_desktop_exited_early");
+    }
+    return frame;
+  } catch (error) {
+    if (
+      expectedKind === "component_ready" && error instanceof S10BO1OrchestratorError &&
+      DESKTOP_STARTUP_FAILURE_CLASSES.includes(error.code)
+    ) context.phase = "desktop_starting";
+    throw error;
+  }
 }
 
 export async function sendAbort(context) {
@@ -3487,37 +3662,194 @@ function noLogPatternSet(context) {
     { name: "workspace_root", value: WORKSPACE_ROOT },
   ].filter(({ value }) => typeof value === "string" && value.length > 0);
   const forbiddenPatterns = Object.freeze([
+    [
+      "absolute_local_path",
+      /(?:^|[\s"'=:])(?:\/(?:Users|home|private|tmp)(?:\/|$)|\/var\/folders(?:\/|$)|[A-Za-z]:[\\/](?:Users|Documents and Settings)[\\/])/m,
+    ],
     ["bearer", /\bbearer\b/i],
     ["credential", /\bcredentials?\b/i],
     ["dsn", /\b(?:postgres(?:ql)?|redis):\/\//i],
     ["private_key", /private[\s_-]*key/i],
-    ["sensitive_field", /["']?(?:argv|bearer|dsn|env|path|payload|secret)["']?\s*:/i],
   ]);
-  return Object.freeze({ literalPatterns, forbiddenPatterns });
+  return Object.freeze({
+    literalPatterns,
+    forbiddenPatterns,
+    classificationRules: STRUCTURED_NO_LOG_RULES,
+  });
+}
+
+function emptyStructuredValue(value) {
+  return value === null || value === "" ||
+    (Array.isArray(value) && value.length === 0) ||
+    (typeof value === "object" && value !== null && !Array.isArray(value) &&
+      Object.keys(value).length === 0);
+}
+
+function sensitiveStructuredField(key) {
+  return /(?:^|_)(?:authorization|bearer|cookies?|credentials?|dsn|keys?|passwords?|private_keys?|secrets?|tokens?)(?:_|$)/
+    .test(key);
+}
+
+function unclassifiedStructuredField(key) {
+  return [
+    "argv",
+    "binary",
+    "body",
+    "command",
+    "content",
+    "cwd",
+    "env",
+    "executable",
+    "headers",
+    "message",
+    "path",
+    "payload",
+    "prompt",
+    "query",
+    "request",
+    "response",
+    "uri",
+    "url",
+  ].includes(key) ||
+    /_(?:argv|binary|body|command|content|cwd|env|executable|headers|message|path|payload|prompt|query|request|response|uri|url)$/.test(key);
+}
+
+function approvedContextFieldValue(key, value) {
+  if (emptyStructuredValue(value)) return true;
+  if (key === "path" || key === "uri" || /_(?:path|uri)$/.test(key)) {
+    return value === "/healthz" || value === "/healthz/v2";
+  }
+  if (key === "env") return value === "local";
+  if (key === "argv") return Array.isArray(value) && value.length === 0;
+  return key === "payload" &&
+    value !== null && typeof value === "object" && !Array.isArray(value) &&
+    exactKeys(value, ["status"]) && value.status === "ready";
+}
+
+function localAbsolutePath(value) {
+  if (typeof value !== "string") return false;
+  if (/^[A-Za-z]:[\\/](?:Users|Documents and Settings)[\\/]/.test(value)) return true;
+  if (
+    /^file:\/\/\/(?:Applications|Library|System|Users|Volumes|home|private|tmp)(?:\/|$)/.test(value) ||
+    /^file:\/\/\/(?:opt\/homebrew|usr\/local)(?:\/|$)/.test(value) ||
+    /^file:\/\/\/var\/folders(?:\/|$)/.test(value) ||
+    /^file:\/\/\/[A-Za-z]:[\\/](?:Users|Documents and Settings)[\\/]/.test(value)
+  ) return true;
+  if (!isAbsolute(value)) return false;
+  return /^\/(?:Applications|Library|System|Users|Volumes|home|private|tmp)(?:\/|$)/.test(value) ||
+    /^\/(?:opt\/homebrew|usr\/local)(?:\/|$)/.test(value) ||
+    /^\/var\/folders(?:\/|$)/.test(value);
+}
+
+function normalizedStructuredField(rawKey) {
+  return rawKey
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .replaceAll("-", "_");
+}
+
+function structuredNoLogRules(value) {
+  const rules = new Set();
+  function visit(current, sensitiveContext = false) {
+    if (typeof current === "string") {
+      if (localAbsolutePath(current)) rules.add("absolute_local_path");
+      if (!sensitiveContext && /\bbearer\b/i.test(current)) rules.add("bearer");
+      if (!sensitiveContext && /\bcredentials?\b/i.test(current)) rules.add("credential");
+      if (!sensitiveContext && /\b(?:postgres(?:ql)?|redis):\/\//i.test(current)) {
+        rules.add("dsn");
+      }
+      if (!sensitiveContext && /private[\s_-]*key/i.test(current)) rules.add("private_key");
+      return;
+    }
+    if (Array.isArray(current)) {
+      for (const entry of current) visit(entry, sensitiveContext);
+      return;
+    }
+    if (current === null || typeof current !== "object") return;
+    for (const [rawKey, entry] of Object.entries(current)) {
+      const key = normalizedStructuredField(rawKey);
+      if (sensitiveStructuredField(key) && !emptyStructuredValue(entry)) {
+        rules.add("sensitive_value_field");
+      }
+      if (unclassifiedStructuredField(key) &&
+        !approvedContextFieldValue(key, entry)) {
+        rules.add("unclassified_sensitive_field");
+      }
+      visit(entry, sensitiveContext || sensitiveStructuredField(key));
+    }
+  }
+  visit(value);
+  return rules;
 }
 
 function scanNoLogBuffer(content, literalPatterns, forbiddenPatterns) {
-  const value = Buffer.from(content).toString("utf8");
-  let hitCount = 0;
-  const hitRules = [];
-  const folded = value.toLocaleLowerCase("en-US");
+  let value;
+  try {
+    value = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(content));
+  } catch {
+    fail("orchestrator_no_log_invalid");
+  }
+  const hitRules = new Set();
+  const folded = value.toLowerCase();
   for (const { name, value: pattern } of literalPatterns) {
-    if (folded.includes(pattern.toLocaleLowerCase("en-US"))) {
-      hitCount += 1;
-      hitRules.push(name);
+    if (folded.includes(pattern.toLowerCase())) hitRules.add(name);
+  }
+  function parseUniqueJson(input) {
+    try {
+      const structured = JSON.parse(input);
+      YAML.parse(input, { version: "1.2", uniqueKeys: true });
+      return Object.freeze({ parsed: true, structured });
+    } catch {
+      return Object.freeze({ parsed: false });
     }
   }
+  function classifyUnstructuredLine(line) {
+    for (const match of line.matchAll(/["']?([A-Za-z][A-Za-z0-9_-]{0,127})["']?\s*:/g)) {
+      const key = normalizedStructuredField(match[1]);
+      const bearerAuthorization = key === "authorization" &&
+        /\bbearer\b/i.test(line.slice((match.index ?? 0) + match[0].length));
+      if (sensitiveStructuredField(key) && !bearerAuthorization) {
+        hitRules.add("sensitive_value_field");
+      }
+      if (unclassifiedStructuredField(key)) hitRules.add("unclassified_sensitive_field");
+    }
+  }
+
+  const nonemptyLines = value.split("\n").filter(Boolean);
+  const unstructuredLines = [];
+  const complete = parseUniqueJson(value.trim());
+  if (complete.parsed) {
+    for (const rule of structuredNoLogRules(complete.structured)) hitRules.add(rule);
+  } else {
+    for (const line of nonemptyLines) {
+      const parsedLine = parseUniqueJson(line);
+      if (parsedLine.parsed) {
+        for (const rule of structuredNoLogRules(parsedLine.structured)) hitRules.add(rule);
+        continue;
+      }
+      unstructuredLines.push(line);
+      classifyUnstructuredLine(line);
+    }
+  }
+  const unstructured = unstructuredLines.join("\n");
   for (const [name, pattern] of forbiddenPatterns) {
-    if (pattern.test(value)) {
-      hitCount += 1;
-      hitRules.push(name);
-    }
+    if (pattern.test(unstructured)) hitRules.add(name);
   }
+  const sortedHitRules = [...hitRules].sort(asciiCompare);
   return Object.freeze({
-    rowCount: value.split("\n").filter(Boolean).length,
-    hitCount,
-    hitRules: Object.freeze(hitRules),
+    rowCount: nonemptyLines.length,
+    hitCount: sortedHitRules.length,
+    hitRules: Object.freeze(sortedHitRules),
   });
+}
+
+function noLogPatternDigest(literalPatterns, forbiddenPatterns, classificationRules) {
+  return sha256([...new Set([
+    ...literalPatterns.map(({ name }) => name),
+    ...forbiddenPatterns.map(([name]) => name),
+    ...classificationRules,
+  ])].sort(asciiCompare).join("\n"));
 }
 
 async function scanNoLogFiles(files, literalPatterns, forbiddenPatterns) {
@@ -3543,37 +3875,78 @@ export async function captureRuntimeLogScan(context, operations = {}) {
     !(context.secrets instanceof Map)
   ) fail("orchestrator_no_log_invalid");
   const project = projectName(context.runId);
-  const list = operations.list ?? (async () => await dockerList([
+  const list = operations.list ?? (async () => (await dockerList([
     "ps",
-    "-aq",
+    "-a",
     "--filter",
     `label=com.docker.compose.project=${project}`,
-  ]));
+    "--format",
+    [
+      "{{.ID}}",
+      '{{.Label "com.docker.compose.project"}}',
+      '{{.Label "ai.yijie.feature"}}',
+      '{{.Label "ai.yijie.slice"}}',
+      '{{.Label "ai.yijie.run-id"}}',
+      '{{.Label "ai.yijie.data-classification"}}',
+      '{{.Label "com.docker.compose.service"}}',
+    ].join("\t"),
+  ])).map((row) => {
+    const parts = row.split("\t");
+    if (parts.length !== RUNTIME_LOG_SOURCE_KEYS.length) fail("orchestrator_no_log_invalid");
+    return {
+      container_id: parts[0],
+      project: parts[1],
+      feature: parts[2],
+      slice: parts[3],
+      run_id: parts[4],
+      data_classification: parts[5],
+      service_role: parts[6],
+    };
+  }));
   const readLogs = operations.readLogs ?? (async (containerId) => await runCommand(
     "container_logs",
     "docker",
     ["logs", containerId],
     { captureAllOutput: true, maxBuffer: CHILD_OUTPUT_MAX_BYTES, timeout: 30_000 },
   ));
-  let containerIds;
+  let sources;
   try {
-    containerIds = [...new Set(await list())].sort();
+    sources = (await list()).map((source) => {
+      if (
+        source === null || typeof source !== "object" || Array.isArray(source) ||
+        !exactKeys(source, RUNTIME_LOG_SOURCE_KEYS) ||
+        !/^[0-9a-f]{12,64}$/.test(source.container_id ?? "") ||
+        source.project !== project || source.feature !== "FEAT-126" ||
+        source.slice !== "S10E" || source.run_id !== context.runId ||
+        source.data_classification !== "synthetic-only" ||
+        !RUNTIME_LOG_SERVICE_ROLES.includes(source.service_role)
+      ) fail("orchestrator_no_log_invalid");
+      return Object.freeze({
+        containerId: source.container_id,
+        origin: `compose:${source.service_role}`,
+      });
+    }).sort((left, right) => asciiCompare(left.origin, right.origin));
   } catch {
     fail("orchestrator_no_log_invalid");
   }
   if (
-    containerIds.length === 0 ||
-    containerIds.some((value) => !/^[0-9a-f]{12,64}$/.test(value ?? ""))
+    sources.length !== RUNTIME_LOG_SERVICE_ROLES.length ||
+    new Set(sources.map(({ containerId }) => containerId)).size !== sources.length ||
+    new Set(sources.map(({ origin }) => origin)).size !== sources.length ||
+    JSON.stringify(sources.map(({ origin }) => origin)) !== JSON.stringify(
+      RUNTIME_LOG_SERVICE_ROLES.map((role) => `compose:${role}`).sort(asciiCompare),
+    )
   ) fail("orchestrator_no_log_invalid");
   const { literalPatterns, forbiddenPatterns } = noLogPatternSet(context);
   let rowCount = 0;
   let hitCount = 0;
   const hitOrigins = [];
   const hitRules = [];
-  for (const containerId of containerIds) {
+  const hitOriginRules = [];
+  for (const source of sources) {
     let content;
     try {
-      content = await readLogs(containerId);
+      content = await readLogs(source.containerId);
     } catch {
       fail("orchestrator_no_log_invalid");
     }
@@ -3584,20 +3957,24 @@ export async function captureRuntimeLogScan(context, operations = {}) {
     rowCount += scan.rowCount;
     hitCount += scan.hitCount;
     for (const rule of scan.hitRules) {
-      hitOrigins.push(containerId);
+      hitOrigins.push(source.origin);
       hitRules.push(rule);
+      hitOriginRules.push(JSON.stringify([source.origin, rule]));
     }
   }
   return validateRuntimeLogScan({
-    schema_version: 2,
+    schema_version: 3,
     status: hitCount === 0 ? "passed" : "failed",
     run_id: context.runId,
-    source_count: containerIds.length,
+    source_count: sources.length,
     row_count: rowCount,
     hit_count: hitCount,
-    source_set_sha256: sha256(containerIds.join("\n")),
-    hit_origin_set_sha256: sha256([...new Set(hitOrigins)].sort().join("\n")),
-    hit_rule_set_sha256: sha256([...new Set(hitRules)].sort().join("\n")),
+    source_set_sha256: sha256(sources.map(({ origin }) => origin).join("\n")),
+    hit_origin_set_sha256: sha256([...new Set(hitOrigins)].sort(asciiCompare).join("\n")),
+    hit_rule_set_sha256: sha256([...new Set(hitRules)].sort(asciiCompare).join("\n")),
+    hit_origin_rule_set_sha256: sha256(
+      [...new Set(hitOriginRules)].sort(asciiCompare).join("\n"),
+    ),
   }, context.runId);
 }
 
@@ -3605,7 +3982,7 @@ export async function scanNoLog(context) {
   if (!context?.runRoot || !(context.secrets instanceof Map) || !context.attempt?.markerPath) {
     fail("orchestrator_no_log_invalid");
   }
-  const { literalPatterns, forbiddenPatterns } = noLogPatternSet(context);
+  const { literalPatterns, forbiddenPatterns, classificationRules } = noLogPatternSet(context);
   if (context.runRootPresent === false) {
     if (
       context.phase !== "preflight_failed" || context.composeAttempted !== false ||
@@ -3650,10 +4027,11 @@ export async function scanNoLog(context) {
       external_source_count: 0,
       external_row_count: 0,
       external_source_set_sha256: sha256(""),
-      pattern_set_sha256: sha256([
-        ...literalPatterns.map(({ name }) => name),
-        ...forbiddenPatterns.map(([name]) => name),
-      ].sort().join("\n")),
+      pattern_set_sha256: noLogPatternDigest(
+        literalPatterns,
+        forbiddenPatterns,
+        classificationRules,
+      ),
     });
   }
   if (
@@ -3761,10 +4139,11 @@ export async function scanNoLog(context) {
     external_source_count: runtimeLogScan?.source_count ?? 0,
     external_row_count: runtimeLogScan?.row_count ?? 0,
     external_source_set_sha256: runtimeLogScan?.source_set_sha256 ?? sha256(""),
-    pattern_set_sha256: sha256([
-      ...literalPatterns.map(({ name }) => name),
-      ...forbiddenPatterns.map(([name]) => name),
-    ].sort().join("\n")),
+    pattern_set_sha256: noLogPatternDigest(
+      literalPatterns,
+      forbiddenPatterns,
+      classificationRules,
+    ),
   });
 }
 
@@ -3780,6 +4159,25 @@ async function dockerList(arguments_) {
 
 async function dockerCount(arguments_) {
   return (await dockerList(arguments_)).length;
+}
+
+function preOwnershipDescendantAbsenceRequired(roles) {
+  return roles.includes("desktop") && !["host", "runtime"].every((role) => roles.includes(role));
+}
+
+export async function requirePreOwnershipDescendantsAbsent(runRoot) {
+  if (typeof runRoot !== "string" || !isAbsolute(runRoot)) fail("orchestrator_cleanup_unknown");
+  try {
+    await requireOwnerDirectory(runRoot);
+  } catch {
+    fail("orchestrator_cleanup_unknown");
+  }
+  try {
+    await lstat(resolve(runRoot, "host"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return true;
+  }
+  fail("orchestrator_cleanup_unknown");
 }
 
 async function cleanupLiveContext(context) {
@@ -3812,7 +4210,17 @@ async function cleanupLiveContext(context) {
   }
   cleanupUnknown ||= outcomes.includes("unknown") || outcomes.includes("foreign_identity_preserved");
 
-  if (context.processes.desktop && !context.descendantProcesses) cleanupUnknown = true;
+  const observedRoles = [
+    ...Object.keys(context.processes ?? {}),
+    ...Object.keys(context.descendantProcesses ?? {}),
+  ];
+  if (preOwnershipDescendantAbsenceRequired(observedRoles)) {
+    try {
+      await requirePreOwnershipDescendantsAbsent(context.runRoot);
+    } catch {
+      cleanupUnknown = true;
+    }
+  }
   if (context.hostEvidence) {
     try {
       const stoppedHostEvidence = await readHostProcessEvidence(
@@ -4336,6 +4744,13 @@ async function reconcileExistingRun(authority, runRoot, options = {}) {
       if (!["absent", "stopped"].includes(outcome)) unknown = true;
     }
   }
+  if (preOwnershipDescendantAbsenceRequired(expectedRoles)) {
+    try {
+      await requirePreOwnershipDescendantsAbsent(runRoot);
+    } catch {
+      unknown = true;
+    }
+  }
   if (options.composeCleanupRequired !== false) {
     try {
       await runCommand(
@@ -4697,16 +5112,7 @@ async function reconcileClaimedAttempt(authority, attempt) {
   }
 
   if (failure && failure.run_root_present !== true) fail("orchestrator_cleanup_unknown");
-  if (
-    failure && ((failure.phase === "desktop_starting" && failure.process_roles.includes("desktop")) || [
-      "desktop_spawned",
-      "component_ready",
-      "abort_sent",
-      "abort_complete",
-      "desktop_exited",
-    ].includes(failure.phase)) &&
-    failure.process_roles.length !== EXISTING_PROCESS_ROLES.length
-  ) fail("orchestrator_cleanup_unknown");
+  validateReconcileFailureProcessState(failure);
   const expectedRoles = failure?.process_roles ?? EXISTING_PROCESS_ROLES;
   const baselineVolumeNames = failure
     ? volumeNamesFromKeys(authority.runId, failure.retained_volume_keys)

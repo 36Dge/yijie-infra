@@ -40,6 +40,7 @@ import {
   readAttemptFailure,
   readAttemptPreclaimFailure,
   readAttemptReconcile,
+  requirePreOwnershipDescendantsAbsent,
   runStartupAbortFlow,
   scanNoLog,
   shouldRunComposeCleanup,
@@ -55,6 +56,7 @@ import {
   validateFreshResourceInventory,
   validateNoLogResult,
   validatePreflightFailureBinding,
+  validateReconcileFailureProcessState,
   validateRuntimeLogScan,
   writeAttemptClosure,
   writeAttemptFailure,
@@ -509,6 +511,170 @@ test("S10BO3 corrective persists a known no-log scope when the completed scan fa
   assert.equal(recordedClosure.no_log_failure_class, "orchestrator_no_log_invalid");
   assert.equal(observed.closure.evidence_failure_class, null);
   assert.equal(observed.closure.no_log_failure_class, "orchestrator_no_log_invalid");
+});
+
+test("S10BO3 corrective persists a closed Desktop startup leaf without continuation", async (t) => {
+  const { root, attempt } = await writeSyntheticAttemptFiles(t, "feat126-s10bo3-desktop-leaf-");
+  const retainedVolumeKeys = [
+    "feat126_s10_api_postgres_data",
+    "feat126_s10_keycloak_postgres_data",
+    "feat126_s10_caddy_data",
+    "feat126_s10_caddy_config",
+  ];
+  const calls = [];
+  let desktopStarts = 0;
+  let phase = "desktop_spawned";
+  let boundary;
+  await assert.rejects(
+    runStartupAbortFlow(authority, {
+      async runPreflight() { calls.push("preflight"); return summary(); },
+      async buildDesktop() { calls.push("build_desktop"); },
+      async startDependencies() { calls.push("dependencies"); },
+      async startApi() { calls.push("api"); },
+      async startFake() { calls.push("fake"); },
+      async startDesktop() { calls.push("desktop"); desktopStarts += 1; },
+      async readDesktopFrame(kind) {
+        calls.push(`read:${kind}`);
+        phase = "desktop_starting";
+        throw new S10BO1OrchestratorError("driver_bind_failed");
+      },
+      async readOwnership() { calls.push("ownership"); throw new Error("unreachable"); },
+      async sendAbort() { calls.push("normal_abort"); throw new Error("unreachable"); },
+      async readDesktopEof() { calls.push("read:eof"); throw new Error("unreachable"); },
+      async waitForDesktopExit() { calls.push("desktop_exit"); throw new Error("unreachable"); },
+      async initiateDesktopAbort() { calls.push("failure_abort"); },
+      async verifyBusinessBoundary() {
+        calls.push("business_boundary_check");
+        boundary = buildBusinessBoundaryEvidence(null, null, null, runId);
+        return boundary;
+      },
+      async cleanup() {
+        calls.push("cleanup");
+        assert.equal(await requirePreOwnershipDescendantsAbsent(root), true);
+        return cleanupResult({
+          scope: "run_artifacts",
+          named_volume_baseline_count: 4,
+          named_volume_after_count: 4,
+        });
+      },
+      async recordFailure(value) {
+        calls.push("record_failure");
+        await writeAttemptFailure(attempt, authority, attemptFailure({
+          attempt_marker_sha256: attempt.markerSha256,
+          failure_class: value.failureClass,
+          business_failure_class: value.businessFailureClass,
+          cleanup_failure_class: value.cleanupFailureClass,
+          parent_failure_class: value.parentFailureClass,
+          phase,
+          compose_attempted: true,
+          compose_cleanup_required: false,
+          run_root_present: true,
+          process_roles: ["api", "desktop", "fake"],
+          retained_volume_keys: retainedVolumeKeys,
+        }));
+      },
+      async scanNoLog() {
+        calls.push("no_log");
+        return noLogResult({
+          scope: "run_artifacts",
+          coverage: "all_run_log_and_evidence_sources",
+          file_count: 3,
+          external_source_count: 4,
+          external_row_count: 4,
+          external_source_set_sha256: "d".repeat(64),
+        });
+      },
+      async recordClosure(value) {
+        calls.push("record_closure");
+        await writeAttemptClosure(attempt, authority, attemptClosure({
+          attempt_marker_sha256: attempt.markerSha256,
+          failure_class: value.failureClass,
+          business_failure_class: value.businessFailureClass,
+          business_status: value.businessStatus,
+          cleanup_failure_class: value.cleanupFailureClass,
+          cleanup_scope: value.cleanupScope,
+          evidence_failure_class: value.evidenceFailureClass,
+          no_log_failure_class: value.noLogFailureClass,
+          no_log_scope: value.noLogScope,
+          parent_failure_class: value.parentFailureClass,
+        }));
+      },
+    }),
+    codeIs("driver_bind_failed"),
+  );
+  const failure = await readAttemptFailure(attempt, authority);
+  const closure = await readAttemptClosure(attempt, authority);
+  assert.equal(failure.failure_class, "driver_bind_failed");
+  assert.equal(failure.phase, "desktop_starting");
+  assert.deepEqual(failure.process_roles, ["api", "desktop", "fake"]);
+  assert.equal(failure.cleanup_failure_class, null);
+  assert.equal(closure.failure_class, "driver_bind_failed");
+  assert.equal(closure.evidence_failure_class, null);
+  assert.equal(closure.business_status, "not_applicable");
+  assert.equal(boundary.scope, "not_started");
+  assert.equal(desktopStarts, 1);
+  assert.deepEqual(calls, [
+    "preflight", "build_desktop", "dependencies", "api", "fake", "desktop",
+    "read:component_ready", "failure_abort", "business_boundary_check", "cleanup",
+    "record_failure", "no_log", "record_closure",
+  ]);
+  assert.equal(calls.includes("ownership"), false);
+  assert.equal(calls.includes("normal_abort"), false);
+  assert.equal(calls.includes("read:eof"), false);
+  assert.equal(calls.includes("desktop_exit"), false);
+});
+
+test("S10BO3 corrective fails closed when pre-ownership sidecar artifacts exist", async (t) => {
+  const runRoot = await canonicalTemporaryRoot(t, "feat126-s10bo3-descendant-absence-");
+  assert.equal(await requirePreOwnershipDescendantsAbsent(runRoot), true);
+
+  const hostRoot = resolve(runRoot, "host");
+  const instanceRoot = resolve(hostRoot, "12600000-0000-4000-8000-000000000071");
+  await mkdir(hostRoot, { mode: 0o700 });
+  await chmod(hostRoot, 0o700);
+  await mkdir(instanceRoot, { mode: 0o700 });
+  await chmod(instanceRoot, 0o700);
+  await writeFile(resolve(instanceRoot, "process.json"), `${JSON.stringify({
+    schemaVersion: 1,
+    runId,
+    role: "agent_host_child",
+    pid: 104,
+    ppid: 102,
+    binarySha256: "4".repeat(64),
+    instanceNonce: "12600000-0000-4000-8000-000000000071",
+    startedAtUnixMs: 1,
+    endedAtUnixMs: 2,
+    state: "stopped",
+    exitCode: 0,
+    stdoutBytes: 0,
+    stderrBytes: 0,
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    logLimitBytes: 256 * 1024,
+  })}\n`, { mode: 0o600 });
+  await chmod(resolve(instanceRoot, "process.json"), 0o600);
+  await assert.rejects(
+    requirePreOwnershipDescendantsAbsent(runRoot),
+    codeIs("orchestrator_cleanup_unknown"),
+  );
+
+  const source = await readFile("scripts/feat-126-s10b-orchestrator.mjs", "utf8");
+  const cleanupStart = source.indexOf("async function cleanupLiveContext");
+  const cleanupEnd = source.indexOf("function createLiveOperations", cleanupStart);
+  const reconcileStart = source.indexOf("async function reconcileExistingRun");
+  const reconcileEnd = source.indexOf("async function readOptionalAttemptFailure", reconcileStart);
+  assert.match(
+    source.slice(cleanupStart, cleanupEnd),
+    /requirePreOwnershipDescendantsAbsent\(context\.runRoot\)/,
+  );
+  assert.match(
+    source.slice(reconcileStart, reconcileEnd),
+    /requirePreOwnershipDescendantsAbsent\(runRoot\)/,
+  );
+  assert.doesNotMatch(
+    source.slice(reconcileStart, reconcileEnd),
+    /readOwnershipEvidence|requestRuntimeEvidence/,
+  );
 });
 
 test("S10BO3-004 attempt ledger consumes a run ID exactly once with O_EXCL", async (t) => {
@@ -1008,6 +1174,26 @@ test("S10BO3-013 rejects unknown inventory and phase-incomplete descendant evide
     }, authority).phase,
     "desktop_spawned",
   );
+  const desktopStartupLeaf = {
+    ...desktopSpawned,
+    failure_class: "driver_bind_failed",
+    phase: "desktop_starting",
+    cleanup_failure_class: null,
+  };
+  assert.equal(validateAttemptFailure(desktopStartupLeaf, authority).phase, "desktop_starting");
+  assert.equal(validateReconcileFailureProcessState(desktopStartupLeaf), true);
+  const genericDesktopStartup = {
+    ...desktopStartupLeaf,
+    failure_class: "orchestrator_control_eof",
+  };
+  assert.throws(
+    () => validateAttemptFailure(genericDesktopStartup, authority),
+    codeIs("orchestrator_attempt_evidence_invalid"),
+  );
+  assert.throws(
+    () => validateReconcileFailureProcessState(genericDesktopStartup),
+    codeIs("orchestrator_cleanup_unknown"),
+  );
   assert.throws(
     () => validateAttemptFailure({ ...attemptFailure(), no_log_required: false }, authority),
     codeIs("orchestrator_attempt_evidence_invalid"),
@@ -1069,34 +1255,286 @@ test("S10BO3-017 captures Compose logs before cleanup and marks leaks failed", a
     composeLogsRequired: true,
     secrets: new Map([["ephemeral", "never-log-secret"]]),
   };
+  const project = `yijie-feat126-s10-${runId.replaceAll("-", "")}`;
+  const roles = [
+    "feat126-s10-api-db",
+    "feat126-s10-caddy",
+    "feat126-s10-keycloak",
+    "feat126-s10-keycloak-db",
+  ];
+  function sources(ids = ["1", "2", "3", "4"].map((value) => value.repeat(12))) {
+    return roles.map((serviceRole, index) => ({
+      container_id: ids[index],
+      project,
+      feature: "FEAT-126",
+      slice: "S10E",
+      run_id: runId,
+      data_classification: "synthetic-only",
+      service_role: serviceRole,
+    }));
+  }
+  function logsWith(targetIds, value) {
+    const selected = new Set(targetIds);
+    return async (containerId) => Buffer.from(selected.has(containerId) ? value : "ready\n", "utf8");
+  }
+  const canonicalSources = sources();
+  const origins = roles.map((role) => `compose:${role}`).sort();
   const clean = await captureRuntimeLogScan(context, {
-    async list() { return ["a".repeat(12), "b".repeat(12)]; },
+    async list() { return canonicalSources; },
     async readLogs() { return Buffer.from("ready\n", "utf8"); },
   });
   assert.equal(clean.status, "passed");
-  assert.equal(clean.schema_version, 2);
-  assert.equal(clean.source_count, 2);
+  assert.equal(clean.schema_version, 3);
+  assert.equal(clean.source_count, 4);
+  assert.equal(clean.source_set_sha256, sha256(origins.join("\n")));
   assert.equal(clean.hit_origin_set_sha256, sha256(""));
   assert.equal(clean.hit_rule_set_sha256, sha256(""));
-  const leaked = await captureRuntimeLogScan(context, {
-    async list() { return ["a".repeat(12)]; },
-    async readLogs() { return Buffer.from("Authorization: Bearer token\n", "utf8"); },
+  assert.equal(clean.hit_origin_rule_set_sha256, sha256(""));
+  const rotatedIds = ["a", "b", "c", "d"].map((value) => value.repeat(12));
+  const rotated = await captureRuntimeLogScan(context, {
+    async list() { return sources(rotatedIds).reverse(); },
+    async readLogs() { return Buffer.from("ready\n", "utf8"); },
   });
-  assert.equal(leaked.status, "failed");
-  assert.equal(leaked.hit_count, 1);
-  assert.equal(leaked.hit_origin_set_sha256, sha256("a".repeat(12)));
-  assert.equal(leaked.hit_rule_set_sha256, sha256("bearer"));
-  assert.equal(validateRuntimeLogScan(leaked, runId).schema_version, 2);
+  assert.equal(rotated.source_set_sha256, clean.source_set_sha256);
+  const benign = await captureRuntimeLogScan(context, {
+    async list() { return canonicalSources; },
+    async readLogs() {
+      return Buffer.from(
+        '{"path":"/healthz","uri":"/healthz/v2","env":"local","payload":{"status":"ready"},"argv":[]}\n' +
+          '{"token":"","secret":null,"authorization":{}}\n',
+        "utf8",
+      );
+    },
+  });
+  assert.equal(benign.status, "passed");
+  assert.equal(benign.hit_count, 0);
+  const sensitiveValue = await captureRuntimeLogScan(context, {
+    async list() { return canonicalSources; },
+    readLogs: logsWith([canonicalSources[0].container_id], '{"token":"opaque-value"}\n'),
+  });
+  assert.equal(sensitiveValue.status, "failed");
+  assert.equal(sensitiveValue.hit_count, 1);
+  assert.equal(sensitiveValue.hit_origin_set_sha256, sha256(origins[0]));
+  assert.equal(sensitiveValue.hit_rule_set_sha256, sha256("sensitive_value_field"));
+  assert.equal(
+    sensitiveValue.hit_origin_rule_set_sha256,
+    sha256(JSON.stringify([origins[0], "sensitive_value_field"])),
+  );
+  assert.equal(validateRuntimeLogScan(sensitiveValue, runId).schema_version, 3);
+  const sensitiveKey = await captureRuntimeLogScan(context, {
+    async list() { return canonicalSources; },
+    readLogs: logsWith([canonicalSources[0].container_id], '{"apiKey":"opaque-value"}\n'),
+  });
+  assert.equal(sensitiveKey.hit_count, 1);
+  assert.equal(sensitiveKey.hit_rule_set_sha256, sha256("sensitive_value_field"));
+  for (const sensitiveField of [
+    "tokenValue",
+    "apiTokens",
+    "clientSecretValue",
+    "APIKey",
+    "APIKeys",
+  ]) {
+    const sensitiveVariant = await captureRuntimeLogScan(context, {
+      async list() { return canonicalSources; },
+      readLogs: logsWith(
+        [canonicalSources[0].container_id],
+        `${JSON.stringify({ [sensitiveField]: "opaque-value" })}\n`,
+      ),
+    });
+    assert.equal(sensitiveVariant.hit_count, 1);
+    assert.equal(sensitiveVariant.hit_rule_set_sha256, sha256("sensitive_value_field"));
+  }
+  const prettySensitive = await captureRuntimeLogScan(context, {
+    async list() { return canonicalSources; },
+    readLogs: logsWith(
+      [canonicalSources[0].container_id],
+      `${JSON.stringify({ nested: { tokenValue: "opaque-value" } }, null, 2)}\n`,
+    ),
+  });
+  assert.equal(prettySensitive.hit_count, 1);
+  assert.equal(prettySensitive.hit_rule_set_sha256, sha256("sensitive_value_field"));
+  const prettyBenign = await captureRuntimeLogScan(context, {
+    async list() { return canonicalSources; },
+    readLogs: logsWith(
+      [canonicalSources[0].container_id],
+      `${JSON.stringify({
+        path: "/healthz",
+        uri: "/healthz/v2",
+        env: "local",
+        payload: { status: "ready" },
+        argv: [],
+      }, null, 2)}\n`,
+    ),
+  });
+  assert.equal(prettyBenign.status, "passed");
+  assert.equal(prettyBenign.hit_count, 0);
+  for (const unclassifiedField of ["message", "content", "prompt", "binary"]) {
+    const unclassifiedVariant = await captureRuntimeLogScan(context, {
+      async list() { return canonicalSources; },
+      readLogs: logsWith(
+        [canonicalSources[1].container_id],
+        `${JSON.stringify({ [unclassifiedField]: "opaque-value" })}\n`,
+      ),
+    });
+    assert.equal(unclassifiedVariant.hit_count, 1);
+    assert.equal(
+      unclassifiedVariant.hit_rule_set_sha256,
+      sha256("unclassified_sensitive_field"),
+    );
+  }
+  const unclassified = await captureRuntimeLogScan(context, {
+    async list() { return canonicalSources; },
+    readLogs: logsWith(
+      [canonicalSources[1].container_id],
+      '{"payload":{"message":"not-content-free"}}\n',
+    ),
+  });
+  assert.equal(unclassified.hit_count, 1);
+  assert.equal(unclassified.hit_rule_set_sha256, sha256("unclassified_sensitive_field"));
+  const unclassifiedUri = await captureRuntimeLogScan(context, {
+    async list() { return canonicalSources; },
+    readLogs: logsWith(
+      [canonicalSources[1].container_id],
+      '{"requestUri":"/v1/tasks?cursor=opaque"}\n',
+    ),
+  });
+  assert.equal(unclassifiedUri.hit_count, 1);
+  assert.equal(unclassifiedUri.hit_rule_set_sha256, sha256("unclassified_sensitive_field"));
+  const absolutePath = await captureRuntimeLogScan(context, {
+    async list() { return canonicalSources; },
+    readLogs: logsWith([canonicalSources[2].container_id], '{"value":"/Users/local/private"}\n'),
+  });
+  assert.equal(absolutePath.hit_count, 1);
+  assert.equal(absolutePath.hit_rule_set_sha256, sha256("absolute_local_path"));
+  const absoluteFileUri = await captureRuntimeLogScan(context, {
+    async list() { return canonicalSources; },
+    readLogs: logsWith(
+      [canonicalSources[2].container_id],
+      '{"value":"file:///Users/local/private"}\n',
+    ),
+  });
+  assert.equal(absoluteFileUri.hit_count, 1);
+  assert.equal(absoluteFileUri.hit_rule_set_sha256, sha256("absolute_local_path"));
+  const duplicateSensitiveKey = await captureRuntimeLogScan(context, {
+    async list() { return canonicalSources; },
+    readLogs: logsWith(
+      [canonicalSources[3].container_id],
+      '{"token":"opaque-value","token":""}\n',
+    ),
+  });
+  assert.equal(duplicateSensitiveKey.hit_count, 1);
+  assert.equal(
+    duplicateSensitiveKey.hit_rule_set_sha256,
+    sha256("sensitive_value_field"),
+  );
+  await assert.rejects(
+    captureRuntimeLogScan(context, {
+      async list() { return canonicalSources; },
+      readLogs: logsWith([canonicalSources[2].container_id], Buffer.from([0xff])),
+    }),
+    codeIs("orchestrator_no_log_invalid"),
+  );
+
   const repeated = await captureRuntimeLogScan(context, {
-    async list() { return ["a".repeat(12), "b".repeat(12)]; },
-    async readLogs() { return Buffer.from("Authorization: Bearer token\n", "utf8"); },
+    async list() { return canonicalSources; },
+    readLogs: logsWith(
+      [canonicalSources[0].container_id, canonicalSources[1].container_id],
+      "Authorization: Bearer token\n",
+    ),
   });
   assert.equal(repeated.hit_count, 2);
   assert.equal(
     repeated.hit_origin_set_sha256,
-    sha256(`${"a".repeat(12)}\n${"b".repeat(12)}`),
+    sha256(origins.slice(0, 2).join("\n")),
   );
   assert.equal(repeated.hit_rule_set_sha256, sha256("bearer"));
+  assert.equal(
+    repeated.hit_origin_rule_set_sha256,
+    sha256(origins.slice(0, 2).map((origin) => JSON.stringify([origin, "bearer"])).join("\n")),
+  );
+
+  const invalidSources = [
+    canonicalSources.slice(0, 3),
+    canonicalSources.map((source, index) => index === 3
+      ? { ...source, service_role: roles[0] }
+      : source),
+    canonicalSources.map((source, index) => index === 3
+      ? { ...source, container_id: canonicalSources[0].container_id }
+      : source),
+    canonicalSources.map((source, index) => index === 0
+      ? { ...source, service_role: "unknown" }
+      : source),
+    canonicalSources.map((source, index) => index === 0
+      ? { ...source, project: `${project}-foreign` }
+      : source),
+    canonicalSources.map((source, index) => index === 0
+      ? { ...source, feature: "FEAT-125" }
+      : source),
+    canonicalSources.map((source, index) => index === 0
+      ? { ...source, slice: "S10B" }
+      : source),
+    canonicalSources.map((source, index) => index === 0
+      ? { ...source, run_id: "12600000-0000-4000-8000-000000000071" }
+      : source),
+    canonicalSources.map((source, index) => index === 0
+      ? { ...source, data_classification: "unknown" }
+      : source),
+    canonicalSources.map((source, index) => index === 0
+      ? { ...source, service_role: `${source.service_role}\textra` }
+      : source),
+  ];
+  for (const invalid of invalidSources) {
+    await assert.rejects(
+      captureRuntimeLogScan(context, {
+        async list() { return invalid; },
+        async readLogs() { return Buffer.from("ready\n", "utf8"); },
+      }),
+      codeIs("orchestrator_no_log_invalid"),
+    );
+  }
+
+  const v1 = {
+    schema_version: 1,
+    status: "passed",
+    run_id: runId,
+    source_count: 4,
+    row_count: 4,
+    hit_count: 0,
+    source_set_sha256: clean.source_set_sha256,
+  };
+  const emptySetSha256 = sha256("");
+  const v2 = {
+    ...v1,
+    schema_version: 2,
+    hit_origin_set_sha256: emptySetSha256,
+    hit_rule_set_sha256: emptySetSha256,
+  };
+  assert.equal(validateRuntimeLogScan(v1, runId).schema_version, 1);
+  assert.equal(validateRuntimeLogScan(v2, runId).schema_version, 2);
+  assert.equal(validateRuntimeLogScan({
+    ...v2,
+    status: "failed",
+    hit_count: 1,
+    hit_origin_set_sha256: sha256(origins[0]),
+    hit_rule_set_sha256: sha256("sensitive_value_field"),
+  }, runId).schema_version, 2);
+  assert.equal(validateRuntimeLogScan(clean, runId).schema_version, 3);
+  assert.throws(
+    () => validateRuntimeLogScan({ ...clean, source_count: 3 }, runId),
+    codeIs("orchestrator_no_log_invalid"),
+  );
+  assert.throws(
+    () => validateRuntimeLogScan({ ...clean, source_set_sha256: sha256("foreign") }, runId),
+    codeIs("orchestrator_no_log_invalid"),
+  );
+  assert.throws(
+    () => validateRuntimeLogScan({ ...v2, hit_count: 1, status: "failed" }, runId),
+    codeIs("orchestrator_no_log_invalid"),
+  );
+  assert.throws(
+    () => validateRuntimeLogScan({ ...clean, hit_origin_rule_set_sha256: emptySetSha256, hit_count: 1, status: "failed" }, runId),
+    codeIs("orchestrator_no_log_invalid"),
+  );
 });
 
 function apiProjection(canonicalHash) {
