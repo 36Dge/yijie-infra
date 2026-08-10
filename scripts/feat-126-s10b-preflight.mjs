@@ -21,12 +21,14 @@ import { FEAT_126_S10_PROFILE, FEAT_126_S10_SERVICES } from "./compose-model.mjs
 
 const INFRA_ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const WORKSPACE_ROOT = resolve(INFRA_ROOT, "..");
+const GENERATED_ROOT = resolve(INFRA_ROOT, "environments/local/generated/feat-126-s10");
 const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const FULL_SHA_PATTERN = /^[0-9a-f]{40}$/;
 const DIGEST_PATTERN = /^[0-9a-f]{64}$/;
 const FIXED_PORTS = Object.freeze([5432, 8443, 9443, 18080, 18081, 18082]);
 const IMAGE_RESOLVER_SCRIPT = resolve(INFRA_ROOT, "scripts/verify-feat-126-s10-images.mjs");
 const IMAGE_RESOLVER_EVIDENCE_FILE = "image-resolver-result.v1.json";
+export const PREFLIGHT_FAILURE_EVIDENCE_FILE = "preflight-failure-closure.v1.json";
 const S10_COMPOSE_FILE = resolve(INFRA_ROOT, "docker-compose.local.yml");
 const {
   CLOSED_RESOLVER_RESULT_MAX_BYTES,
@@ -71,6 +73,29 @@ const PROBE_KEYS = Object.freeze([
   "schema_version",
   "status",
 ]);
+const PREFLIGHT_FAILURE_KEYS = Object.freeze([
+  "cleanup_state",
+  "compose_attempted",
+  "failure_class",
+  "phase",
+  "run_id",
+  "s10b_r8_executed",
+  "schema_version",
+  "scope",
+  "status",
+]);
+const PREFLIGHT_PHASES = new Set([
+  "authority",
+  "run_root",
+  "compose_config",
+  "image_resolver",
+  "dependencies",
+  "service_setup",
+  "build",
+  "api_ready",
+  "fake_ready",
+  "no_log",
+]);
 
 export class S10BPreflightError extends Error {
   constructor(code) {
@@ -81,6 +106,22 @@ export class S10BPreflightError extends Error {
 
 function fail(code) {
   throw new S10BPreflightError(code);
+}
+
+export function validatePreflightFailureEvidence(value, runId) {
+  if (
+    value === null || Array.isArray(value) || typeof value !== "object" ||
+    JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(PREFLIGHT_FAILURE_KEYS) ||
+    value.schema_version !== 1 || value.status !== "failed" ||
+    value.scope !== "S10B-001-combined-preflight" || value.run_id !== runId ||
+    !PREFLIGHT_PHASES.has(value.phase) || typeof value.compose_attempted !== "boolean" ||
+    !["not_applicable", "passed", "unknown"].includes(value.cleanup_state) ||
+    !/^[a-z][a-z0-9_]{0,127}$/.test(value.failure_class ?? "") ||
+    value.s10b_r8_executed !== false
+  ) {
+    fail("preflight_failure_evidence_invalid");
+  }
+  return Object.freeze({ ...value });
 }
 
 const IMAGE_RESOLVER_PARENT_FAILURE_SET = new Set(IMAGE_RESOLVER_PARENT_FAILURE_CLASSES);
@@ -187,6 +228,46 @@ async function requirePortsAvailable(ports = FIXED_PORTS) {
   for (const port of ports) {
     if (!(await portIsAvailable(port))) fail("preflight_port_unavailable");
   }
+}
+
+export async function preparePreflightFailureEvidenceRoots(
+  runId,
+  options = {},
+) {
+  if (!RUN_ID_PATTERN.test(runId ?? "")) fail("preflight_run_id_invalid");
+  const generatedRoot = resolve(options.generatedRoot ?? GENERATED_ROOT);
+  const runRoot = resolve(generatedRoot, runId);
+  const logRoot = resolve(runRoot, "logs");
+  const evidenceRoot = resolve(runRoot, "preflight-evidence");
+  let runRootMetadata;
+  try {
+    runRootMetadata = await lstat(runRoot);
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    fail("preflight_run_root_invalid");
+  }
+  if (
+    !runRootMetadata.isDirectory() || runRootMetadata.isSymbolicLink() ||
+    runRootMetadata.uid !== process.getuid() || (runRootMetadata.mode & 0o777) !== 0o700 ||
+    (await realpath(runRoot)) !== runRoot
+  ) fail("preflight_run_root_invalid");
+  for (const directory of [logRoot, evidenceRoot]) {
+    let created = false;
+    try {
+      await mkdir(directory, { mode: 0o700 });
+      created = true;
+    } catch (error) {
+      if (error?.code !== "EEXIST") fail("preflight_run_root_invalid");
+    }
+    if (created) await chmod(directory, 0o700);
+    const metadata = await lstat(directory);
+    if (
+      !metadata.isDirectory() || metadata.isSymbolicLink() ||
+      metadata.uid !== process.getuid() || (metadata.mode & 0o777) !== 0o700 ||
+      (await realpath(directory)) !== directory
+    ) fail("preflight_run_root_invalid");
+  }
+  return true;
 }
 
 function boundedJSONRequest(path, expectedStatus) {
@@ -468,6 +549,15 @@ function startPrevalidatedDependencies(runId, secretsPath) {
   );
 }
 
+export function attemptPrevalidatedDependencyStart(state, start) {
+  if (
+    state === null || Array.isArray(state) || typeof state !== "object" ||
+    typeof state.dependenciesAttempted !== "boolean" || typeof start !== "function"
+  ) fail("preflight_dependencies_authority_invalid");
+  state.dependenciesAttempted = true;
+  return start();
+}
+
 async function execute(runId, expectedSHAs) {
   if (!RUN_ID_PATTERN.test(runId ?? "")) fail("preflight_run_id_invalid");
   let apiRuntimeAuthority;
@@ -487,10 +577,13 @@ async function execute(runId, expectedSHAs) {
   const evidenceRoot = resolve(runRoot, "preflight-evidence");
   const secretsPath = resolve(runRoot, "infra-secrets.env");
   const caPath = resolve(runRoot, "caddy-root.crt");
-  let dependenciesStarted = false;
+  const dependencyState = { dependenciesAttempted: false };
   let apiProcess;
   let fakeProcess;
   let failure;
+  let runRootCreated = false;
+  let phase = "authority";
+  let cleanupState = "not_applicable";
   const completed = [];
 
   try {
@@ -511,13 +604,17 @@ async function execute(runId, expectedSHAs) {
     ) {
       fail("preflight_run_root_invalid");
     }
+    runRootCreated = true;
+    phase = "run_root";
     await mkdir(binRoot, { mode: 0o700 });
     await mkdir(logRoot, { mode: 0o700 });
     await mkdir(evidenceRoot, { mode: 0o700 });
     completed.push("authority", "ports", "secret_init");
 
+    phase = "compose_config";
     runCommand("compose_config", "make", ["feat-126-s10-config", `RUN_ID=${runId}`]);
     completed.push("compose");
+    phase = "image_resolver";
     await runClosedImageResolver(runId, evidenceRoot);
     completed.push("images");
     // Reuse the reviewed wrapper immediately before the direct fixed Compose
@@ -530,9 +627,15 @@ async function execute(runId, expectedSHAs) {
     // The public `make feat-126-s10-up` path retains its human resolver for
     // compatibility. The parent starts dependencies from a fixed authority so
     // the closed resolver is not repeated through that human path.
-    startPrevalidatedDependencies(runId, secretsPath);
-    dependenciesStarted = true;
+    phase = "dependencies";
+    attemptPrevalidatedDependencyStart(
+      dependencyState,
+      () => {
+        startPrevalidatedDependencies(runId, secretsPath);
+      },
+    );
     runCommand("dependency_status", "make", ["feat-126-s10-status", `RUN_ID=${runId}`]);
+    phase = "service_setup";
     runCommand("ca_export", "make", ["feat-126-s10-export-ca", `RUN_ID=${runId}`]);
     runCommand("runtime_inventory", "make", ["feat-126-s10-verify-runtime", `RUN_ID=${runId}`]);
     runCommand("synthetic_identity", "make", ["feat-126-s10-provision-users", `RUN_ID=${runId}`]);
@@ -550,6 +653,7 @@ async function execute(runId, expectedSHAs) {
     ]);
     completed.push("dependencies", "tls_oidc", "identity", "migration", "bootstrap");
 
+    phase = "build";
     const buildEnvironment = commandEnvironment({ GOCACHE: resolve(runRoot, "go-build-cache") });
     runCommand("api_build", "go", ["build", "-trimpath", "-o", resolve(binRoot, "yijie-api"), "./cmd/api-server"], {
       cwd: REPOSITORIES.api,
@@ -605,6 +709,7 @@ async function execute(runId, expectedSHAs) {
       resolve(logRoot, "api.log"),
     );
     await waitForAPI(apiProcess);
+    phase = "api_ready";
     completed.push("api_health", "api_readiness");
 
     fakeProcess = startProcess(
@@ -644,12 +749,14 @@ async function execute(runId, expectedSHAs) {
       fail("fake_readiness_authority_invalid");
     }
     const readiness = validateProbeResult(probeValue, runId);
+    phase = "fake_ready";
     completed.push("host_owned_fake_authority", "fake_readiness");
 
     await scanLogs(
       [resolve(logRoot, "api.log"), resolve(logRoot, "fake.log")],
       [...secrets.values()],
     );
+    phase = "no_log";
     completed.push("content_free_logs");
     return {
       readiness,
@@ -666,20 +773,54 @@ async function execute(runId, expectedSHAs) {
   } finally {
     await stopProcess(fakeProcess);
     await stopProcess(apiProcess);
-    if (dependenciesStarted) {
+    if (dependencyState.dependenciesAttempted) {
       try {
         runCommand("cleanup", "make", ["feat-126-s10-stop", `RUN_ID=${runId}`]);
+        cleanupState = "passed";
       } catch (cleanupError) {
+        cleanupState = "unknown";
         if (!failure) failure = cleanupError;
       }
     }
+    let portsRestored = false;
     for (let attempt = 0; attempt < 30; attempt += 1) {
       const available = await Promise.all(FIXED_PORTS.map((port) => portIsAvailable(port)));
-      if (available.every(Boolean)) break;
-      if (attempt === 29 && !failure) failure = new S10BPreflightError("preflight_cleanup_incomplete");
+      if (available.every(Boolean)) {
+        portsRestored = true;
+        break;
+      }
       await new Promise((resolveWait) => setTimeout(resolveWait, 100));
     }
+    if (!portsRestored) {
+      cleanupState = "unknown";
+      if (!failure) failure = new S10BPreflightError("preflight_cleanup_incomplete");
+    }
     if (failure) {
+      try {
+        runRootCreated = await preparePreflightFailureEvidenceRoots(runId);
+      } catch {
+        runRootCreated = false;
+      }
+      if (runRootCreated) {
+        try {
+          await writeClosedJSON(
+            resolve(evidenceRoot, PREFLIGHT_FAILURE_EVIDENCE_FILE),
+            validatePreflightFailureEvidence({
+              schema_version: 1,
+              status: "failed",
+              scope: "S10B-001-combined-preflight",
+              run_id: runId,
+              failure_class: failure.code,
+              phase,
+              compose_attempted: dependencyState.dependenciesAttempted,
+              cleanup_state: cleanupState,
+              s10b_r8_executed: false,
+            }, runId),
+          );
+        } catch {
+          // The primary failure remains authoritative; outer closure will mark missing evidence.
+        }
+      }
       try {
         await writeClosedJSON(resolve(runRoot, "REJECTED"), {
           schema_version: 1,

@@ -26,13 +26,16 @@ import {
 import { parseFeat126S10Secrets } from "./feat-126-s10-secrets.mjs";
 import {
   buildPrevalidatedDependencyArguments,
+  PREFLIGHT_FAILURE_EVIDENCE_FILE,
   readExpectedSHAs,
+  validatePreflightFailureEvidence,
   validateProbeResult,
 } from "./feat-126-s10b-preflight.mjs";
 
 const INFRA_ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const WORKSPACE_ROOT = resolve(INFRA_ROOT, "..");
 const GENERATED_ROOT = resolve(INFRA_ROOT, "environments/local/generated/feat-126-s10");
+const ATTEMPT_ROOT = resolve(GENERATED_ROOT, ".orchestrator-attempts");
 const DESKTOP_ROOT = resolve(WORKSPACE_ROOT, "yijie-desktop");
 const RUNTIME_ROOT = resolve(WORKSPACE_ROOT, "yijie-codex");
 const REPOSITORIES = Object.freeze({
@@ -45,6 +48,7 @@ const REPOSITORIES = Object.freeze({
   infra: INFRA_ROOT,
 });
 const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const FULL_SHA_PATTERN = /^[0-9a-f]{40}$/;
 const DIGEST_PATTERN = /^[0-9a-f]{64}$/;
 const CONTROL_KEYS = Object.freeze(["kind", "nonce", "run_id", "schema_version", "sequence"]);
 const CONTROL_MAX_BYTES = 1024;
@@ -54,6 +58,123 @@ const PROCESS_STOP_TIMEOUT_MS = 8_000;
 const CHILD_OUTPUT_MAX_BYTES = 1024 * 1024;
 const FIXED_PORTS = Object.freeze([5432, 8443, 9443, 18080, 18081, 18082]);
 const REPOSITORY_KEYS = Object.freeze(["api", "contracts", "desktop", "governance", "host", "infra", "runtime"]);
+const PREFLIGHT_MAKE_SHA_KEYS = Object.freeze([
+  ["governance", "GOVERNANCE_SHA"],
+  ["contracts", "CONTRACTS_SHA"],
+  ["api", "API_SHA"],
+  ["host", "HOST_SHA"],
+  ["desktop", "DESKTOP_SHA"],
+  ["runtime", "RUNTIME_SHA"],
+  ["infra", "INFRA_SHA"],
+]);
+const ATTEMPT_MARKER_KEYS = Object.freeze([
+  "binary_sha256",
+  "kind",
+  "pid",
+  "ppid",
+  "repositories",
+  "run_id",
+  "schema_version",
+  "script_sha256",
+  "s10b_r8_executed",
+  "start_identity",
+  "status",
+]);
+const ATTEMPT_FAILURE_KEYS = Object.freeze([
+  "attempt_marker_sha256",
+  "business_failure_class",
+  "cleanup_failure_class",
+  "compose_attempted",
+  "compose_cleanup_required",
+  "failure_class",
+  "no_log_required",
+  "parent_failure_class",
+  "phase",
+  "process_roles",
+  "retained_volume_keys",
+  "run_id",
+  "run_root_present",
+  "schema_version",
+  "s10b_r8_executed",
+  "status",
+]);
+const ATTEMPT_CLOSURE_KEYS = Object.freeze([
+  "attempt_marker_sha256",
+  "business_failure_class",
+  "business_status",
+  "cleanup_failure_class",
+  "cleanup_scope",
+  "closure_kind",
+  "evidence_failure_class",
+  "failure_class",
+  "no_log_failure_class",
+  "no_log_scope",
+  "parent_failure_class",
+  "run_id",
+  "schema_version",
+  "s10b_r8_executed",
+  "status",
+]);
+const ATTEMPT_RECONCILE_KEYS = Object.freeze([
+  "attempt_marker_sha256",
+  "business_status",
+  "cleanup_failure_class",
+  "cleanup_scope",
+  "failure_class",
+  "no_log_failure_class",
+  "no_log_scope",
+  "run_id",
+  "schema_version",
+  "s10b_r8_executed",
+  "status",
+]);
+const CLEANUP_RESULT_KEYS = Object.freeze([
+  "containers",
+  "listeners",
+  "named_volume_after_count",
+  "named_volume_baseline_count",
+  "named_volumes_preserved",
+  "networks",
+  "processes",
+  "prune_executed",
+  "schema_version",
+  "scope",
+  "status",
+  "temporary_volumes",
+  "volume_delete_executed",
+]);
+const NO_LOG_RESULT_KEYS = Object.freeze([
+  "coverage",
+  "external_row_count",
+  "external_source_count",
+  "external_source_set_sha256",
+  "file_count",
+  "hit_count",
+  "pattern_set_sha256",
+  "row_count",
+  "schema_version",
+  "scope",
+]);
+const RUNTIME_LOG_SCAN_KEYS = Object.freeze([
+  "hit_count",
+  "row_count",
+  "run_id",
+  "schema_version",
+  "source_count",
+  "source_set_sha256",
+  "status",
+]);
+const BUSINESS_BOUNDARY_KEYS = Object.freeze([
+  "api_after_sha256",
+  "api_before_sha256",
+  "fake_accepted_calls",
+  "fake_rejected_calls",
+  "run_id",
+  "s10b_r8_executed",
+  "schema_version",
+  "scope",
+  "status",
+]);
 const SUMMARY_KEYS = Object.freeze([
   "api_binary_sha256",
   "api_runtime_authority",
@@ -210,6 +331,10 @@ export const S10BO2_TARGETED_MATRIX = Object.freeze(
   Array.from({ length: 14 }, (_, index) => `S10BO2-${String(index + 1).padStart(3, "0")}`),
 );
 
+export const S10BO3_TARGETED_MATRIX = Object.freeze(
+  Array.from({ length: 20 }, (_, index) => `S10BO3-${String(index + 1).padStart(3, "0")}`),
+);
+
 export const S10BO1_CONTROL_KINDS = Object.freeze([
   "component_ready",
   "mode_transition",
@@ -249,14 +374,28 @@ export const S10BO2_STATES = Object.freeze([
   "closed_pass",
 ]);
 
+const ATTEMPT_PHASES = new Set([
+  "preflight_not_started",
+  "preflight_running",
+  "preflight_failed",
+  "preflight_context_invalid",
+  "desktop_building",
+  "dependencies_starting",
+  "api_starting",
+  "fake_starting",
+  "desktop_starting",
+  ...S10BO2_STATES,
+]);
+
 const S10BO1_STATE_INDEX = new Map(S10BO1_STATES.map((state, index) => [state, index]));
 const S10BO2_STATE_INDEX = new Map(S10BO2_STATES.map((state, index) => [state, index]));
 
 export class S10BO1OrchestratorError extends Error {
-  constructor(code) {
+  constructor(code, closure = undefined) {
     super(code);
     this.name = "S10BO1OrchestratorError";
     this.code = code;
+    if (closure) this.closure = Object.freeze({ ...closure });
   }
 }
 
@@ -265,7 +404,7 @@ function fail(code) {
 }
 
 function exactKeys(value, expected) {
-  return JSON.stringify(Object.keys(value).sort()) === JSON.stringify(expected);
+  return JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expected].sort());
 }
 
 function ownedByCurrentUser(metadata) {
@@ -282,15 +421,6 @@ function commandEnvironment(extra = {}) {
     if (process.env[key]) allowed[key] = process.env[key];
   }
   return { ...allowed, ...extra };
-}
-
-function repositoryEnvironment(repositories) {
-  return Object.fromEntries(
-    Object.entries(repositories).map(([role, digest]) => [
-      `FEAT126_S10B_${role.toUpperCase()}_SHA`,
-      digest,
-    ]),
-  );
 }
 
 export function createParentIdentityGuard({
@@ -335,6 +465,7 @@ export async function runCommand(label, command, arguments_, options = {}) {
       let outputBytes = 0;
       let errorBytes = 0;
       const output = [];
+      const errorOutput = [];
       let failure;
       let child;
       const cleanup = () => {
@@ -397,7 +528,7 @@ export async function runCommand(label, command, arguments_, options = {}) {
       child.once("error", (error) => settle(error));
       child.stdout.on("data", (chunk) => {
         outputBytes += chunk.length;
-        if (outputBytes > maximumBytes) {
+        if (outputBytes + errorBytes > maximumBytes) {
           stop(new Error("command output capacity exceeded"));
           return;
         }
@@ -405,7 +536,11 @@ export async function runCommand(label, command, arguments_, options = {}) {
       });
       child.stderr.on("data", (chunk) => {
         errorBytes += chunk.length;
-        if (errorBytes > maximumBytes) stop(new Error("command error capacity exceeded"));
+        if (outputBytes + errorBytes > maximumBytes) {
+          stop(new Error("command error capacity exceeded"));
+          return;
+        }
+        errorOutput.push(chunk);
       });
       child.once("close", (code, signal) => {
         if (failure) {
@@ -421,7 +556,20 @@ export async function runCommand(label, command, arguments_, options = {}) {
           return;
         }
         if (code !== 0 || signal !== null) {
+          if (typeof options.failureParser === "function") {
+            try {
+              const failureCode = options.failureParser(Buffer.concat(errorOutput));
+              settle(new S10BO1OrchestratorError(failureCode));
+              return;
+            } catch {
+              // A malformed child failure frame maps to the step-level class.
+            }
+          }
           settle(new Error("command failed"));
+          return;
+        }
+        if (options.captureAllOutput === true) {
+          settle(undefined, Buffer.concat([...output, ...errorOutput]));
           return;
         }
         settle(undefined, Buffer.concat(output).toString("utf8"));
@@ -437,6 +585,102 @@ export async function runCommand(label, command, arguments_, options = {}) {
     if (error instanceof S10BO1OrchestratorError) throw error;
     fail(`orchestrator_${label}_failed`);
   }
+}
+
+export function buildPreflightMakeInvocation(authority) {
+  if (
+    !RUN_ID_PATTERN.test(authority?.runId ?? "") ||
+    authority?.repositories === null || Array.isArray(authority?.repositories) ||
+    typeof authority?.repositories !== "object" ||
+    !exactKeys(authority.repositories, REPOSITORY_KEYS) ||
+    REPOSITORY_KEYS.some((role) => !FULL_SHA_PATTERN.test(authority.repositories[role] ?? ""))
+  ) {
+    fail("orchestrator_preflight_authority_invalid");
+  }
+  return Object.freeze([
+    "--silent",
+    "--no-print-directory",
+    "feat-126-s10b-preflight",
+    `RUN_ID=${authority.runId}`,
+    ...PREFLIGHT_MAKE_SHA_KEYS.map(([role, name]) => `${name}=${authority.repositories[role]}`),
+  ]);
+}
+
+export function parsePreflightFailureFrame(output) {
+  const bytes = Buffer.isBuffer(output) ? output : Buffer.from(output ?? "", "utf8");
+  if (bytes.length === 0 || bytes.length > 2048) fail("orchestrator_preflight_failed");
+  let framed;
+  try {
+    framed = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    fail("orchestrator_preflight_failed");
+  }
+  if (framed.includes("\0") || framed.includes("\r") || !framed.endsWith("\n")) {
+    fail("orchestrator_preflight_failed");
+  }
+  const lines = framed.slice(0, -1).split("\n");
+  if (
+    ![1, 2].includes(lines.length) || lines.some((line) => line !== line.trim()) ||
+    (lines.length === 2 && lines[1] !== "make: *** [feat-126-s10b-preflight] Error 1")
+  ) fail("orchestrator_preflight_failed");
+  let value;
+  try {
+    const [body] = lines;
+    YAML.parse(body, { version: "1.2", uniqueKeys: true });
+    value = JSON.parse(body);
+  } catch {
+    fail("orchestrator_preflight_failed");
+  }
+  if (
+    value === null || Array.isArray(value) || typeof value !== "object" ||
+    !exactKeys(value, ["failure_class", "schema_version", "status"]) ||
+    value.schema_version !== 1 || value.status !== "failed" ||
+    !/^[a-z][a-z0-9_]{0,127}$/.test(value.failure_class ?? "")
+  ) {
+    fail("orchestrator_preflight_failed");
+  }
+  return value.failure_class;
+}
+
+function validFailureClass(value) {
+  return value === null || /^[a-z][a-z0-9_]{0,127}$/.test(value ?? "");
+}
+
+export function buildOrchestratorFailureEnvelope(error) {
+  const failureClass = error instanceof S10BO1OrchestratorError
+    ? error.code
+    : "orchestrator_internal_failure";
+  const closure = error instanceof S10BO1OrchestratorError ? error.closure : undefined;
+  const value = {
+    schema_version: 1,
+    status: "failed",
+    failure_class: failureClass,
+    business_failure_class: closure?.business_failure_class ?? null,
+    cleanup_failure_class: closure?.cleanup_failure_class ?? null,
+    evidence_failure_class: closure?.evidence_failure_class ?? null,
+    no_log_failure_class: closure?.no_log_failure_class ?? null,
+    parent_failure_class: closure?.parent_failure_class ?? null,
+  };
+  if (
+    !validFailureClass(value.failure_class) || value.failure_class === null ||
+    !validFailureClass(value.business_failure_class) ||
+    !validFailureClass(value.cleanup_failure_class) ||
+    !validFailureClass(value.evidence_failure_class) ||
+    !validFailureClass(value.no_log_failure_class) ||
+    !validFailureClass(value.parent_failure_class)
+  ) {
+    return Object.freeze({
+      schema_version: 1,
+      status: "failed",
+      failure_class: "orchestrator_internal_failure",
+      business_failure_class: null,
+      cleanup_failure_class: null,
+      evidence_failure_class: null,
+      no_log_failure_class: null,
+      parent_failure_class: null,
+    });
+  }
+  return Object.freeze(value);
 }
 
 export function validateOrchestratorInput(runId, environment = process.env, arguments_ = []) {
@@ -691,12 +935,56 @@ export function validateFakeAuthority(value, authority) {
   return true;
 }
 
+export function validateClosedFakeAuthorityProjection(value, context, requireZero = true) {
+  const expectedKeys = [
+    "accepted_calls",
+    "call_cap",
+    "dataset_id",
+    "dataset_sha256",
+    "fixture_case_id",
+    "generation",
+    "mode",
+    "rejected_calls",
+    "run_id",
+    "schema_version",
+    "status",
+  ];
+  if (
+    value === null || Array.isArray(value) || typeof value !== "object" ||
+    !exactKeys(value, expectedKeys) ||
+    !Number.isSafeInteger(value.accepted_calls) || value.accepted_calls < 0 ||
+    !Number.isSafeInteger(value.rejected_calls) || value.rejected_calls < 0 ||
+    (requireZero && (value.accepted_calls !== 0 || value.rejected_calls !== 0)) ||
+    value.dataset_id !== context?.summary?.fake_readiness?.dataset_id ||
+    value.fixture_case_id !== context?.summary?.fake_readiness?.fixture_case_id ||
+    value.dataset_sha256 !== context?.summary?.fake_readiness?.dataset_sha256
+  ) fail("orchestrator_fake_authority_invalid");
+  validateFakeAuthority(value, {
+    runId: context.runId,
+    mode: "complete",
+    generation: 1,
+    callCap: 1,
+  });
+  return Object.freeze({ ...value });
+}
+
 export function validateApiVerifierProjection(value, runId) {
   const validCounts = (entry) => entry && Number.isSafeInteger(entry.count) && entry.count >= 0 &&
     Array.isArray(entry.enums) && entry.enums.every((item) => typeof item === "string") &&
     DIGEST_PATTERN.test(entry.canonical_hash ?? "");
   if (
     value === null || typeof value !== "object" || Array.isArray(value) ||
+    !exactKeys(value, [
+      "audit",
+      "canonical_hash",
+      "denylist_hit_count",
+      "idempotency",
+      "profile",
+      "run_id",
+      "schema_version",
+      "status",
+      "tasks",
+    ]) ||
     value.schema_version !== 1 || value.status !== "passed" || value.run_id !== runId ||
     value.profile !== "feat-126-s10-local-lab" || value.denylist_hit_count !== 0 ||
     !validCounts(value.tasks) || !validCounts(value.audit) || !validCounts(value.idempotency) ||
@@ -705,6 +993,35 @@ export function validateApiVerifierProjection(value, runId) {
     fail("orchestrator_api_projection_invalid");
   }
   return true;
+}
+
+export function validatePreflightFailureBinding(primaryFailureClass, evidence) {
+  if (
+    !/^[a-z][a-z0-9_]{0,127}$/.test(primaryFailureClass ?? "") ||
+    evidence === null || Array.isArray(evidence) || typeof evidence !== "object" ||
+    evidence.failure_class !== primaryFailureClass
+  ) fail("orchestrator_preflight_failure_evidence_invalid");
+  return true;
+}
+
+export function validateBusinessBoundaryEvidence(value, runId) {
+  const apiRequired = ["api_only", "api_and_fake"].includes(value?.scope);
+  const fakeRequired = value?.scope === "api_and_fake";
+  if (
+    value === null || Array.isArray(value) || typeof value !== "object" ||
+    !exactKeys(value, BUSINESS_BOUNDARY_KEYS) || value.schema_version !== 1 ||
+    value.status !== "passed" || value.run_id !== runId ||
+    !["not_started", "api_only", "api_and_fake"].includes(value.scope) ||
+    (apiRequired
+      ? (!DIGEST_PATTERN.test(value.api_before_sha256 ?? "") ||
+        value.api_after_sha256 !== value.api_before_sha256)
+      : (value.api_before_sha256 !== null || value.api_after_sha256 !== null)) ||
+    (fakeRequired
+      ? (value.fake_accepted_calls !== 0 || value.fake_rejected_calls !== 0)
+      : (value.fake_accepted_calls !== null || value.fake_rejected_calls !== null)) ||
+    value.s10b_r8_executed !== false
+  ) fail("orchestrator_business_boundary_invalid");
+  return Object.freeze({ ...value });
 }
 
 export function validateDesktopDriverProjection(value, authority) {
@@ -724,9 +1041,16 @@ export function validateDesktopDriverProjection(value, authority) {
 export function validateCleanupClosure(value) {
   if (
     value === null || typeof value !== "object" || Array.isArray(value) ||
-    value.schema_version !== 1 || value.status !== "passed" ||
+    !exactKeys(value, CLEANUP_RESULT_KEYS) || value.schema_version !== 1 || value.status !== "passed" ||
+    !["pre_run_absence", "preflight_artifacts", "run_artifacts"].includes(value.scope) ||
     value.containers !== 0 || value.networks !== 0 || value.processes !== 0 || value.listeners !== 0 ||
     value.temporary_volumes !== 0 || value.named_volumes_preserved !== true ||
+    !Number.isSafeInteger(value.named_volume_baseline_count) || value.named_volume_baseline_count < 0 ||
+    !Number.isSafeInteger(value.named_volume_after_count) || value.named_volume_after_count < 0 ||
+    value.named_volume_baseline_count !== value.named_volume_after_count ||
+    (value.scope === "pre_run_absence" && value.named_volume_baseline_count !== 0) ||
+    (value.scope === "run_artifacts" &&
+      value.named_volume_baseline_count !== S10_NAMED_VOLUME_KEYS.length) ||
     value.prune_executed !== false || value.volume_delete_executed !== false
   ) {
     fail("orchestrator_cleanup_incomplete");
@@ -734,16 +1058,61 @@ export function validateCleanupClosure(value) {
   return true;
 }
 
+export function shouldRunComposeCleanup(context) {
+  return context?.composeCleanupRequired === true;
+}
+
 export function validateNoLogResult(value) {
   if (
     value === null || typeof value !== "object" || Array.isArray(value) ||
-    value.schema_version !== 1 || !Number.isSafeInteger(value.file_count) || value.file_count <= 0 ||
+    !exactKeys(value, NO_LOG_RESULT_KEYS) || value.schema_version !== 1 ||
+    !["attempt_only", "preflight_artifacts", "run_artifacts"].includes(value.scope) ||
+    ![
+      "attempt_marker_and_failure",
+      "attempt_ledger",
+      "attempt_marker_only",
+      "all_preflight_log_and_evidence_sources",
+      "all_run_log_and_evidence_sources",
+    ].includes(value.coverage) ||
+    (value.scope === "attempt_only" && (
+      !["attempt_marker_only", "attempt_marker_and_failure", "attempt_ledger"].includes(value.coverage) ||
+      value.file_count !== ({
+        attempt_marker_only: 1,
+        attempt_marker_and_failure: 2,
+        attempt_ledger: 3,
+      })[value.coverage]
+    )) ||
+    (value.scope === "preflight_artifacts" &&
+      value.coverage !== "all_preflight_log_and_evidence_sources") ||
+    (value.scope === "run_artifacts" &&
+      value.coverage !== "all_run_log_and_evidence_sources") ||
+    !Number.isSafeInteger(value.file_count) || value.file_count <= 0 ||
     !Number.isSafeInteger(value.row_count) || value.row_count < 0 || value.hit_count !== 0 ||
+    !Number.isSafeInteger(value.external_source_count) || value.external_source_count < 0 ||
+    !Number.isSafeInteger(value.external_row_count) || value.external_row_count < 0 ||
+    !DIGEST_PATTERN.test(value.external_source_set_sha256 ?? "") ||
+    (value.scope !== "run_artifacts" &&
+      (value.external_source_count !== 0 || value.external_row_count !== 0 ||
+        value.external_source_set_sha256 !== sha256(""))) ||
+    (value.scope === "run_artifacts" && value.external_source_count <= 0) ||
     !DIGEST_PATTERN.test(value.pattern_set_sha256 ?? "")
   ) {
     fail("orchestrator_no_log_invalid");
   }
   return true;
+}
+
+export function validateRuntimeLogScan(value, runId) {
+  if (
+    value === null || Array.isArray(value) || typeof value !== "object" ||
+    !exactKeys(value, RUNTIME_LOG_SCAN_KEYS) || value.schema_version !== 1 ||
+    value.status !== (value.hit_count === 0 ? "passed" : "failed") ||
+    value.run_id !== runId || !Number.isSafeInteger(value.source_count) ||
+    value.source_count <= 0 || !Number.isSafeInteger(value.row_count) || value.row_count < 0 ||
+    !Number.isSafeInteger(value.hit_count) || value.hit_count < 0 ||
+    !DIGEST_PATTERN.test(value.source_set_sha256 ?? "")
+  ) fail("orchestrator_no_log_invalid");
+  return Object.freeze({ ...value });
 }
 
 export function validateOwnership(manifests) {
@@ -778,6 +1147,44 @@ export function classifyProjectVolumes(project, names) {
   const namedVolumes = observed.filter((name) => expected.has(name)).length;
   const temporaryVolumes = observed.filter((name) => !expected.has(name)).length;
   return Object.freeze({ namedVolumes, temporaryVolumes });
+}
+
+function projectName(runId) {
+  return `yijie-feat126-s10-${runId.replaceAll("-", "")}`;
+}
+
+function retainedVolumeKeys(runId, names) {
+  const project = projectName(runId);
+  const prefix = `${project}_`;
+  const keys = names
+    .filter((name) => name.startsWith(prefix))
+    .map((name) => name.slice(prefix.length))
+    .filter((key) => S10_NAMED_VOLUME_KEYS.includes(key));
+  return Object.freeze(S10_NAMED_VOLUME_KEYS.filter((key) => keys.includes(key)));
+}
+
+function volumeNamesFromKeys(runId, keys) {
+  const project = projectName(runId);
+  return Object.freeze(keys.map((key) => `${project}_${key}`));
+}
+
+function sameStringSet(left, right) {
+  if (!Array.isArray(left) || !Array.isArray(right)) return false;
+  const leftSorted = [...left].sort();
+  const rightSorted = [...right].sort();
+  return new Set(leftSorted).size === leftSorted.length &&
+    new Set(rightSorted).size === rightSorted.length &&
+    JSON.stringify(leftSorted) === JSON.stringify(rightSorted);
+}
+
+async function projectVolumeNames(runId) {
+  return Object.freeze((await dockerList([
+    "volume",
+    "ls",
+    "-q",
+    "--filter",
+    `label=com.docker.compose.project=${projectName(runId)}`,
+  ])).sort());
 }
 
 export function buildOrchestratorPlan(input) {
@@ -867,14 +1274,20 @@ export function validateRuntimeProcessEvidence(value, authority) {
   return Object.freeze({ ...value });
 }
 
-export function validateExistingProcessRecordSet(records) {
-  if (!Array.isArray(records) || records.length !== EXISTING_PROCESS_ROLES.length) {
+export function validateExistingProcessRecordSet(records, expectedRoles = EXISTING_PROCESS_ROLES) {
+  if (
+    !Array.isArray(expectedRoles) || new Set(expectedRoles).size !== expectedRoles.length ||
+    JSON.stringify(expectedRoles) !== JSON.stringify(
+      EXISTING_PROCESS_ROLES.filter((role) => expectedRoles.includes(role)),
+    ) || !Array.isArray(records) || records.length !== expectedRoles.length
+  ) {
     fail("orchestrator_existing_evidence_incomplete");
   }
-  const roles = records.map((record) => record?.role).sort();
-  if (JSON.stringify(roles) !== JSON.stringify(EXISTING_PROCESS_ROLES)) {
+  const roles = records.map((record) => record?.role);
+  if (JSON.stringify(roles) !== JSON.stringify(expectedRoles)) {
     fail("orchestrator_existing_evidence_incomplete");
   }
+  if (records.length === 0) return true;
   const runIds = new Set(records.map((record) => record?.run_id));
   const pids = records.map((record) => record?.pid);
   if (
@@ -889,12 +1302,18 @@ export function validateExistingProcessRecordSet(records) {
     fail("orchestrator_existing_evidence_incomplete");
   }
   const byRole = new Map(records.map((record) => [record.role, record]));
-  const infraPid = byRole.get("desktop").ppid;
+  const infraOwned = ["api", "fake", "desktop"].map((role) => byRole.get(role)).filter(Boolean);
+  const infraPid = infraOwned[0]?.ppid;
   if (
-    byRole.get("api").ppid !== infraPid || byRole.get("fake").ppid !== infraPid ||
-    pids.includes(infraPid) ||
-    byRole.get("host").ppid !== byRole.get("desktop").pid ||
-    byRole.get("runtime").ppid !== byRole.get("host").pid
+    (infraOwned.length > 0 && (
+      infraOwned.some((record) => record.ppid !== infraPid) || pids.includes(infraPid)
+    )) ||
+    (byRole.has("host") && (
+      !byRole.has("desktop") || byRole.get("host").ppid !== byRole.get("desktop").pid
+    )) ||
+    (byRole.has("runtime") && (
+      !byRole.has("host") || byRole.get("runtime").ppid !== byRole.get("host").pid
+    ))
   ) {
     fail("orchestrator_existing_evidence_incomplete");
   }
@@ -1002,6 +1421,27 @@ export async function runStartupAbortFlow(authority, operations) {
   let cleanup;
   let noLog;
   let cleanupFailure;
+  let businessBoundary;
+  let businessFailure;
+  let secondaryFailure;
+  const retainFirstSecondary = (error) => {
+    if (!secondaryFailure) secondaryFailure = error;
+  };
+  try {
+    if (typeof operations.verifyBusinessBoundary !== "function") {
+      fail("orchestrator_business_boundary_unknown");
+    }
+    businessBoundary = await operations.verifyBusinessBoundary();
+    validateBusinessBoundaryEvidence(businessBoundary, authority.runId);
+    if (!primaryFailure && businessBoundary.scope !== "api_and_fake") {
+      fail("orchestrator_business_boundary_unknown");
+    }
+  } catch (error) {
+    businessFailure = error instanceof S10BO1OrchestratorError
+      ? error
+      : new S10BO1OrchestratorError("orchestrator_business_boundary_unknown");
+    retainFirstSecondary(businessFailure);
+  }
   try {
     cleanup = await operations.cleanup();
     validateCleanupClosure(cleanup);
@@ -1010,15 +1450,7 @@ export async function runStartupAbortFlow(authority, operations) {
     cleanupFailure = error instanceof S10BO1OrchestratorError
       ? error
       : new S10BO1OrchestratorError("orchestrator_cleanup_unknown");
-  }
-  let noLogFailure;
-  try {
-    noLog = await operations.scanNoLog();
-    validateNoLogResult(noLog);
-  } catch (error) {
-    noLogFailure = error instanceof S10BO1OrchestratorError
-      ? error
-      : new S10BO1OrchestratorError("orchestrator_no_log_invalid");
+    retainFirstSecondary(cleanupFailure);
   }
   let parentFailure;
   try {
@@ -1027,22 +1459,128 @@ export async function runStartupAbortFlow(authority, operations) {
     parentFailure = error instanceof S10BO1OrchestratorError
       ? error
       : new S10BO1OrchestratorError("orchestrator_parent_death");
+    retainFirstSecondary(parentFailure);
   }
 
-  if (cleanupFailure) primaryFailure = cleanupFailure;
-  else if (noLogFailure) primaryFailure = noLogFailure;
-  else if (parentFailure) primaryFailure = parentFailure;
+  let evidenceFailure = primaryFailure?.closure?.evidence_failure_class
+    ? new S10BO1OrchestratorError(primaryFailure.closure.evidence_failure_class)
+    : undefined;
+  if (evidenceFailure) retainFirstSecondary(evidenceFailure);
+  let failureRecorded = false;
+  const preNoLogFailure = primaryFailure ?? businessFailure ?? cleanupFailure ?? parentFailure;
+  if (preNoLogFailure && typeof operations.recordFailure === "function") {
+    try {
+      await operations.recordFailure({
+        failureClass: preNoLogFailure.code,
+        businessFailureClass: businessFailure?.code ?? null,
+        cleanupFailureClass: cleanupFailure?.code ?? null,
+        parentFailureClass: parentFailure?.code ?? null,
+      });
+      failureRecorded = true;
+    } catch (error) {
+      evidenceFailure = error instanceof S10BO1OrchestratorError
+        ? error
+        : new S10BO1OrchestratorError("orchestrator_evidence_write_failed");
+      retainFirstSecondary(evidenceFailure);
+    }
+  }
 
-  if (primaryFailure) {
+  let noLogFailure;
+  try {
+    noLog = await operations.scanNoLog();
+    validateNoLogResult(noLog);
+  } catch (error) {
+    noLogFailure = error instanceof S10BO1OrchestratorError
+      ? error
+      : new S10BO1OrchestratorError("orchestrator_no_log_invalid");
+    retainFirstSecondary(noLogFailure);
+  }
+
+  if (!failureRecorded && noLogFailure && typeof operations.recordFailure === "function") {
+    try {
+      await operations.recordFailure({
+        failureClass: primaryFailure?.code ?? secondaryFailure.code,
+        businessFailureClass: businessFailure?.code ?? null,
+        cleanupFailureClass: cleanupFailure?.code ?? null,
+        parentFailureClass: parentFailure?.code ?? null,
+      });
+      failureRecorded = true;
+    } catch (error) {
+      if (!evidenceFailure) {
+        evidenceFailure = error instanceof S10BO1OrchestratorError
+          ? error
+          : new S10BO1OrchestratorError("orchestrator_evidence_write_failed");
+      }
+      retainFirstSecondary(evidenceFailure);
+    }
+  }
+
+  let failure = primaryFailure ?? secondaryFailure;
+  if (failure && typeof operations.recordClosure === "function") {
+    try {
+      await operations.recordClosure({
+        status: "failed",
+        failureClass: failure.code,
+        businessFailureClass: businessFailure?.code ?? null,
+        businessStatus: businessBoundary
+          ? businessBoundary.scope === "not_started" ? "not_applicable" : "passed"
+          : businessFailure ? "failed" : "unknown",
+        cleanupFailureClass: cleanupFailure?.code ?? null,
+        cleanupScope: cleanup?.scope ?? null,
+        evidenceFailureClass: evidenceFailure?.code ?? null,
+        noLogFailureClass: noLogFailure?.code ?? null,
+        noLogScope: noLog?.scope ?? null,
+        parentFailureClass: parentFailure?.code ?? null,
+      });
+    } catch (error) {
+      if (!evidenceFailure) {
+        evidenceFailure = error instanceof S10BO1OrchestratorError
+          ? error
+          : new S10BO1OrchestratorError("orchestrator_evidence_write_failed");
+        retainFirstSecondary(evidenceFailure);
+        failure = primaryFailure ?? secondaryFailure;
+      }
+    }
+  }
+
+  if (failure) {
     try {
       machine.closeFailure(cleanupPassed);
     } catch {
       // Failure closure state is secondary to the original failure class.
     }
-    throw primaryFailure;
+    throw new S10BO1OrchestratorError(failure.code, {
+      business_failure_class: businessFailure?.code ?? null,
+      cleanup_failure_class: cleanupFailure?.code ?? null,
+      evidence_failure_class: evidenceFailure?.code ?? null,
+      no_log_failure_class: noLogFailure?.code ?? null,
+      parent_failure_class: parentFailure?.code ?? null,
+    });
   }
   machine.transition("cleanup_passed");
   machine.transition("closed_pass");
+  try {
+    await operations.recordClosure({
+      status: "passed",
+      failureClass: null,
+      businessFailureClass: null,
+      businessStatus: "passed",
+      cleanupFailureClass: null,
+      cleanupScope: cleanup.scope,
+      evidenceFailureClass: null,
+      noLogFailureClass: null,
+      noLogScope: noLog.scope,
+      parentFailureClass: null,
+    });
+  } catch {
+    throw new S10BO1OrchestratorError("orchestrator_evidence_write_failed", {
+      business_failure_class: null,
+      cleanup_failure_class: null,
+      evidence_failure_class: "orchestrator_evidence_write_failed",
+      no_log_failure_class: null,
+      parent_failure_class: null,
+    });
+  }
   return Object.freeze({
     schema_version: 1,
     status: "passed",
@@ -1108,6 +1646,421 @@ async function writeSecureJson(path, value) {
   } finally {
     await handle?.close();
   }
+}
+
+async function ensureOwnerOnlyDirectory(path, failureCode = "orchestrator_attempt_evidence_invalid") {
+  try {
+    await mkdir(path, { mode: 0o700 });
+    await chmod(path, 0o700);
+  } catch (error) {
+    if (error?.code !== "EEXIST") fail(failureCode);
+  }
+  try {
+    await requireOwnerDirectory(path);
+  } catch {
+    fail(failureCode);
+  }
+}
+
+function validateAttemptRepositories(repositories, expected) {
+  return Boolean(
+    repositories && !Array.isArray(repositories) && typeof repositories === "object" &&
+    exactKeys(repositories, REPOSITORY_KEYS) &&
+    REPOSITORY_KEYS.every((role) => (
+      FULL_SHA_PATTERN.test(repositories[role] ?? "") && repositories[role] === expected[role]
+    )),
+  );
+}
+
+const ATTEMPT_PHASE_PROCESS_RULES = Object.freeze({
+  created: Object.freeze({ required: [], allowed: [] }),
+  preflight_not_started: Object.freeze({ required: [], allowed: [] }),
+  preflight_running: Object.freeze({ required: [], allowed: [] }),
+  preflight_failed: Object.freeze({ required: [], allowed: [] }),
+  preflight_context_invalid: Object.freeze({ required: [], allowed: [] }),
+  preflight_passed: Object.freeze({ required: [], allowed: [] }),
+  desktop_building: Object.freeze({ required: [], allowed: [] }),
+  desktop_built: Object.freeze({ required: [], allowed: [] }),
+  dependencies_starting: Object.freeze({ required: [], allowed: [] }),
+  dependencies_ready: Object.freeze({ required: [], allowed: [] }),
+  api_starting: Object.freeze({ required: [], allowed: ["api"] }),
+  api_ready: Object.freeze({ required: ["api"], allowed: ["api"] }),
+  fake_starting: Object.freeze({ required: ["api"], allowed: ["api", "fake"] }),
+  fake_ready: Object.freeze({ required: ["api", "fake"], allowed: ["api", "fake"] }),
+  desktop_starting: Object.freeze({
+    required: ["api", "fake"],
+    allowed: ["api", "desktop", "fake"],
+  }),
+  desktop_spawned: Object.freeze({
+    required: ["api", "desktop", "fake"],
+    allowed: EXISTING_PROCESS_ROLES,
+  }),
+  component_ready: Object.freeze({ required: EXISTING_PROCESS_ROLES, allowed: EXISTING_PROCESS_ROLES }),
+  abort_sent: Object.freeze({ required: EXISTING_PROCESS_ROLES, allowed: EXISTING_PROCESS_ROLES }),
+  abort_complete: Object.freeze({ required: EXISTING_PROCESS_ROLES, allowed: EXISTING_PROCESS_ROLES }),
+  desktop_exited: Object.freeze({ required: EXISTING_PROCESS_ROLES, allowed: EXISTING_PROCESS_ROLES }),
+  cleanup_passed: Object.freeze({ required: EXISTING_PROCESS_ROLES, allowed: EXISTING_PROCESS_ROLES }),
+  closed_pass: Object.freeze({ required: EXISTING_PROCESS_ROLES, allowed: EXISTING_PROCESS_ROLES }),
+});
+
+function validateFailureClassOrNull(value) {
+  return value === null || /^[a-z][a-z0-9_]{0,127}$/.test(value ?? "");
+}
+
+function validateAttemptPhaseState(value) {
+  const rule = ATTEMPT_PHASE_PROCESS_RULES[value.phase];
+  const roles = value.process_roles;
+  const retainedVolumeKeys = value.retained_volume_keys;
+  if (
+    !rule || !Array.isArray(roles) || new Set(roles).size !== roles.length ||
+    JSON.stringify(roles) !== JSON.stringify(EXISTING_PROCESS_ROLES.filter((role) => roles.includes(role))) ||
+    roles.some((role) => !rule.allowed.includes(role)) ||
+    rule.required.some((role) => !roles.includes(role)) ||
+    !Array.isArray(retainedVolumeKeys) || new Set(retainedVolumeKeys).size !== retainedVolumeKeys.length ||
+    JSON.stringify(retainedVolumeKeys) !== JSON.stringify(
+      S10_NAMED_VOLUME_KEYS.filter((key) => retainedVolumeKeys.includes(key)),
+    ) || (value.compose_cleanup_required && !value.compose_attempted)
+  ) return false;
+  if (!value.run_root_present) {
+    return value.phase === "preflight_failed" && value.compose_attempted === false &&
+      value.compose_cleanup_required === false && roles.length === 0 && retainedVolumeKeys.length === 0;
+  }
+  if (value.phase === "preflight_failed" && !value.compose_attempted && retainedVolumeKeys.length !== 0) {
+    return false;
+  }
+  if (value.phase === "preflight_context_invalid" && !value.compose_attempted) return false;
+  if (![
+    "created",
+    "preflight_not_started",
+    "preflight_running",
+    "preflight_failed",
+    "preflight_context_invalid",
+  ].includes(value.phase)) {
+    if (!value.compose_attempted || retainedVolumeKeys.length !== S10_NAMED_VOLUME_KEYS.length) return false;
+  }
+  if (
+    ((value.phase === "desktop_starting" && roles.includes("desktop")) || [
+      "desktop_spawned",
+      "component_ready",
+      "abort_sent",
+      "abort_complete",
+      "desktop_exited",
+    ].includes(value.phase)) &&
+    roles.length !== EXISTING_PROCESS_ROLES.length && value.cleanup_failure_class === null
+  ) return false;
+  return true;
+}
+
+export function validateAttemptMarker(value, authority) {
+  if (
+    value === null || Array.isArray(value) || typeof value !== "object" ||
+    !exactKeys(value, ATTEMPT_MARKER_KEYS) || value.schema_version !== 1 ||
+    value.kind !== "feat126-s10bo2-attempt" || value.status !== "claimed" ||
+    value.run_id !== authority?.runId || value.s10b_r8_executed !== false ||
+    !validateAttemptRepositories(value.repositories, authority?.repositories ?? {}) ||
+    !Number.isSafeInteger(value.pid) || value.pid <= 1 ||
+    !Number.isSafeInteger(value.ppid) || value.ppid <= 0 ||
+    !DIGEST_PATTERN.test(value.start_identity ?? "") ||
+    !DIGEST_PATTERN.test(value.binary_sha256 ?? "") ||
+    !DIGEST_PATTERN.test(value.script_sha256 ?? "")
+  ) {
+    fail("orchestrator_attempt_evidence_invalid");
+  }
+  return Object.freeze({ ...value, repositories: Object.freeze({ ...value.repositories }) });
+}
+
+export function validateAttemptFailure(value, authority) {
+  if (
+    value === null || Array.isArray(value) || typeof value !== "object" ||
+    !exactKeys(value, ATTEMPT_FAILURE_KEYS) || value.schema_version !== 1 ||
+    value.status !== "failed" || value.run_id !== authority?.runId ||
+    value.s10b_r8_executed !== false || !ATTEMPT_PHASES.has(value.phase) ||
+    !DIGEST_PATTERN.test(value.attempt_marker_sha256 ?? "") ||
+    typeof value.compose_attempted !== "boolean" ||
+    typeof value.compose_cleanup_required !== "boolean" ||
+    typeof value.run_root_present !== "boolean" || value.no_log_required !== true ||
+    !/^[a-z][a-z0-9_]{0,127}$/.test(value.failure_class ?? "") ||
+    !validateFailureClassOrNull(value.business_failure_class) ||
+    !validateFailureClassOrNull(value.cleanup_failure_class) ||
+    !validateFailureClassOrNull(value.parent_failure_class) ||
+    !validateAttemptPhaseState(value)
+  ) {
+    fail("orchestrator_attempt_evidence_invalid");
+  }
+  return Object.freeze({
+    ...value,
+    process_roles: Object.freeze([...value.process_roles]),
+    retained_volume_keys: Object.freeze([...value.retained_volume_keys]),
+  });
+}
+
+export function validateAttemptClosure(value, authority) {
+  const passed = value?.status === "passed";
+  const failed = value?.status === "failed";
+  if (
+    value === null || Array.isArray(value) || typeof value !== "object" ||
+    !exactKeys(value, ATTEMPT_CLOSURE_KEYS) || value.schema_version !== 1 ||
+    (!passed && !failed) || value.run_id !== authority?.runId ||
+    value.s10b_r8_executed !== false || !DIGEST_PATTERN.test(value.attempt_marker_sha256 ?? "") ||
+    value.closure_kind !== (passed ? "success" : "failure") ||
+    (passed ? value.failure_class !== null :
+      !/^[a-z][a-z0-9_]{0,127}$/.test(value.failure_class ?? "")) ||
+    !["passed", "not_applicable", "unknown", "failed"].includes(value.business_status) ||
+    ![null, "pre_run_absence", "preflight_artifacts", "run_artifacts"].includes(
+      value.cleanup_scope,
+    ) ||
+    ![null, "attempt_only", "preflight_artifacts", "run_artifacts"].includes(value.no_log_scope) ||
+    !validateFailureClassOrNull(value.business_failure_class) ||
+    !validateFailureClassOrNull(value.cleanup_failure_class) ||
+    !validateFailureClassOrNull(value.evidence_failure_class) ||
+    !validateFailureClassOrNull(value.no_log_failure_class) ||
+    !validateFailureClassOrNull(value.parent_failure_class) ||
+    (failed && (
+      (value.cleanup_failure_class === null) !== (value.cleanup_scope !== null) ||
+      (value.no_log_failure_class === null) !== (value.no_log_scope !== null) ||
+      (value.business_failure_class === null &&
+        !["passed", "not_applicable"].includes(value.business_status)) ||
+      (value.business_failure_class !== null &&
+        !["failed", "unknown"].includes(value.business_status))
+    )) ||
+    (passed && (
+      value.business_status !== "passed" || value.cleanup_scope === null ||
+      value.no_log_scope === null || value.business_failure_class !== null ||
+      value.cleanup_failure_class !== null || value.evidence_failure_class !== null ||
+      value.no_log_failure_class !== null || value.parent_failure_class !== null
+    ))
+  ) fail("orchestrator_attempt_evidence_invalid");
+  return Object.freeze({ ...value });
+}
+
+export function validateAttemptReconcile(value, authority) {
+  if (
+    value === null || Array.isArray(value) || typeof value !== "object" ||
+    !exactKeys(value, ATTEMPT_RECONCILE_KEYS) || value.schema_version !== 1 ||
+    value.status !== "reconciled" || value.run_id !== authority?.runId ||
+    value.s10b_r8_executed !== false || !DIGEST_PATTERN.test(value.attempt_marker_sha256 ?? "") ||
+    !/^[a-z][a-z0-9_]{0,127}$/.test(value.failure_class ?? "") ||
+    !["passed", "not_applicable", "unknown", "failed"].includes(value.business_status) ||
+    ![null, "pre_run_absence", "preflight_artifacts", "run_artifacts"].includes(
+      value.cleanup_scope,
+    ) ||
+    ![null, "attempt_only", "preflight_artifacts", "run_artifacts"].includes(value.no_log_scope) ||
+    !validateFailureClassOrNull(value.cleanup_failure_class) ||
+    !validateFailureClassOrNull(value.no_log_failure_class) ||
+    (value.cleanup_failure_class === null) !== (value.cleanup_scope !== null) ||
+    (value.no_log_failure_class === null) !== (value.no_log_scope !== null)
+  ) fail("orchestrator_attempt_evidence_invalid");
+  return Object.freeze({ ...value });
+}
+
+export function buildAttemptReconcileEvidence(attempt, authority, failure, outcome) {
+  return validateAttemptReconcile({
+    schema_version: 1,
+    status: "reconciled",
+    run_id: authority?.runId,
+    attempt_marker_sha256: attempt?.markerSha256,
+    failure_class: failure?.failure_class ?? "orchestrator_unclean_exit",
+    business_status: outcome?.businessStatus,
+    cleanup_scope: outcome?.cleanup?.scope ?? null,
+    cleanup_failure_class: outcome?.cleanupFailure?.code ?? null,
+    no_log_scope: outcome?.noLog?.scope ?? null,
+    no_log_failure_class: outcome?.noLogFailure?.code ?? null,
+    s10b_r8_executed: false,
+  }, authority);
+}
+
+function canonicalJsonBytes(value) {
+  return Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
+}
+
+async function readAttemptJson(path, maximumBytes, validator, authority, includeDigest = false) {
+  let value;
+  let bytes;
+  try {
+    bytes = await readSecureFile(path, maximumBytes);
+    value = JSON.parse(bytes.toString("utf8"));
+    if (!bytes.equals(canonicalJsonBytes(value))) fail("orchestrator_attempt_evidence_invalid");
+  } catch {
+    fail("orchestrator_attempt_evidence_invalid");
+  }
+  try {
+    const validated = validator(value, authority);
+    return includeDigest
+      ? Object.freeze({ value: validated, digest: sha256(bytes) })
+      : validated;
+  } catch {
+    fail("orchestrator_attempt_evidence_invalid");
+  }
+}
+
+function attemptPaths(attemptRoot, runId) {
+  return Object.freeze({
+    markerPath: resolve(attemptRoot, `${runId}.attempt.v1.json`),
+    failurePath: resolve(attemptRoot, `${runId}.failure.v1.json`),
+    closurePath: resolve(attemptRoot, `${runId}.closure.v1.json`),
+    reconcilePath: resolve(attemptRoot, `${runId}.reconcile.v1.json`),
+  });
+}
+
+async function requireAttemptBinding(attempt, authority) {
+  const expected = attemptPaths(attempt?.attemptRoot ?? "", authority?.runId ?? "");
+  if (
+    !attempt || attempt.markerPath !== expected.markerPath || attempt.failurePath !== expected.failurePath ||
+    attempt.closurePath !== expected.closurePath || attempt.reconcilePath !== expected.reconcilePath ||
+    !DIGEST_PATTERN.test(attempt.markerSha256 ?? "")
+  ) fail("orchestrator_attempt_evidence_invalid");
+  await ensureOwnerOnlyDirectory(attempt.attemptRoot);
+  const observed = await readAttemptJson(
+    attempt.markerPath,
+    4096,
+    validateAttemptMarker,
+    authority,
+    true,
+  );
+  if (observed.digest !== attempt.markerSha256) fail("orchestrator_attempt_evidence_invalid");
+  return observed.value;
+}
+
+async function requireAbsentAttemptArtifact(path) {
+  try {
+    await lstat(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    fail("orchestrator_attempt_evidence_invalid");
+  }
+  fail("orchestrator_attempt_evidence_invalid");
+}
+
+export async function claimAttemptLedger(authority, options = {}) {
+  buildPreflightMakeInvocation(authority);
+  const attemptRoot = options.attemptRoot ?? ATTEMPT_ROOT;
+  await ensureOwnerOnlyDirectory(attemptRoot);
+  let identity = options.identity;
+  if (!identity) identity = await inspectProcessIdentity(process.pid);
+  if (!identity || identity.pid !== process.pid) fail("orchestrator_process_identity_unknown");
+  const scriptSha256 = options.scriptSha256 ?? await hashFile(fileURLToPath(import.meta.url));
+  if (!DIGEST_PATTERN.test(scriptSha256 ?? "")) fail("orchestrator_attempt_evidence_invalid");
+  const { markerPath, failurePath, closurePath, reconcilePath } = attemptPaths(
+    attemptRoot,
+    authority.runId,
+  );
+  const marker = validateAttemptMarker({
+    schema_version: 1,
+    kind: "feat126-s10bo2-attempt",
+    status: "claimed",
+    run_id: authority.runId,
+    repositories: authority.repositories,
+    pid: identity.pid,
+    ppid: identity.ppid,
+    start_identity: identity.start_identity,
+    binary_sha256: identity.binary_sha256,
+    script_sha256: scriptSha256,
+    s10b_r8_executed: false,
+  }, authority);
+  const markerBytes = canonicalJsonBytes(marker);
+  const markerSha256 = sha256(markerBytes);
+  let handle;
+  try {
+    handle = await open(
+      markerPath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    await handle.writeFile(markerBytes);
+    await handle.chmod(0o600);
+    await handle.sync();
+    await requireAbsentAttemptArtifact(failurePath);
+    await requireAbsentAttemptArtifact(closurePath);
+    await requireAbsentAttemptArtifact(reconcilePath);
+    return Object.freeze({
+      fresh: true,
+      attemptRoot,
+      markerPath,
+      failurePath,
+      closurePath,
+      reconcilePath,
+      markerSha256,
+      marker,
+    });
+  } catch (error) {
+    if (error?.code !== "EEXIST") fail("orchestrator_attempt_evidence_invalid");
+  } finally {
+    await handle?.close();
+  }
+  let existing;
+  for (let readAttempt = 0; readAttempt < 50; readAttempt += 1) {
+    try {
+      existing = await readAttemptJson(markerPath, 4096, validateAttemptMarker, authority, true);
+      break;
+    } catch (error) {
+      if (readAttempt === 49) throw error;
+      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    }
+  }
+  if (
+    existing.value.script_sha256 !== scriptSha256 ||
+    existing.value.binary_sha256 !== identity.binary_sha256
+  ) fail("orchestrator_attempt_evidence_invalid");
+  return Object.freeze({
+    fresh: false,
+    attemptRoot,
+    markerPath,
+    failurePath,
+    closurePath,
+    reconcilePath,
+    markerSha256: existing.digest,
+    marker: existing.value,
+  });
+}
+
+export async function writeAttemptFailure(attempt, authority, value) {
+  await requireAttemptBinding(attempt, authority);
+  const validated = validateAttemptFailure(value, authority);
+  if (validated.attempt_marker_sha256 !== attempt.markerSha256) {
+    fail("orchestrator_attempt_evidence_invalid");
+  }
+  await writeSecureJson(attempt.failurePath, validated);
+  return validated;
+}
+
+export async function readAttemptFailure(attempt, authority) {
+  await requireAttemptBinding(attempt, authority);
+  return await readAttemptJson(attempt.failurePath, 4096, validateAttemptFailure, authority);
+}
+
+export async function writeAttemptClosure(attempt, authority, value) {
+  await requireAttemptBinding(attempt, authority);
+  const validated = validateAttemptClosure(value, authority);
+  if (validated.attempt_marker_sha256 !== attempt.markerSha256) {
+    fail("orchestrator_attempt_evidence_invalid");
+  }
+  await writeSecureJson(attempt.closurePath, validated);
+  return validated;
+}
+
+export async function readAttemptClosure(attempt, authority) {
+  await requireAttemptBinding(attempt, authority);
+  return await readAttemptJson(attempt.closurePath, 4096, validateAttemptClosure, authority);
+}
+
+export async function writeAttemptReconcile(attempt, authority, value) {
+  await requireAttemptBinding(attempt, authority);
+  const validated = validateAttemptReconcile(value, authority);
+  if (validated.attempt_marker_sha256 !== attempt.markerSha256) {
+    fail("orchestrator_attempt_evidence_invalid");
+  }
+  await writeSecureJson(attempt.reconcilePath, validated);
+  return validated;
+}
+
+export async function readAttemptReconcile(attempt, authority) {
+  await requireAttemptBinding(attempt, authority);
+  return await readAttemptJson(
+    attempt.reconcilePath,
+    4096,
+    validateAttemptReconcile,
+    authority,
+  );
 }
 
 async function hashFile(path) {
@@ -1454,7 +2407,7 @@ function inspectListener(port) {
   });
 }
 
-async function loadRunContext(authority) {
+async function loadRunContext(authority, attempt) {
   const runRoot = resolve(GENERATED_ROOT, authority.runId);
   const evidenceRoot = resolve(runRoot, "orchestrator-evidence");
   const preflightEvidenceRoot = resolve(runRoot, "preflight-evidence");
@@ -1506,8 +2459,17 @@ async function loadRunContext(authority) {
   ) {
     fail("orchestrator_ca_invalid");
   }
+  const retainedVolumeNames = await projectVolumeNames(authority.runId);
+  const retainedVolumes = classifyProjectVolumes(projectName(authority.runId), retainedVolumeNames);
+  if (
+    retainedVolumes.namedVolumes !== S10_NAMED_VOLUME_KEYS.length ||
+    retainedVolumes.temporaryVolumes !== 0
+  ) {
+    fail("orchestrator_preflight_cleanup_invalid");
+  }
   return {
     ...authority,
+    attempt,
     nonce: randomUUID(),
     runRoot,
     evidenceRoot,
@@ -1522,25 +2484,106 @@ async function loadRunContext(authority) {
     secretsPath,
     caPath,
     caSha256: sha256(ca),
-    composeAttempted: false,
+    phase: "preflight_passed",
+    runRootPresent: true,
+    retainedVolumeNames,
+    composeAttempted: true,
+    composeCleanupRequired: false,
     composeStarted: false,
+    composeLogsRequired: false,
     cleanupUnknown: false,
     processes: {},
   };
 }
 
-async function executePreflight(authority, signal) {
-  await runCommand(
+async function loadPreflightFailureContext(authority, attempt, provisional, primaryFailure) {
+  const runRoot = resolve(GENERATED_ROOT, authority.runId);
+  let runRootPresent = true;
+  try {
+    await lstat(runRoot);
+  } catch (error) {
+    if (error?.code !== "ENOENT") fail("orchestrator_run_root_invalid");
+    runRootPresent = false;
+  }
+  if (!runRootPresent) {
+    return Object.freeze({
+      context: {
+        ...provisional,
+        phase: "preflight_failed",
+        runRootPresent: false,
+        composeAttempted: false,
+        composeCleanupRequired: false,
+        primaryFailureClass: primaryFailure.code,
+      },
+      failure: primaryFailure,
+    });
+  }
+
+  const preflightEvidenceRoot = resolve(runRoot, "preflight-evidence");
+  const logRoot = resolve(runRoot, "logs");
+  const evidenceRoot = resolve(runRoot, "orchestrator-evidence");
+  for (const directory of [runRoot, preflightEvidenceRoot, logRoot]) {
+    await requireOwnerDirectory(directory);
+  }
+  await ensureOwnerOnlyDirectory(evidenceRoot, "orchestrator_evidence_root_invalid");
+  let preflightFailure;
+  try {
+    preflightFailure = validatePreflightFailureEvidence(
+      JSON.parse((await readSecureFile(
+        resolve(preflightEvidenceRoot, PREFLIGHT_FAILURE_EVIDENCE_FILE),
+        4096,
+      )).toString("utf8")),
+      authority.runId,
+    );
+  } catch {
+    fail("orchestrator_preflight_failure_evidence_invalid");
+  }
+  validatePreflightFailureBinding(primaryFailure.code, preflightFailure);
+  const secretsPath = resolve(runRoot, "infra-secrets.env");
+  let secrets = new Map();
+  try {
+    secrets = parseFeat126S10Secrets((await readSecureFile(secretsPath, 4096)).toString("utf8"));
+  } catch {
+    if (preflightFailure.phase !== "authority") fail("orchestrator_secret_store_invalid");
+  }
+  const observedVolumeNames = await projectVolumeNames(authority.runId);
+  const observedVolumes = classifyProjectVolumes(projectName(authority.runId), observedVolumeNames);
+  const composeNotAttemptedWithResources = !preflightFailure.compose_attempted && observedVolumeNames.length !== 0;
+  return Object.freeze({
+    context: {
+      ...provisional,
+      attempt,
+      runRoot,
+      evidenceRoot,
+      preflightEvidenceRoot,
+      logRoot,
+      secrets,
+      secretsPath,
+      phase: "preflight_failed",
+      runRootPresent: true,
+      primaryFailureClass: preflightFailure.failure_class,
+      retainedVolumeNames: preflightFailure.compose_attempted
+        ? observedVolumeNames
+        : provisional.retainedVolumeNames,
+      composeAttempted: preflightFailure.compose_attempted,
+      composeCleanupRequired: preflightFailure.compose_attempted &&
+        preflightFailure.cleanup_state !== "passed",
+      cleanupUnknown: (
+        preflightFailure.cleanup_state === "unknown" && !preflightFailure.compose_attempted
+      ) || composeNotAttemptedWithResources || observedVolumes.temporaryVolumes !== 0,
+    },
+    failure: new S10BO1OrchestratorError(preflightFailure.failure_class),
+  });
+}
+
+export async function executePreflight(authority, signal, runner = runCommand) {
+  await runner(
     "preflight",
     "make",
-    [
-      "--silent",
-      "--no-print-directory",
-      "feat-126-s10b-preflight",
-      `RUN_ID=${authority.runId}`,
-    ],
+    buildPreflightMakeInvocation(authority),
     {
-      env: commandEnvironment(repositoryEnvironment(authority.repositories)),
+      env: commandEnvironment(),
+      failureParser: parsePreflightFailureFrame,
       timeout: 30 * 60_000,
       signal,
     },
@@ -1567,6 +2610,25 @@ async function verifyRepositoryAuthority(repositories, signal) {
 }
 
 async function buildDesktop(context) {
+  context.apiVerifierBinary = resolve(context.binRoot, "verify-feat126-s10-e2e");
+  await runCommand(
+    "api_verifier_build",
+    "go",
+    [
+      "build",
+      "-trimpath",
+      "-o",
+      context.apiVerifierBinary,
+      "./cmd/verify-feat126-s10-e2e",
+    ],
+    {
+      cwd: REPOSITORIES.api,
+      env: commandEnvironment({ GOCACHE: resolve(context.runRoot, "go-build-cache") }),
+      timeout: 30 * 60_000,
+      signal: context.parentSignal,
+    },
+  );
+  context.apiVerifierBinarySha256 = await hashFile(context.apiVerifierBinary);
   await runCommand("desktop_frontend_typecheck", "pnpm", ["exec", "vue-tsc", "--noEmit"], {
     cwd: DESKTOP_ROOT,
     env: commandEnvironment({ VITE_FEAT126_S10_DRIVER: "true" }),
@@ -1614,12 +2676,60 @@ async function buildDesktop(context) {
 async function startDependencies(context) {
   const arguments_ = buildPrevalidatedDependencyArguments(context.runId, context.secretsPath);
   context.composeAttempted = true;
+  context.composeCleanupRequired = true;
   await runCommand("dependencies", "docker", arguments_, {
     env: commandEnvironment({ FEAT126_S10_RUN_ID: context.runId }),
     timeout: 10 * 60_000,
     signal: context.parentSignal,
   });
   context.composeStarted = true;
+  context.composeLogsRequired = true;
+}
+
+export async function runApiVerifierProjection(context, runner = runCommand) {
+  if (
+    context?.apiVerifierBinary !== resolve(context?.binRoot ?? "", "verify-feat126-s10-e2e") ||
+    context?.apiRuntimeEnvironment === null || Array.isArray(context?.apiRuntimeEnvironment) ||
+    typeof context?.apiRuntimeEnvironment !== "object"
+  ) fail("orchestrator_api_projection_invalid");
+  let metadata;
+  let digest;
+  try {
+    metadata = await lstat(context.apiVerifierBinary);
+    digest = await hashFile(context.apiVerifierBinary);
+  } catch {
+    fail("orchestrator_api_projection_invalid");
+  }
+  if (
+    !metadata.isFile() || metadata.isSymbolicLink() || !ownedByCurrentUser(metadata) ||
+    metadata.nlink !== 1 || digest !== context.apiVerifierBinarySha256 ||
+    (await realpath(context.apiVerifierBinary)) !== context.apiVerifierBinary
+  ) fail("orchestrator_api_projection_invalid");
+  const output = await runner(
+    "api_verifier",
+    context.apiVerifierBinary,
+    ["--profile", "feat-126-s10-local-lab", "--run-id", context.runId],
+    {
+      cwd: REPOSITORIES.api,
+      env: context.apiRuntimeEnvironment,
+      maxBuffer: 64 * 1024,
+      timeout: 30_000,
+      signal: context.parentSignal,
+    },
+  );
+  if (
+    typeof output !== "string" || output.length === 0 || output.length > 64 * 1024 ||
+    output.includes("\0") || output.includes("\r") || !output.endsWith("\n") ||
+    output.slice(0, -1).includes("\n")
+  ) fail("orchestrator_api_projection_invalid");
+  let value;
+  try {
+    value = JSON.parse(output);
+  } catch {
+    fail("orchestrator_api_projection_invalid");
+  }
+  validateApiVerifierProjection(value, context.runId);
+  return Object.freeze(value);
 }
 
 async function startApi(context) {
@@ -1648,6 +2758,12 @@ async function startApi(context) {
   }, context);
   await waitForHttpReadiness(context.processes.api.child, "api", "/healthz", "ok");
   await waitForHttpReadiness(context.processes.api.child, "api", "/readyz", "ready");
+  context.apiRuntimeEnvironment = apiEnvironment;
+  context.apiVerifierBefore = await runApiVerifierProjection(context);
+  await writeSecureJson(
+    resolve(context.evidenceRoot, "api-verifier-before.v1.json"),
+    context.apiVerifierBefore,
+  );
 }
 
 async function startFake(context) {
@@ -1688,7 +2804,11 @@ async function startFake(context) {
       } catch {
         fail("orchestrator_fake_authority_invalid");
       }
-      await probeClosedFakeAuthority(context);
+      context.fakeAuthorityBefore = await probeClosedFakeAuthority(context);
+      await writeSecureJson(
+        resolve(context.evidenceRoot, "fake-authority-before.v1.json"),
+        context.fakeAuthorityBefore,
+      );
       return;
     }
     await new Promise((resolveWait) => setTimeout(resolveWait, 100));
@@ -1696,7 +2816,7 @@ async function startFake(context) {
   fail("orchestrator_fake_not_ready");
 }
 
-async function probeClosedFakeAuthority(context) {
+async function probeClosedFakeAuthority(context, requireZero = true) {
   const value = await new Promise((resolveProbe, rejectProbe) => {
     const request = http.get(
       {
@@ -1731,34 +2851,66 @@ async function probeClosedFakeAuthority(context) {
     request.on("timeout", () => request.destroy(new Error("timeout")));
     request.on("error", rejectProbe);
   }).catch(() => fail("orchestrator_fake_authority_invalid"));
-  const expectedKeys = [
-    "accepted_calls",
-    "call_cap",
-    "dataset_id",
-    "dataset_sha256",
-    "fixture_case_id",
-    "generation",
-    "mode",
-    "rejected_calls",
-    "run_id",
-    "schema_version",
-    "status",
-  ];
-  if (
-    value === null || Array.isArray(value) || typeof value !== "object" ||
-    !exactKeys(value, expectedKeys) || value.accepted_calls !== 0 || value.rejected_calls !== 0 ||
-    value.dataset_id !== context.summary.fake_readiness.dataset_id ||
-    value.fixture_case_id !== context.summary.fake_readiness.fixture_case_id ||
-    value.dataset_sha256 !== context.summary.fake_readiness.dataset_sha256
-  ) {
-    fail("orchestrator_fake_authority_invalid");
+  return validateClosedFakeAuthorityProjection(value, context, requireZero);
+}
+
+export function buildBusinessBoundaryEvidence(before, after, fake, runId) {
+  if (before === null && after === null && fake === null) {
+    return validateBusinessBoundaryEvidence({
+      schema_version: 1,
+      status: "passed",
+      scope: "not_started",
+      run_id: runId,
+      api_before_sha256: null,
+      api_after_sha256: null,
+      fake_accepted_calls: null,
+      fake_rejected_calls: null,
+      s10b_r8_executed: false,
+    }, runId);
   }
-  validateFakeAuthority(value, {
-    runId: context.runId,
-    mode: "complete",
-    generation: 1,
-    callCap: 1,
-  });
+  validateApiVerifierProjection(before, runId);
+  validateApiVerifierProjection(after, runId);
+  const value = {
+    schema_version: 1,
+    status: "passed",
+    scope: fake === null ? "api_only" : "api_and_fake",
+    run_id: runId,
+    api_before_sha256: before.canonical_hash,
+    api_after_sha256: after.canonical_hash,
+    fake_accepted_calls: fake?.accepted_calls ?? null,
+    fake_rejected_calls: fake?.rejected_calls ?? null,
+    s10b_r8_executed: false,
+  };
+  return validateBusinessBoundaryEvidence(value, runId);
+}
+
+async function verifyBusinessBoundary(context) {
+  const apiStarted = Boolean(context.processes?.api);
+  const fakeStarted = Boolean(context.processes?.fake);
+  if (!apiStarted && !fakeStarted) {
+    context.businessBoundary = buildBusinessBoundaryEvidence(null, null, null, context.runId);
+    return context.businessBoundary;
+  }
+  if (!apiStarted || !context.apiVerifierBefore) fail("orchestrator_business_boundary_unknown");
+  const after = await runApiVerifierProjection(context);
+  await writeSecureJson(resolve(context.evidenceRoot, "api-verifier-after.v1.json"), after);
+  let fake = null;
+  if (fakeStarted) {
+    if (!context.fakeAuthorityBefore) fail("orchestrator_business_boundary_unknown");
+    fake = await probeClosedFakeAuthority(context, false);
+    await writeSecureJson(resolve(context.evidenceRoot, "fake-authority-after.v1.json"), fake);
+  }
+  context.businessBoundary = buildBusinessBoundaryEvidence(
+    context.apiVerifierBefore,
+    after,
+    fake,
+    context.runId,
+  );
+  await writeSecureJson(
+    resolve(context.evidenceRoot, "business-boundary.v1.json"),
+    context.businessBoundary,
+  );
+  return context.businessBoundary;
 }
 
 function desktopEnvironment(context) {
@@ -2035,15 +3187,7 @@ async function listInspectableFiles(root, required, excludedDirectories = new Se
   return found.sort();
 }
 
-export async function scanNoLog(context) {
-  if (
-    !context?.runRoot || context.logRoot !== resolve(context.runRoot, "logs") ||
-    context.evidenceRoot !== resolve(context.runRoot, "orchestrator-evidence") ||
-    context.preflightEvidenceRoot !== resolve(context.runRoot, "preflight-evidence") ||
-    !(context.secrets instanceof Map)
-  ) {
-    fail("orchestrator_no_log_invalid");
-  }
+function noLogPatternSet(context) {
   const literalPatterns = [
     ...[...context.secrets.entries()].map(([name, value]) => ({
       name: `secret:${name}`,
@@ -2061,24 +3205,187 @@ export async function scanNoLog(context) {
     ["private_key", /private[\s_-]*key/i],
     ["sensitive_field", /["']?(?:argv|bearer|dsn|env|path|payload|secret)["']?\s*:/i],
   ]);
+  return Object.freeze({ literalPatterns, forbiddenPatterns });
+}
+
+function scanNoLogBuffer(content, literalPatterns, forbiddenPatterns) {
+  const value = Buffer.from(content).toString("utf8");
+  let hitCount = 0;
+  const folded = value.toLocaleLowerCase("en-US");
+  for (const { value: pattern } of literalPatterns) {
+    if (folded.includes(pattern.toLocaleLowerCase("en-US"))) hitCount += 1;
+  }
+  for (const [, pattern] of forbiddenPatterns) {
+    if (pattern.test(value)) hitCount += 1;
+  }
+  return Object.freeze({
+    rowCount: value.split("\n").filter(Boolean).length,
+    hitCount,
+  });
+}
+
+async function scanNoLogFiles(files, literalPatterns, forbiddenPatterns) {
+  let rowCount = 0;
+  let hitCount = 0;
+  for (const path of files) {
+    let content;
+    try {
+      content = await readSecureFile(path, CHILD_OUTPUT_MAX_BYTES, [0o600], 0);
+    } catch {
+      fail("orchestrator_no_log_invalid");
+    }
+    const scan = scanNoLogBuffer(content, literalPatterns, forbiddenPatterns);
+    rowCount += scan.rowCount;
+    hitCount += scan.hitCount;
+  }
+  return Object.freeze({ rowCount, hitCount });
+}
+
+export async function captureRuntimeLogScan(context, operations = {}) {
+  if (
+    !context?.composeLogsRequired || !RUN_ID_PATTERN.test(context.runId ?? "") ||
+    !(context.secrets instanceof Map)
+  ) fail("orchestrator_no_log_invalid");
+  const project = projectName(context.runId);
+  const list = operations.list ?? (async () => await dockerList([
+    "ps",
+    "-aq",
+    "--filter",
+    `label=com.docker.compose.project=${project}`,
+  ]));
+  const readLogs = operations.readLogs ?? (async (containerId) => await runCommand(
+    "container_logs",
+    "docker",
+    ["logs", containerId],
+    { captureAllOutput: true, maxBuffer: CHILD_OUTPUT_MAX_BYTES, timeout: 30_000 },
+  ));
+  let containerIds;
+  try {
+    containerIds = [...new Set(await list())].sort();
+  } catch {
+    fail("orchestrator_no_log_invalid");
+  }
+  if (
+    containerIds.length === 0 ||
+    containerIds.some((value) => !/^[0-9a-f]{12,64}$/.test(value ?? ""))
+  ) fail("orchestrator_no_log_invalid");
+  const { literalPatterns, forbiddenPatterns } = noLogPatternSet(context);
+  let rowCount = 0;
+  let hitCount = 0;
+  for (const containerId of containerIds) {
+    let content;
+    try {
+      content = await readLogs(containerId);
+    } catch {
+      fail("orchestrator_no_log_invalid");
+    }
+    if (!Buffer.isBuffer(content) || content.length > CHILD_OUTPUT_MAX_BYTES) {
+      fail("orchestrator_no_log_invalid");
+    }
+    const scan = scanNoLogBuffer(content, literalPatterns, forbiddenPatterns);
+    rowCount += scan.rowCount;
+    hitCount += scan.hitCount;
+  }
+  return validateRuntimeLogScan({
+    schema_version: 1,
+    status: hitCount === 0 ? "passed" : "failed",
+    run_id: context.runId,
+    source_count: containerIds.length,
+    row_count: rowCount,
+    hit_count: hitCount,
+    source_set_sha256: sha256(containerIds.join("\n")),
+  }, context.runId);
+}
+
+export async function scanNoLog(context) {
+  if (!context?.runRoot || !(context.secrets instanceof Map) || !context.attempt?.markerPath) {
+    fail("orchestrator_no_log_invalid");
+  }
+  const { literalPatterns, forbiddenPatterns } = noLogPatternSet(context);
+  if (context.runRootPresent === false) {
+    if (
+      context.phase !== "preflight_failed" || context.composeAttempted !== false ||
+      context.composeCleanupRequired !== false ||
+      Object.keys(context.processes ?? {}).length !== 0 ||
+      Object.keys(context.descendantProcesses ?? {}).length !== 0 ||
+      !sameStringSet(context.retainedVolumeNames, [])
+    ) {
+      fail("orchestrator_no_log_invalid");
+    }
+    try {
+      await lstat(context.runRoot);
+      fail("orchestrator_no_log_invalid");
+    } catch (error) {
+      if (error instanceof S10BO1OrchestratorError || error?.code !== "ENOENT") {
+        fail("orchestrator_no_log_invalid");
+      }
+    }
+    const files = [
+      context.attempt.markerPath,
+      ...(context.attemptFailure ? [context.attempt.failurePath] : []),
+      ...(context.attemptClosure ? [context.attempt.closurePath] : []),
+    ].sort();
+    const scan = await scanNoLogFiles(files, literalPatterns, forbiddenPatterns);
+    return Object.freeze({
+      schema_version: 1,
+      scope: "attempt_only",
+      coverage: context.attemptClosure
+        ? "attempt_ledger"
+        : context.attemptFailure
+          ? "attempt_marker_and_failure"
+          : "attempt_marker_only",
+      file_count: files.length,
+      row_count: scan.rowCount,
+      hit_count: scan.hitCount,
+      external_source_count: 0,
+      external_row_count: 0,
+      external_source_set_sha256: sha256(""),
+      pattern_set_sha256: sha256([
+        ...literalPatterns.map(({ name }) => name),
+        ...forbiddenPatterns.map(([name]) => name),
+      ].sort().join("\n")),
+    });
+  }
+  if (
+    context.logRoot !== resolve(context.runRoot, "logs") ||
+    context.evidenceRoot !== resolve(context.runRoot, "orchestrator-evidence") ||
+    context.preflightEvidenceRoot !== resolve(context.runRoot, "preflight-evidence")
+  ) {
+    fail("orchestrator_no_log_invalid");
+  }
   const scanRoots = [
     [context.logRoot, true],
     [context.evidenceRoot, true],
     [context.preflightEvidenceRoot, true],
     [resolve(context.runRoot, "bootstrap-evidence"), false],
     [resolve(context.runRoot, "host"), false],
+    [resolve(context.runRoot, "host-home"), false],
+    [resolve(context.runRoot, "codex-home"), false],
     [resolve(context.runRoot, "secure-storage"), false, new Set(["ephemeral-secrets"])],
   ];
   let files;
   try {
     await requireOwnerDirectory(context.runRoot);
-    files = [...new Set((await Promise.all(
-      scanRoots.map(([root, required, excluded]) => listInspectableFiles(root, required, excluded)),
-    )).flat())].sort();
+    files = [...new Set([
+      ...(await Promise.all(
+        scanRoots.map(([root, required, excluded]) => listInspectableFiles(root, required, excluded)),
+      )).flat(),
+      context.attempt.markerPath,
+      ...(context.attemptFailure ? [context.attempt.failurePath] : []),
+      ...(context.attemptClosure ? [context.attempt.closurePath] : []),
+      ...(context.phase === "preflight_failed" ? [resolve(context.runRoot, "REJECTED")] : []),
+    ])].sort();
   } catch {
     fail("orchestrator_no_log_invalid");
   }
-  const requiredFiles = new Set([resolve(context.preflightEvidenceRoot, "summary.json")]);
+  const requiredFiles = new Set([context.attempt.markerPath]);
+  if (context.phase === "preflight_failed") {
+    requiredFiles.add(resolve(context.preflightEvidenceRoot, PREFLIGHT_FAILURE_EVIDENCE_FILE));
+    requiredFiles.add(context.attempt.failurePath);
+    requiredFiles.add(resolve(context.runRoot, "REJECTED"));
+  } else {
+    requiredFiles.add(resolve(context.preflightEvidenceRoot, "summary.json"));
+  }
   for (const [role, process_] of Object.entries(context.processes ?? {})) {
     if (process_.logPath) requiredFiles.add(process_.logPath);
     if (process_.record) requiredFiles.add(resolve(context.evidenceRoot, `${role}-process.v1.json`));
@@ -2097,38 +3404,49 @@ export async function scanNoLog(context) {
       requiredFiles.add(resolve(hostInstance, name));
     }
   }
+  const preflightOnly = ["preflight_failed", "preflight_context_invalid"].includes(context.phase);
+  let runtimeLogScan = context.runtimeLogScan;
+  if (!preflightOnly && !runtimeLogScan) {
+    try {
+      runtimeLogScan = validateRuntimeLogScan(
+        JSON.parse((await readSecureFile(
+          resolve(context.evidenceRoot, "runtime-log-scan.v1.json"),
+          4096,
+        )).toString("utf8")),
+        context.runId,
+      );
+    } catch {
+      fail("orchestrator_no_log_invalid");
+    }
+  }
+  if (!preflightOnly) requiredFiles.add(resolve(context.evidenceRoot, "runtime-log-scan.v1.json"));
+  if (context.apiVerifierBefore) {
+    for (const name of [
+      "api-verifier-before.v1.json",
+      "api-verifier-after.v1.json",
+      "business-boundary.v1.json",
+    ]) requiredFiles.add(resolve(context.evidenceRoot, name));
+    if (context.fakeAuthorityBefore) {
+      requiredFiles.add(resolve(context.evidenceRoot, "fake-authority-before.v1.json"));
+      requiredFiles.add(resolve(context.evidenceRoot, "fake-authority-after.v1.json"));
+    }
+  }
   if ([...requiredFiles].some((path) => !files.includes(path))) {
     fail("orchestrator_no_log_invalid");
   }
-  let rowCount = 0;
-  let hitCount = 0;
-  for (const path of files) {
-    let content;
-    try {
-      content = await readSecureFile(path, CHILD_OUTPUT_MAX_BYTES, [0o600], 0);
-    } catch {
-      fail("orchestrator_no_log_invalid");
-    }
-    let value;
-    try {
-      value = new TextDecoder("utf-8", { fatal: true }).decode(content);
-    } catch {
-      fail("orchestrator_no_log_invalid");
-    }
-    rowCount += value.split("\n").filter(Boolean).length;
-    const folded = value.toLocaleLowerCase("en-US");
-    for (const { value: pattern } of literalPatterns) {
-      if (folded.includes(pattern.toLocaleLowerCase("en-US"))) hitCount += 1;
-    }
-    for (const [, pattern] of forbiddenPatterns) {
-      if (pattern.test(value)) hitCount += 1;
-    }
-  }
+  const scan = await scanNoLogFiles(files, literalPatterns, forbiddenPatterns);
   return Object.freeze({
     schema_version: 1,
+    scope: preflightOnly ? "preflight_artifacts" : "run_artifacts",
+    coverage: preflightOnly
+      ? "all_preflight_log_and_evidence_sources"
+      : "all_run_log_and_evidence_sources",
     file_count: files.length,
-    row_count: rowCount,
-    hit_count: hitCount,
+    row_count: scan.rowCount + (runtimeLogScan?.row_count ?? 0),
+    hit_count: scan.hitCount + (runtimeLogScan?.hit_count ?? 0),
+    external_source_count: runtimeLogScan?.source_count ?? 0,
+    external_row_count: runtimeLogScan?.row_count ?? 0,
+    external_source_set_sha256: runtimeLogScan?.source_set_sha256 ?? sha256(""),
     pattern_set_sha256: sha256([
       ...literalPatterns.map(({ name }) => name),
       ...forbiddenPatterns.map(([name]) => name),
@@ -2152,6 +3470,17 @@ async function dockerCount(arguments_) {
 
 async function cleanupLiveContext(context) {
   let cleanupUnknown = context.cleanupUnknown;
+  if (context.composeLogsRequired) {
+    try {
+      context.runtimeLogScan = await captureRuntimeLogScan(context);
+      await writeSecureJson(
+        resolve(context.evidenceRoot, "runtime-log-scan.v1.json"),
+        context.runtimeLogScan,
+      );
+    } catch {
+      context.runtimeLogScanUnknown = true;
+    }
+  }
   try {
     await closeControlWriter(context.controlWriter);
   } catch {
@@ -2187,7 +3516,7 @@ async function cleanupLiveContext(context) {
     }
   }
 
-  if (context.composeAttempted) {
+  if (shouldRunComposeCleanup(context)) {
     try {
       await runCommand(
         "cleanup",
@@ -2196,6 +3525,7 @@ async function cleanupLiveContext(context) {
         { timeout: 10 * 60_000 },
       );
       context.composeStarted = false;
+      context.composeCleanupRequired = false;
     } catch {
       cleanupUnknown = true;
     }
@@ -2220,41 +3550,105 @@ async function cleanupLiveContext(context) {
   const listeners = listenerInspections.filter((entry) => entry.listening).length;
   cleanupUnknown ||= listenerInspections.some((entry) => entry.unknown);
 
-  const project = `yijie-feat126-s10-${context.runId.replaceAll("-", "")}`;
+  const project = projectName(context.runId);
   const containers = await dockerCount(["ps", "-aq", "--filter", `label=com.docker.compose.project=${project}`]);
   const networks = await dockerCount(["network", "ls", "-q", "--filter", `label=com.docker.compose.project=${project}`]);
-  const volumes = classifyProjectVolumes(
-    project,
-    await dockerList(["volume", "ls", "-q", "--filter", `label=com.docker.compose.project=${project}`]),
-  );
+  const volumeNames = await projectVolumeNames(context.runId);
+  const volumes = classifyProjectVolumes(project, volumeNames);
+  const namedVolumesPreserved = sameStringSet(volumeNames, context.retainedVolumeNames);
   if (cleanupUnknown) fail("orchestrator_cleanup_unknown");
+  const cleanupScope = context.runRootPresent === false
+    ? "pre_run_absence"
+    : ["preflight_failed", "preflight_context_invalid"].includes(context.phase)
+      ? "preflight_artifacts"
+      : "run_artifacts";
   return Object.freeze({
     schema_version: 1,
+    scope: cleanupScope,
     status: containers === 0 && networks === 0 && processAssessment.processes === 0 &&
-      listeners === 0 && volumes.namedVolumes === S10_NAMED_VOLUME_KEYS.length &&
-      volumes.temporaryVolumes === 0 ? "passed" : "failed",
+      listeners === 0 && namedVolumesPreserved && volumes.temporaryVolumes === 0
+      ? "passed"
+      : "failed",
     containers,
     networks,
     processes: processAssessment.processes,
     listeners,
     temporary_volumes: volumes.temporaryVolumes,
-    named_volumes_preserved: volumes.namedVolumes === S10_NAMED_VOLUME_KEYS.length,
+    named_volume_baseline_count: context.retainedVolumeNames.length,
+    named_volume_after_count: volumeNames.length,
+    named_volumes_preserved: namedVolumesPreserved,
     prune_executed: false,
     volume_delete_executed: false,
   });
 }
 
-async function createLiveOperations(authority, parentGuard = createParentIdentityGuard()) {
+export function validateFreshResourceInventory(value) {
+  if (
+    value === null || Array.isArray(value) || typeof value !== "object" ||
+    !exactKeys(value, ["containers", "listeners", "networks", "volume_names"]) ||
+    !Number.isSafeInteger(value.containers) || value.containers < 0 ||
+    !Number.isSafeInteger(value.networks) || value.networks < 0 ||
+    !Array.isArray(value.volume_names) || value.volume_names.some((name) => typeof name !== "string") ||
+    !Array.isArray(value.listeners) || value.listeners.length !== FIXED_PORTS.length ||
+    value.listeners.some((entry, index) => (
+      entry === null || Array.isArray(entry) || typeof entry !== "object" ||
+      !exactKeys(entry, ["listening", "port", "unknown"]) || entry.port !== FIXED_PORTS[index] ||
+      typeof entry.listening !== "boolean" || typeof entry.unknown !== "boolean"
+    )) || value.containers !== 0 || value.networks !== 0 || value.volume_names.length !== 0 ||
+    value.listeners.some((entry) => entry.listening || entry.unknown)
+  ) fail("orchestrator_run_resources_not_fresh");
+  return true;
+}
+
+async function verifyFreshRunResources(context) {
+  try {
+    await lstat(context.runRoot);
+    context.runRootPresent = true;
+    context.cleanupUnknown = true;
+    fail("orchestrator_run_not_fresh");
+  } catch (error) {
+    if (error instanceof S10BO1OrchestratorError) throw error;
+    if (error?.code !== "ENOENT") {
+      context.cleanupUnknown = true;
+      fail("orchestrator_run_root_invalid");
+    }
+  }
+  const project = projectName(context.runId);
+  const containers = await dockerCount([
+    "ps",
+    "-aq",
+    "--filter",
+    `label=com.docker.compose.project=${project}`,
+  ]);
+  const networks = await dockerCount([
+    "network",
+    "ls",
+    "-q",
+    "--filter",
+    `label=com.docker.compose.project=${project}`,
+  ]);
+  const volumes = await projectVolumeNames(context.runId);
+  const listeners = await Promise.all(FIXED_PORTS.map(inspectListener));
+  validateFreshResourceInventory({ containers, networks, volume_names: volumes, listeners });
+}
+
+function createLiveOperations(authority, attempt, parentGuard = createParentIdentityGuard()) {
   const parentController = new AbortController();
   const runRoot = resolve(GENERATED_ROOT, authority.runId);
   let context = {
     ...authority,
+    attempt,
     runRoot,
     evidenceRoot: resolve(runRoot, "orchestrator-evidence"),
     preflightEvidenceRoot: resolve(runRoot, "preflight-evidence"),
     logRoot: resolve(runRoot, "logs"),
     secrets: new Map(),
-    composeAttempted: true,
+    phase: "preflight_not_started",
+    runRootPresent: false,
+    retainedVolumeNames: Object.freeze([]),
+    composeAttempted: false,
+    composeCleanupRequired: false,
+    composeLogsRequired: false,
     cleanupUnknown: false,
     processes: {},
     parentSignal: parentController.signal,
@@ -2282,42 +3676,112 @@ async function createLiveOperations(authority, parentGuard = createParentIdentit
   return {
     async runPreflight() {
       requireParentAlive();
-      await Promise.race([
-        executePreflight(authority, parentController.signal),
-        parentDeath,
-      ]);
+      context.phase = "preflight_running";
+      try {
+        await Promise.race([verifyFreshRunResources(context), parentDeath]);
+        requireParentAlive();
+        await Promise.race([
+          executePreflight(authority, parentController.signal),
+          parentDeath,
+        ]);
+      } catch (error) {
+        const primary = error instanceof S10BO1OrchestratorError
+          ? error
+          : new S10BO1OrchestratorError("orchestrator_preflight_failed");
+        let failureContext;
+        try {
+          failureContext = await loadPreflightFailureContext(
+            authority,
+            attempt,
+            context,
+            primary,
+          );
+        } catch (contextError) {
+          try {
+            await lstat(context.runRoot);
+            context.runRootPresent = true;
+          } catch (rootError) {
+            if (rootError?.code !== "ENOENT") context.cleanupUnknown = true;
+          }
+          context.phase = "preflight_failed";
+          context.cleanupUnknown = true;
+          const evidenceFailure = contextError instanceof S10BO1OrchestratorError
+            ? contextError.code
+            : "orchestrator_preflight_failure_evidence_invalid";
+          throw new S10BO1OrchestratorError(primary.code, {
+            evidence_failure_class: evidenceFailure,
+          });
+        }
+        context = failureContext.context;
+        throw failureContext.failure;
+      }
       requireParentAlive();
-      context = await loadRunContext(authority);
+      try {
+        context = await loadRunContext(authority, attempt);
+      } catch (error) {
+        let observedVolumeNames = [];
+        try {
+          observedVolumeNames = await projectVolumeNames(authority.runId);
+        } catch {
+          // The original context-load failure remains primary; cleanup stays unknown.
+        }
+        context = {
+          ...context,
+          runRoot: resolve(GENERATED_ROOT, authority.runId),
+          evidenceRoot: resolve(GENERATED_ROOT, authority.runId, "orchestrator-evidence"),
+          preflightEvidenceRoot: resolve(GENERATED_ROOT, authority.runId, "preflight-evidence"),
+          logRoot: resolve(GENERATED_ROOT, authority.runId, "logs"),
+          phase: "preflight_context_invalid",
+          runRootPresent: true,
+          retainedVolumeNames: observedVolumeNames,
+          composeAttempted: true,
+          composeCleanupRequired: false,
+          cleanupUnknown: true,
+        };
+        throw error;
+      }
       context.parentSignal = parentController.signal;
       return context.summary;
     },
     async buildDesktop() {
       requireParentAlive();
+      context.phase = "desktop_building";
       context.desktopBinary = await Promise.race([buildDesktop(context), parentDeath]);
+      context.phase = "desktop_built";
       requireParentAlive();
     },
     async startDependencies() {
       requireParentAlive();
+      context.phase = "dependencies_starting";
       await Promise.race([startDependencies(context), parentDeath]);
+      context.phase = "dependencies_ready";
       requireParentAlive();
     },
     async startApi() {
       requireParentAlive();
+      context.phase = "api_starting";
       await Promise.race([startApi(context), parentDeath]);
+      context.phase = "api_ready";
       requireParentAlive();
     },
     async startFake() {
       requireParentAlive();
+      context.phase = "fake_starting";
       await Promise.race([startFake(context), parentDeath]);
+      context.phase = "fake_ready";
       requireParentAlive();
     },
     async startDesktop() {
       requireParentAlive();
+      context.phase = "desktop_starting";
       await Promise.race([startDesktop(context), parentDeath]);
+      context.phase = "desktop_spawned";
       requireParentAlive();
     },
     async readDesktopFrame(expectedKind) {
-      return await Promise.race([readDesktopFrame(context, expectedKind), parentDeath]);
+      const frame = await Promise.race([readDesktopFrame(context, expectedKind), parentDeath]);
+      if (expectedKind === "abort_complete") context.phase = "abort_complete";
+      return frame;
     },
     async readDesktopEof() {
       return await Promise.race([
@@ -2330,17 +3794,20 @@ async function createLiveOperations(authority, parentGuard = createParentIdentit
     async readOwnership() {
       requireParentAlive();
       const ownership = await readOwnershipEvidence(context);
+      context.phase = "component_ready";
       requireParentAlive();
       return ownership;
     },
     async sendAbort() {
       requireParentAlive();
       await Promise.race([sendAbort(context), parentDeath]);
+      context.phase = "abort_sent";
       requireParentAlive();
     },
     async waitForDesktopExit() {
       requireParentAlive();
       await Promise.race([waitForDesktopExit(context), parentDeath]);
+      context.phase = "desktop_exited";
       requireParentAlive();
     },
     async initiateDesktopAbort() {
@@ -2360,11 +3827,76 @@ async function createLiveOperations(authority, parentGuard = createParentIdentit
         ]);
       }
     },
+    async verifyBusinessBoundary() {
+      return await verifyBusinessBoundary(context);
+    },
     async cleanup() {
       if (!context) fail("orchestrator_cleanup_unknown");
       const result = await cleanupLiveContext(context);
       requireParentAlive();
       return result;
+    },
+    async recordFailure({
+      failureClass,
+      businessFailureClass,
+      cleanupFailureClass,
+      parentFailureClass,
+    }) {
+      const processRoles = EXISTING_PROCESS_ROLES.filter((role) => (
+        Boolean(context.processes?.[role]) || Boolean(context.descendantProcesses?.[role])
+      ));
+      const value = await writeAttemptFailure(attempt, authority, {
+        schema_version: 1,
+        status: "failed",
+        run_id: authority.runId,
+        attempt_marker_sha256: attempt.markerSha256,
+        failure_class: failureClass,
+        business_failure_class: businessFailureClass,
+        cleanup_failure_class: cleanupFailureClass,
+        parent_failure_class: parentFailureClass,
+        phase: context.phase,
+        compose_attempted: context.composeAttempted,
+        compose_cleanup_required: context.composeCleanupRequired,
+        run_root_present: context.runRootPresent,
+        process_roles: processRoles,
+        retained_volume_keys: retainedVolumeKeys(authority.runId, context.retainedVolumeNames),
+        no_log_required: true,
+        s10b_r8_executed: false,
+      });
+      context.attemptFailure = value;
+      return value;
+    },
+    async recordClosure({
+      status,
+      failureClass,
+      businessFailureClass,
+      businessStatus,
+      cleanupFailureClass,
+      cleanupScope,
+      evidenceFailureClass,
+      noLogFailureClass,
+      noLogScope,
+      parentFailureClass,
+    }) {
+      const value = await writeAttemptClosure(attempt, authority, {
+        schema_version: 1,
+        status,
+        closure_kind: status === "passed" ? "success" : "failure",
+        run_id: authority.runId,
+        attempt_marker_sha256: attempt.markerSha256,
+        failure_class: failureClass,
+        business_failure_class: businessFailureClass,
+        business_status: businessStatus,
+        cleanup_failure_class: cleanupFailureClass,
+        cleanup_scope: cleanupScope,
+        evidence_failure_class: evidenceFailureClass,
+        no_log_failure_class: noLogFailureClass,
+        no_log_scope: noLogScope,
+        parent_failure_class: parentFailureClass,
+        s10b_r8_executed: false,
+      });
+      context.attemptClosure = value;
+      return value;
     },
     async scanNoLog() {
       if (!context) fail("orchestrator_no_log_invalid");
@@ -2381,7 +3913,11 @@ async function createLiveOperations(authority, parentGuard = createParentIdentit
   };
 }
 
-export async function loadExistingProcessRecords(runRoot, runId) {
+export async function loadExistingProcessRecords(
+  runRoot,
+  runId,
+  expectedRoles = EXISTING_PROCESS_ROLES,
+) {
   const evidenceRoot = resolve(runRoot, "orchestrator-evidence");
   try {
     await lstat(evidenceRoot);
@@ -2396,7 +3932,7 @@ export async function loadExistingProcessRecords(runRoot, runId) {
   } catch {
     fail("orchestrator_existing_evidence_incomplete");
   }
-  const expectedNames = EXISTING_PROCESS_ROLES.map((role) => `${role}-process.v1.json`).sort();
+  const expectedNames = expectedRoles.map((role) => `${role}-process.v1.json`).sort();
   const observedNames = entries
     .filter((entry) => entry.name.endsWith("-process.v1.json"))
     .map((entry) => entry.name)
@@ -2405,7 +3941,7 @@ export async function loadExistingProcessRecords(runRoot, runId) {
     fail("orchestrator_existing_evidence_incomplete");
   }
   const records = [];
-  for (const role of EXISTING_PROCESS_ROLES) {
+  for (const role of expectedRoles) {
     const path = resolve(evidenceRoot, `${role}-process.v1.json`);
     try {
       const bytes = await readSecureFile(path, 4096);
@@ -2418,7 +3954,7 @@ export async function loadExistingProcessRecords(runRoot, runId) {
       fail("orchestrator_process_record_invalid");
     }
   }
-  validateExistingProcessRecordSet(records);
+  validateExistingProcessRecordSet(records, expectedRoles);
   return Object.freeze(records);
 }
 
@@ -2441,10 +3977,12 @@ async function validateExistingBinaryAuthority(records, runRoot) {
   }
 }
 
-async function reconcileExistingRun(authority, runRoot) {
+async function reconcileExistingRun(authority, runRoot, options = {}) {
   await requireOwnerDirectory(runRoot);
   let unknown = false;
-  const records = await loadExistingProcessRecords(runRoot, authority.runId);
+  const expectedRoles = options.expectedRoles ?? EXISTING_PROCESS_ROLES;
+  const retainedVolumeNames = options.retainedVolumeNames ?? await projectVolumeNames(authority.runId);
+  const records = await loadExistingProcessRecords(runRoot, authority.runId, expectedRoles);
   await validateExistingBinaryAuthority(records, runRoot);
   const byRole = new Map(records.map((record) => [record.role, record]));
   const currentByRole = new Map();
@@ -2460,12 +3998,15 @@ async function reconcileExistingRun(authority, runRoot) {
     if (current !== null && !sameProcessIdentity(record, current)) unknown = true;
   }
   if (
-    (currentByRole.get("host") !== null && currentByRole.get("desktop") === null) ||
-    (currentByRole.get("runtime") !== null && currentByRole.get("host") === null)
+    (currentByRole.has("host") && currentByRole.get("host") !== null &&
+      (!currentByRole.has("desktop") || currentByRole.get("desktop") === null)) ||
+    (currentByRole.has("runtime") && currentByRole.get("runtime") !== null &&
+      (!currentByRole.has("host") || currentByRole.get("host") === null))
   ) unknown = true;
   if (!unknown) {
     for (const role of ["desktop", "fake", "api"]) {
       const record = byRole.get(role);
+      if (!record) continue;
       const outcome = await reconcileProcess(record, {
         inspect: inspectProcessIdentity,
         async stop(value) {
@@ -2481,15 +4022,17 @@ async function reconcileExistingRun(authority, runRoot) {
       if (!["absent", "stopped"].includes(outcome)) unknown = true;
     }
   }
-  try {
-    await runCommand(
-      "cleanup",
-      "make",
-      ["--silent", "--no-print-directory", "feat-126-s10-stop", `RUN_ID=${authority.runId}`],
-      { timeout: 10 * 60_000 },
-    );
-  } catch {
-    unknown = true;
+  if (options.composeCleanupRequired !== false) {
+    try {
+      await runCommand(
+        "cleanup",
+        "make",
+        ["--silent", "--no-print-directory", "feat-126-s10-stop", `RUN_ID=${authority.runId}`],
+        { timeout: 10 * 60_000 },
+      );
+    } catch {
+      unknown = true;
+    }
   }
   let processAssessment = { processes: records.length, identityUnknown: false };
   for (let attempt = 0; attempt < 80; attempt += 1) {
@@ -2508,21 +4051,430 @@ async function reconcileExistingRun(authority, runRoot) {
   }
   unknown ||= listenerInspections.some((entry) => entry.listening || entry.unknown);
 
-  const project = `yijie-feat126-s10-${authority.runId.replaceAll("-", "")}`;
+  const project = projectName(authority.runId);
   const containers = await dockerCount(["ps", "-aq", "--filter", `label=com.docker.compose.project=${project}`]);
   const networks = await dockerCount(["network", "ls", "-q", "--filter", `label=com.docker.compose.project=${project}`]);
-  const volumes = classifyProjectVolumes(
-    project,
-    await dockerList(["volume", "ls", "-q", "--filter", `label=com.docker.compose.project=${project}`]),
-  );
+  const volumeNames = await projectVolumeNames(authority.runId);
+  const volumes = classifyProjectVolumes(project, volumeNames);
   unknown ||= containers !== 0 || networks !== 0 ||
-    volumes.namedVolumes !== S10_NAMED_VOLUME_KEYS.length || volumes.temporaryVolumes !== 0;
+    !sameStringSet(volumeNames, retainedVolumeNames) || volumes.temporaryVolumes !== 0;
   if (unknown) fail("orchestrator_cleanup_unknown");
+  const cleanup = Object.freeze({
+    schema_version: 1,
+    scope: options.scope ?? "run_artifacts",
+    status: "passed",
+    containers,
+    networks,
+    processes: processAssessment.processes,
+    listeners: listenerInspections.filter((entry) => entry.listening).length,
+    temporary_volumes: volumes.temporaryVolumes,
+    named_volume_baseline_count: retainedVolumeNames.length,
+    named_volume_after_count: volumeNames.length,
+    named_volumes_preserved: true,
+    prune_executed: false,
+    volume_delete_executed: false,
+  });
+  validateCleanupClosure(cleanup);
+  return Object.freeze({ cleanup, records });
+}
+
+async function readOptionalAttemptFailure(attempt, authority) {
+  try {
+    await lstat(attempt.failurePath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    fail("orchestrator_attempt_evidence_invalid");
+  }
+  return await readAttemptFailure(attempt, authority);
+}
+
+async function readOptionalAttemptClosure(attempt, authority) {
+  try {
+    await lstat(attempt.closurePath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    fail("orchestrator_attempt_evidence_invalid");
+  }
+  return await readAttemptClosure(attempt, authority);
+}
+
+async function readOptionalAttemptReconcile(attempt, authority) {
+  try {
+    await lstat(attempt.reconcilePath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    fail("orchestrator_attempt_evidence_invalid");
+  }
+  return await readAttemptReconcile(attempt, authority);
+}
+
+async function readSecureJson(path, maximumBytes = 16 * 1024) {
+  try {
+    return JSON.parse((await readSecureFile(path, maximumBytes)).toString("utf8"));
+  } catch (error) {
+    if (error instanceof S10BO1OrchestratorError) throw error;
+    fail("orchestrator_artifact_invalid");
+  }
+}
+
+export function persistedOwnershipEvidenceRequiredFiles(records) {
+  if (!Array.isArray(records)) fail("orchestrator_existing_evidence_incomplete");
+  const roles = new Set(records.map((record) => record?.role));
+  if (!roles.has("host") && !roles.has("runtime")) return Object.freeze([]);
+  if (!["desktop", "host", "runtime"].every((role) => roles.has(role))) {
+    fail("orchestrator_existing_evidence_incomplete");
+  }
+  return Object.freeze([
+    "host-evidence.v1.json",
+    "host-stopped-evidence.v1.json",
+    "runtime-evidence.v1.json",
+  ]);
+}
+
+async function loadPersistedOwnershipEvidence(context, byRole) {
+  const hostRecord = byRole.get("host");
+  const runtimeRecord = byRole.get("runtime");
+  const requiredFiles = persistedOwnershipEvidenceRequiredFiles([...byRole.values()]);
+  if (requiredFiles.length === 0) return;
+  const desktopRecord = byRole.get("desktop");
+  let hostBinarySha256;
+  let runtimeBinarySha256;
+  let manifestSha256;
+  try {
+    hostBinarySha256 = await hashFile(resolve(context.binRoot, "yijie-agent-host"));
+    runtimeBinarySha256 = await hashFile(
+      resolve(RUNTIME_ROOT, ".yijie/build/macos/aarch64-apple-darwin/codex"),
+    );
+    manifestSha256 = await hashFile(
+      resolve(RUNTIME_ROOT, ".yijie/build/macos/aarch64-apple-darwin/runtime-manifest.json"),
+    );
+  } catch {
+    fail("orchestrator_existing_evidence_incomplete");
+  }
+  const hostEvidence = validateHostProcessEvidence(
+    await readSecureJson(resolve(context.evidenceRoot, requiredFiles[0])),
+    {
+      runId: context.runId,
+      desktopPid: desktopRecord.pid,
+      binarySha256: hostBinarySha256,
+      expectedState: "ready",
+      expectedPid: hostRecord.pid,
+    },
+  );
+  const runtimeEvidence = validateRuntimeProcessEvidence(
+    await readSecureJson(resolve(context.evidenceRoot, requiredFiles[2])),
+    {
+      runId: context.runId,
+      hostPid: hostRecord.pid,
+      binarySha256: runtimeBinarySha256,
+      manifestSha256,
+      nonce: hostEvidence.instanceNonce,
+      profile: "feat-126-s10-local-lab",
+    },
+  );
+  if (
+    runtimeEvidence.pid !== runtimeRecord.pid || hostEvidence.pid !== hostRecord.pid ||
+    runtimeEvidence.binary_sha256 !== runtimeRecord.binary_sha256 ||
+    hostEvidence.binarySha256 !== hostRecord.binary_sha256
+  ) fail("orchestrator_existing_evidence_incomplete");
+  const hostStoppedEvidence = validateHostProcessEvidence(
+    await readSecureJson(resolve(context.evidenceRoot, requiredFiles[1])),
+    {
+      runId: context.runId,
+      desktopPid: desktopRecord.pid,
+      binarySha256: hostBinarySha256,
+      expectedState: "stopped",
+      expectedPid: hostEvidence.pid,
+      expectedNonce: hostEvidence.instanceNonce,
+      expectedStartedAtUnixMs: hostEvidence.startedAtUnixMs,
+    },
+  );
+  context.hostEvidence = hostEvidence;
+  context.runtimeEvidence = runtimeEvidence;
+  context.hostStoppedEvidence = hostStoppedEvidence;
+}
+
+async function loadReconcileNoLogContext(authority, attempt, failure, closure, records) {
+  const runRoot = resolve(GENERATED_ROOT, authority.runId);
+  const logRoot = resolve(runRoot, "logs");
+  const evidenceRoot = resolve(runRoot, "orchestrator-evidence");
+  const preflightEvidenceRoot = resolve(runRoot, "preflight-evidence");
+  let secrets = new Map();
+  let summary;
+  try {
+    secrets = parseFeat126S10Secrets((await readSecureFile(
+      resolve(runRoot, "infra-secrets.env"),
+      4096,
+    )).toString("utf8"));
+  } catch {
+    if (failure?.phase !== "preflight_failed") fail("orchestrator_secret_store_invalid");
+  }
+  if (records.length !== 0) {
+    try {
+      summary = await readSecureJson(resolve(preflightEvidenceRoot, "summary.json"), 64 * 1024);
+      validateRepositorySummary(summary, authority.runId, authority.repositories);
+    } catch {
+      fail("orchestrator_existing_evidence_incomplete");
+    }
+  }
+  const byRole = new Map(records.map((record) => [record.role, record]));
+  const processes = {};
+  for (const [role, logName] of [
+    ["api", "api-orchestrator.log"],
+    ["fake", "fake-orchestrator.log"],
+    ["desktop", "desktop-orchestrator.log"],
+  ]) {
+    const record = byRole.get(role);
+    if (record) processes[role] = { record, logPath: resolve(logRoot, logName) };
+  }
+  const descendantProcesses = Object.fromEntries(
+    ["host", "runtime"].filter((role) => byRole.has(role)).map((role) => [role, byRole.get(role)]),
+  );
+  const context = {
+    ...authority,
+    attempt,
+    attemptFailure: failure,
+    attemptClosure: closure,
+    runRoot,
+    binRoot: resolve(runRoot, "bin"),
+    runRootPresent: true,
+    logRoot,
+    evidenceRoot,
+    preflightEvidenceRoot,
+    secrets,
+    summary,
+    phase: failure?.phase ?? "desktop_exited",
+    processes,
+    descendantProcesses,
+  };
+  await loadPersistedOwnershipEvidence(context, byRole);
+  try {
+    const apiVerifierBefore = await readSecureJson(
+      resolve(evidenceRoot, "api-verifier-before.v1.json"),
+    );
+    validateApiVerifierProjection(apiVerifierBefore, authority.runId);
+    context.apiVerifierBefore = apiVerifierBefore;
+  } catch {
+    if (byRole.has("api") && !["api_starting", "dependencies_ready"].includes(context.phase)) {
+      fail("orchestrator_existing_evidence_incomplete");
+    }
+  }
+  if (byRole.has("fake")) {
+    try {
+      context.fakeAuthorityBefore = validateClosedFakeAuthorityProjection(await readSecureJson(
+        resolve(evidenceRoot, "fake-authority-before.v1.json"),
+      ), context);
+    } catch {
+      if (context.phase !== "fake_starting") fail("orchestrator_existing_evidence_incomplete");
+    }
+  }
+  return context;
+}
+
+async function reconcileClaimedAttempt(authority, attempt) {
+  let ownerIdentity;
+  try {
+    ownerIdentity = await inspectProcessIdentity(attempt.marker.pid);
+  } catch {
+    fail("orchestrator_cleanup_unknown");
+  }
+  if (ownerIdentity && sameProcessIdentity(attempt.marker, ownerIdentity)) {
+    fail("orchestrator_existing_run_active");
+  }
+
+  const failure = await readOptionalAttemptFailure(attempt, authority);
+  const closure = await readOptionalAttemptClosure(attempt, authority);
+  const priorReconcile = await readOptionalAttemptReconcile(attempt, authority);
+  if (priorReconcile) fail("orchestrator_existing_run_reconciled");
+  if (
+    closure && (
+      (closure.status === "passed" && failure !== null) ||
+      (closure.status === "failed" && (
+        !failure || closure.failure_class !== failure.failure_class ||
+        closure.business_failure_class !== failure.business_failure_class ||
+        closure.cleanup_failure_class !== failure.cleanup_failure_class ||
+        closure.parent_failure_class !== failure.parent_failure_class
+      ))
+    )
+  ) fail("orchestrator_attempt_evidence_invalid");
+  const persistReconcile = async ({
+    businessStatus,
+    cleanup,
+    cleanupFailure,
+    noLog,
+    noLogFailure,
+  }) => await writeAttemptReconcile(
+    attempt,
+    authority,
+    buildAttemptReconcileEvidence(attempt, authority, failure, {
+      businessStatus,
+      cleanup,
+      cleanupFailure,
+      noLog,
+      noLogFailure,
+    }),
+  );
+  const runRoot = resolve(GENERATED_ROOT, authority.runId);
+  let runRootPresent = true;
+  try {
+    await lstat(runRoot);
+  } catch (error) {
+    if (error?.code !== "ENOENT") fail("orchestrator_run_root_invalid");
+    runRootPresent = false;
+  }
+
+  if (!runRootPresent) {
+    if (
+      closure || (failure && (
+        failure.run_root_present !== false || failure.phase !== "preflight_failed" ||
+        failure.compose_attempted !== false || failure.compose_cleanup_required !== false ||
+        failure.process_roles.length !== 0 || failure.retained_volume_keys.length !== 0
+      ))
+    ) {
+      fail("orchestrator_cleanup_unknown");
+    }
+    const retainedVolumeNames = await projectVolumeNames(authority.runId);
+    if (retainedVolumeNames.length !== 0) fail("orchestrator_cleanup_unknown");
+    const context = {
+      ...authority,
+      attempt,
+      attemptFailure: failure,
+      attemptClosure: closure,
+      runRoot,
+      runRootPresent: false,
+      phase: "preflight_failed",
+      composeAttempted: false,
+      composeCleanupRequired: false,
+      cleanupUnknown: false,
+      retainedVolumeNames,
+      processes: {},
+      secrets: new Map(),
+    };
+    let cleanup;
+    let cleanupFailure;
+    let noLog;
+    let noLogFailure;
+    try {
+      cleanup = await cleanupLiveContext(context);
+      validateCleanupClosure(cleanup);
+    } catch (error) {
+      cleanupFailure = error instanceof S10BO1OrchestratorError
+        ? error
+        : new S10BO1OrchestratorError("orchestrator_cleanup_unknown");
+    }
+    try {
+      noLog = await scanNoLog(context);
+      validateNoLogResult(noLog);
+    } catch (error) {
+      noLogFailure = error instanceof S10BO1OrchestratorError
+        ? error
+        : new S10BO1OrchestratorError("orchestrator_no_log_invalid");
+    }
+    await persistReconcile({
+      businessStatus: "not_applicable",
+      cleanup,
+      cleanupFailure,
+      noLog,
+      noLogFailure,
+    });
+    if (cleanupFailure) throw cleanupFailure;
+    if (noLogFailure) throw noLogFailure;
+    fail("orchestrator_existing_run_reconciled");
+  }
+
+  if (failure && failure.run_root_present !== true) fail("orchestrator_cleanup_unknown");
+  if (
+    failure && ((failure.phase === "desktop_starting" && failure.process_roles.includes("desktop")) || [
+      "desktop_spawned",
+      "component_ready",
+      "abort_sent",
+      "abort_complete",
+      "desktop_exited",
+    ].includes(failure.phase)) &&
+    failure.process_roles.length !== EXISTING_PROCESS_ROLES.length
+  ) fail("orchestrator_cleanup_unknown");
+  const expectedRoles = failure?.process_roles ?? EXISTING_PROCESS_ROLES;
+  const baselineVolumeNames = failure
+    ? volumeNamesFromKeys(authority.runId, failure.retained_volume_keys)
+    : volumeNamesFromKeys(authority.runId, S10_NAMED_VOLUME_KEYS);
+  let reconciled;
+  let cleanupFailure;
+  try {
+    reconciled = await reconcileExistingRun(authority, runRoot, {
+      expectedRoles,
+      composeCleanupRequired: failure?.compose_cleanup_required ?? true,
+      retainedVolumeNames: baselineVolumeNames,
+      scope: failure && ["preflight_failed", "preflight_context_invalid"].includes(failure.phase)
+        ? "preflight_artifacts"
+        : "run_artifacts",
+    });
+  } catch (error) {
+    cleanupFailure = error instanceof S10BO1OrchestratorError
+      ? error
+      : new S10BO1OrchestratorError("orchestrator_cleanup_unknown");
+  }
+  let noLog;
+  let noLogFailure;
+  let businessStatus = closure?.business_status ?? (
+    failure && [
+      "preflight_not_started",
+      "preflight_running",
+      "preflight_failed",
+      "preflight_context_invalid",
+      "desktop_building",
+      "desktop_built",
+      "dependencies_starting",
+      "dependencies_ready",
+      "api_starting",
+    ].includes(failure.phase) ? "not_applicable" : "unknown"
+  );
+  if (reconciled) {
+    try {
+      const noLogContext = await loadReconcileNoLogContext(
+        authority,
+        attempt,
+        failure,
+        closure,
+        reconciled.records,
+      );
+      noLog = await scanNoLog(noLogContext);
+      validateNoLogResult(noLog);
+      try {
+        const boundary = validateBusinessBoundaryEvidence(
+          await readSecureJson(resolve(noLogContext.evidenceRoot, "business-boundary.v1.json")),
+          authority.runId,
+        );
+        businessStatus = boundary.scope === "not_started" ? "not_applicable" : "passed";
+      } catch {
+        // A missing post-run boundary remains unknown unless the recorded phase predates API readiness.
+      }
+    } catch (error) {
+      noLogFailure = error instanceof S10BO1OrchestratorError
+        ? error
+        : new S10BO1OrchestratorError("orchestrator_no_log_invalid");
+    }
+  } else {
+    noLogFailure = new S10BO1OrchestratorError("orchestrator_no_log_invalid");
+  }
+  await persistReconcile({
+    businessStatus,
+    cleanup: reconciled?.cleanup,
+    cleanupFailure,
+    noLog,
+    noLogFailure,
+  });
+  if (cleanupFailure) throw cleanupFailure;
+  if (noLogFailure) throw noLogFailure;
+  if (businessStatus === "unknown" || businessStatus === "failed") {
+    fail("orchestrator_business_boundary_unknown");
+  }
   fail("orchestrator_existing_run_reconciled");
 }
 
 async function executeOrchestrator(authority) {
-  const operations = await createLiveOperations(authority);
+  const attempt = await claimAttemptLedger(authority);
+  if (!attempt.fresh) await reconcileClaimedAttempt(authority, attempt);
+  const operations = createLiveOperations(authority, attempt);
   const handlers = new Map();
   for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"]) {
     const handler = () => operations.parentDied();
@@ -2531,16 +4483,8 @@ async function executeOrchestrator(authority) {
   }
   const parentWatchdog = setInterval(() => operations.pollParentAlive(), 100);
   parentWatchdog.unref();
-  const runRoot = resolve(GENERATED_ROOT, authority.runId);
   try {
     operations.pollParentAlive();
-    try {
-      await lstat(runRoot);
-      await reconcileExistingRun(authority, runRoot);
-    } catch (error) {
-      if (error instanceof S10BO1OrchestratorError) throw error;
-      if (error?.code !== "ENOENT") fail("orchestrator_run_root_invalid");
-    }
     return await runStartupAbortFlow(authority, operations);
   } finally {
     clearInterval(parentWatchdog);
@@ -2557,8 +4501,7 @@ async function main() {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((error) => {
-    const code = error instanceof S10BO1OrchestratorError ? error.code : "orchestrator_internal_failure";
-    process.stderr.write(`${JSON.stringify({ schema_version: 1, status: "failed", failure_class: code })}\n`);
+    process.stderr.write(`${JSON.stringify(buildOrchestratorFailureEnvelope(error))}\n`);
     process.exitCode = 1;
   });
 }

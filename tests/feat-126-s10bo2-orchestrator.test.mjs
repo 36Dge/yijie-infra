@@ -98,12 +98,15 @@ function summary() {
 function cleanupResult(overrides = {}) {
   return {
     schema_version: 1,
+    scope: "run_artifacts",
     status: "passed",
     containers: 0,
     networks: 0,
     processes: 0,
     listeners: 0,
     temporary_volumes: 0,
+    named_volume_baseline_count: 4,
+    named_volume_after_count: 4,
     named_volumes_preserved: true,
     prune_executed: false,
     volume_delete_executed: false,
@@ -114,10 +117,30 @@ function cleanupResult(overrides = {}) {
 function noLogResult(overrides = {}) {
   return {
     schema_version: 1,
+    scope: "run_artifacts",
+    coverage: "all_run_log_and_evidence_sources",
     file_count: 4,
     row_count: 8,
     hit_count: 0,
+    external_source_count: 4,
+    external_row_count: 4,
+    external_source_set_sha256: "d".repeat(64),
     pattern_set_sha256: "c".repeat(64),
+    ...overrides,
+  };
+}
+
+function businessBoundaryResult(overrides = {}) {
+  return {
+    schema_version: 1,
+    status: "passed",
+    scope: "api_and_fake",
+    run_id: runId,
+    api_before_sha256: "d".repeat(64),
+    api_after_sha256: "d".repeat(64),
+    fake_accepted_calls: 0,
+    fake_rejected_calls: 0,
+    s10b_r8_executed: false,
     ...overrides,
   };
 }
@@ -211,7 +234,13 @@ function flowOperations(calls, overrides = {}) {
     async sendAbort() { calls.push("send:abort"); },
     async waitForDesktopExit() { calls.push("desktop_exit"); },
     async initiateDesktopAbort() { calls.push("desktop_abort"); },
+    async verifyBusinessBoundary() {
+      calls.push("business_boundary");
+      return businessBoundaryResult();
+    },
     async cleanup() { calls.push("cleanup"); return cleanupResult(); },
+    async recordFailure() {},
+    async recordClosure() {},
     async scanNoLog() { calls.push("no_log"); return noLogResult(); },
     ...overrides,
   };
@@ -379,7 +408,7 @@ test("S10BO2-006 executes the only allowed spawn and abort order", async () => {
   assert.deepEqual(calls, [
     "preflight", "build_desktop", "dependencies", "api", "fake", "desktop",
     "read:component_ready", "ownership", "send:abort", "read:abort_complete",
-    "read:eof", "desktop_exit", "cleanup", "no_log",
+    "read:eof", "desktop_exit", "business_boundary", "cleanup", "no_log",
   ]);
 });
 
@@ -399,7 +428,7 @@ test("S10BO2-007 unexpected exit initiates Desktop-owned abort then exact cleanu
     runStartupAbortFlow({ runId, repositories }, operations),
     (error) => errorCode(error) === "orchestrator_desktop_exited_early",
   );
-  assert.deepEqual(calls.slice(-3), ["desktop_abort", "cleanup", "no_log"]);
+  assert.deepEqual(calls.slice(-4), ["desktop_abort", "business_boundary", "cleanup", "no_log"]);
 
   const parentDeathCalls = [];
   await assert.rejects(
@@ -410,7 +439,7 @@ test("S10BO2-007 unexpected exit initiates Desktop-owned abort then exact cleanu
     })),
     (error) => errorCode(error) === "orchestrator_parent_death",
   );
-  assert.deepEqual(parentDeathCalls.slice(-2), ["cleanup", "no_log"]);
+  assert.deepEqual(parentDeathCalls.slice(-3), ["business_boundary", "cleanup", "no_log"]);
 });
 
 test("S10BO2-007 detects actual parent disappearance and aborts a long command", async (t) => {
@@ -684,7 +713,7 @@ test("S10BO2-011 incomplete existing-run evidence and unknown cleanup fail close
     runStartupAbortFlow({ runId, repositories }, operations),
     (error) => errorCode(error) === "orchestrator_cleanup_unknown",
   );
-  assert.deepEqual(calls.slice(-2), ["cleanup", "no_log"]);
+  assert.deepEqual(calls.slice(-3), ["business_boundary", "cleanup", "no_log"]);
 
   const precedenceCalls = [];
   await assert.rejects(
@@ -883,6 +912,16 @@ test("S10BO2-013 scans all evidence roots and fails closed when a root is missin
   const preflightEvidenceRoot = resolve(runRoot, "preflight-evidence");
   const hostRoot = resolve(runRoot, "host");
   const hostInstance = resolve(hostRoot, nonce);
+  const attemptMarker = resolve(runRoot, "attempt.v1.json");
+  const runtimeLogScan = {
+    schema_version: 1,
+    status: "passed",
+    run_id: runId,
+    source_count: 4,
+    row_count: 0,
+    hit_count: 0,
+    source_set_sha256: "e".repeat(64),
+  };
   for (const directory of [logRoot, evidenceRoot, preflightEvidenceRoot, hostRoot, hostInstance]) {
     await mkdir(directory, { mode: 0o700 });
     await chmod(directory, 0o700);
@@ -891,7 +930,9 @@ test("S10BO2-013 scans all evidence roots and fails closed when a root is missin
     [resolve(logRoot, "desktop.log"), ""],
     [resolve(evidenceRoot, "desktop.json"), '{"status":"ok"}\n'],
     [resolve(preflightEvidenceRoot, "summary.json"), '{"status":"ok"}\n'],
+    [resolve(evidenceRoot, "runtime-log-scan.v1.json"), `${JSON.stringify(runtimeLogScan)}\n`],
     [resolve(hostInstance, "stdout.log"), ""],
+    [attemptMarker, '{"status":"claimed"}\n'],
   ]) {
     await writeFile(path, value, { mode: 0o600 });
     await chmod(path, 0o600);
@@ -901,10 +942,12 @@ test("S10BO2-013 scans all evidence roots and fails closed when a root is missin
     logRoot,
     evidenceRoot,
     preflightEvidenceRoot,
+    attempt: { markerPath: attemptMarker },
     secrets: new Map([["credential", "secret-value-never-log"]]),
+    runtimeLogScan,
   };
   const clean = await scanNoLog(context);
-  assert.equal(clean.file_count, 4);
+  assert.equal(clean.file_count, 6);
   assert.equal(clean.hit_count, 0);
   assert.equal(
     (await scanNoLog({

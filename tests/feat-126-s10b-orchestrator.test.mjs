@@ -135,11 +135,24 @@ test("S10BO1-012 Desktop driver is test-profile, nonce and PKCE bound", () => {
 });
 
 test("S10BO1-013 cleanup is exact and preserves named volumes", () => {
-  assert.equal(validateCleanupClosure({ schema_version: 1, status: "passed", containers: 0, networks: 0, processes: 0, listeners: 0, temporary_volumes: 0, named_volumes_preserved: true, prune_executed: false, volume_delete_executed: false }), true);
-  assert.equal(errorCode(() => validateCleanupClosure({ schema_version: 1, status: "passed", containers: 0, networks: 0, processes: 0, listeners: 0, temporary_volumes: 0, named_volumes_preserved: false, prune_executed: false, volume_delete_executed: false })), "orchestrator_cleanup_incomplete");
+  const cleanup = { schema_version: 1, scope: "run_artifacts", status: "passed", containers: 0, networks: 0, processes: 0, listeners: 0, temporary_volumes: 0, named_volume_baseline_count: 4, named_volume_after_count: 4, named_volumes_preserved: true, prune_executed: false, volume_delete_executed: false };
+  assert.equal(validateCleanupClosure(cleanup), true);
+  assert.equal(errorCode(() => validateCleanupClosure({ ...cleanup, named_volumes_preserved: false })), "orchestrator_cleanup_incomplete");
 });
 
 test("S10BO1-014 no-log result requires zero hits", () => {
-  assert.equal(validateNoLogResult({ schema_version: 1, file_count: 8, row_count: 12, hit_count: 0, pattern_set_sha256: "c".repeat(64) }), true);
-  assert.equal(errorCode(() => validateNoLogResult({ schema_version: 1, file_count: 8, row_count: 12, hit_count: 1, pattern_set_sha256: "c".repeat(64) })), "orchestrator_no_log_invalid");
+  const noLog = {
+    schema_version: 1,
+    scope: "run_artifacts",
+    coverage: "all_run_log_and_evidence_sources",
+    file_count: 8,
+    row_count: 12,
+    hit_count: 0,
+    external_source_count: 4,
+    external_row_count: 4,
+    external_source_set_sha256: "b".repeat(64),
+    pattern_set_sha256: "c".repeat(64),
+  };
+  assert.equal(validateNoLogResult(noLog), true);
+  assert.equal(errorCode(() => validateNoLogResult({ ...noLog, hit_count: 1 })), "orchestrator_no_log_invalid");
 });
