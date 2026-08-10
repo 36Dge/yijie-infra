@@ -185,6 +185,9 @@ feat-126-s10b-orchestrator:
 	@test -n "$(DESKTOP_SHA)" || (echo "DESKTOP_SHA is required" >&2; exit 2)
 	@test -n "$(RUNTIME_SHA)" || (echo "RUNTIME_SHA is required" >&2; exit 2)
 	@test -n "$(INFRA_SHA)" || (echo "INFRA_SHA is required" >&2; exit 2)
+	@NODE_PATH="$$(command -v node)"; \
+		test -n "$$NODE_PATH" || (echo "absolute node path is required" >&2; exit 2); \
+		case "$$NODE_PATH" in /*) ;; *) echo "absolute node path is required" >&2; exit 2 ;; esac; \
 	FEAT126_S10B_GOVERNANCE_SHA="$(GOVERNANCE_SHA)" \
 	FEAT126_S10B_CONTRACTS_SHA="$(CONTRACTS_SHA)" \
 	FEAT126_S10B_API_SHA="$(API_SHA)" \
@@ -192,7 +195,7 @@ feat-126-s10b-orchestrator:
 	FEAT126_S10B_DESKTOP_SHA="$(DESKTOP_SHA)" \
 	FEAT126_S10B_RUNTIME_SHA="$(RUNTIME_SHA)" \
 	FEAT126_S10B_INFRA_SHA="$(INFRA_SHA)" \
-		node scripts/feat-126-s10b-orchestrator.mjs "$(RUN_ID)"
+		"$$NODE_PATH" scripts/feat-126-s10b-orchestrator.mjs "$(RUN_ID)"
 
 lint:
 	./scripts/plan.sh

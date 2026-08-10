@@ -912,6 +912,7 @@ test("S10BO2-013 scans all evidence roots and fails closed when a root is missin
   const preflightEvidenceRoot = resolve(runRoot, "preflight-evidence");
   const hostRoot = resolve(runRoot, "host");
   const hostInstance = resolve(hostRoot, nonce);
+  const attemptPreclaim = resolve(runRoot, "preclaim.v1.json");
   const attemptMarker = resolve(runRoot, "attempt.v1.json");
   const runtimeLogScan = {
     schema_version: 1,
@@ -932,6 +933,7 @@ test("S10BO2-013 scans all evidence roots and fails closed when a root is missin
     [resolve(preflightEvidenceRoot, "summary.json"), '{"status":"ok"}\n'],
     [resolve(evidenceRoot, "runtime-log-scan.v1.json"), `${JSON.stringify(runtimeLogScan)}\n`],
     [resolve(hostInstance, "stdout.log"), ""],
+    [attemptPreclaim, '{"status":"reserved"}\n'],
     [attemptMarker, '{"status":"claimed"}\n'],
   ]) {
     await writeFile(path, value, { mode: 0o600 });
@@ -942,12 +944,12 @@ test("S10BO2-013 scans all evidence roots and fails closed when a root is missin
     logRoot,
     evidenceRoot,
     preflightEvidenceRoot,
-    attempt: { markerPath: attemptMarker },
+    attempt: { preclaimPath: attemptPreclaim, markerPath: attemptMarker },
     secrets: new Map([["credential", "secret-value-never-log"]]),
     runtimeLogScan,
   };
   const clean = await scanNoLog(context);
-  assert.equal(clean.file_count, 6);
+  assert.equal(clean.file_count, 7);
   assert.equal(clean.hit_count, 0);
   assert.equal(
     (await scanNoLog({
@@ -973,6 +975,14 @@ test("S10BO2-013 scans all evidence roots and fails closed when a root is missin
   await writeFile(apiEvidence, `${JSON.stringify(processRecord("api", 0))}\n`, { mode: 0o600 });
   await chmod(apiEvidence, 0o600);
   assert.equal((await scanNoLog(processContext)).hit_count, 0);
+
+  await unlink(attemptPreclaim);
+  await assert.rejects(
+    scanNoLog(context),
+    (error) => errorCode(error) === "orchestrator_no_log_invalid",
+  );
+  await writeFile(attemptPreclaim, '{"status":"reserved"}\n', { mode: 0o600 });
+  await chmod(attemptPreclaim, 0o600);
 
   const sensitive = resolve(evidenceRoot, "leak.json");
   await writeFile(

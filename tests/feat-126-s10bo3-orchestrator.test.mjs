@@ -38,6 +38,7 @@ import {
   persistedOwnershipEvidenceRequiredFiles,
   readAttemptClosure,
   readAttemptFailure,
+  readAttemptPreclaimFailure,
   readAttemptReconcile,
   runStartupAbortFlow,
   scanNoLog,
@@ -45,6 +46,8 @@ import {
   validateAttemptClosure,
   validateAttemptFailure,
   validateAttemptMarker,
+  validateAttemptPreclaim,
+  validateAttemptPreclaimFailure,
   validateAttemptReconcile,
   validateBusinessBoundaryEvidence,
   validateCleanupClosure,
@@ -487,6 +490,52 @@ test("S10BO3-004 attempt ledger consumes a run ID exactly once with O_EXCL", asy
   assert.equal(claimed.filter((value) => !value.fresh).length, 1);
 });
 
+test("S10BO3 corrective reserves the run before process identity and persists a terminal failure", async (t) => {
+  const root = await canonicalTemporaryRoot(t, "feat126-s10b-preclaim-");
+  const attemptRoot = resolve(root, "attempts");
+  await assert.rejects(
+    claimAttemptLedger(authority, {
+      attemptRoot,
+      scriptSha256,
+      async inspectIdentity() {
+        throw new S10BO1OrchestratorError("orchestrator_process_identity_unknown");
+      },
+    }),
+    codeIs("orchestrator_process_identity_unknown"),
+  );
+
+  const preclaimPath = resolve(attemptRoot, `${runId}.preclaim.v1.json`);
+  const preclaimFailurePath = resolve(attemptRoot, `${runId}.preclaim-failure.v1.json`);
+  const markerPath = resolve(attemptRoot, `${runId}.attempt.v1.json`);
+  assert.equal((await lstat(attemptRoot)).mode & 0o777, 0o700);
+  assert.equal((await lstat(preclaimPath)).mode & 0o777, 0o600);
+  assert.equal((await lstat(preclaimFailurePath)).mode & 0o777, 0o600);
+  await assert.rejects(lstat(markerPath), (error) => error?.code === "ENOENT");
+
+  const preclaim = validateAttemptPreclaim(JSON.parse(await readFile(preclaimPath, "utf8")), authority);
+  const failure = await readAttemptPreclaimFailure(preclaimFailurePath, authority);
+  assert.equal(failure.failure_class, "orchestrator_process_identity_unknown");
+  assert.equal(failure.preclaim_sha256, sha256(canonicalJsonBytes(preclaim)));
+  assert.equal(validateAttemptPreclaimFailure(failure, authority).s10b_r8_executed, false);
+  assert.doesNotMatch(
+    JSON.stringify({ preclaim, failure }),
+    /bearer|credential|dsn|private[\s_-]*key|"(?:argv|env|path|payload|secret)"/i,
+  );
+
+  await assert.rejects(
+    claimAttemptLedger(authority, { attemptRoot, identity, scriptSha256 }),
+    codeIs("orchestrator_existing_preclaim_failed"),
+  );
+});
+
+test("S10BO3 corrective invokes the canonical orchestrator with an absolute Node path", async () => {
+  const makefile = await readFile("Makefile", "utf8");
+  assert.match(makefile, /NODE_PATH="\$\$\(command -v node\)"/);
+  assert.match(makefile, /case "\$\$NODE_PATH" in \/\*\)/);
+  assert.match(makefile, /"\$\$NODE_PATH" scripts\/feat-126-s10b-orchestrator\.mjs/);
+  assert.doesNotMatch(makefile, /\n\s*node scripts\/feat-126-s10b-orchestrator\.mjs/);
+});
+
 test("S10BO3-005 rejects malformed, symlinked, hard-linked, or authority-drifted attempt evidence", async (t) => {
   assert.throws(
     () => validateAttemptMarker({ ...attemptMarker(), unexpected: true }, authority),
@@ -591,9 +640,9 @@ test("S10BO3-006 failure evidence is immutable, strict, and bound to the consume
 });
 
 test("S10BO3-007 establishes content-free no-log evidence when preflight never created run root", async (t) => {
-  const { root, attempt, failure } = await writeSyntheticAttemptFiles(t, "feat126-s10bo3-absent-");
-  await writeFile(attempt.failurePath, `${JSON.stringify(failure)}\n`, { mode: 0o600 });
-  await chmod(attempt.failurePath, 0o600);
+  const { root, attempt } = await claimTemporaryAttempt(t, "feat126-s10bo3-absent-");
+  const failure = attemptFailure({ attempt_marker_sha256: attempt.markerSha256 });
+  await writeAttemptFailure(attempt, authority, failure);
   const runRoot = resolve(root, "absent-run-root");
   const context = {
     ...authority,
@@ -609,10 +658,10 @@ test("S10BO3-007 establishes content-free no-log evidence when preflight never c
     secrets: new Map(),
   };
   const result = await scanNoLog(context);
-  assert.equal(result.file_count, 2);
+  assert.equal(result.file_count, 3);
   assert.equal(result.scope, "attempt_only");
-  assert.equal(result.coverage, "attempt_marker_and_failure");
-  assert.equal(result.row_count, 2);
+  assert.equal(result.coverage, "preclaim_marker_and_failure");
+  assert.equal(result.row_count, 3);
   assert.equal(result.hit_count, 0);
   assert.equal(validateNoLogResult(result), true);
 
@@ -631,9 +680,9 @@ test("S10BO3-007 establishes content-free no-log evidence when preflight never c
 
   const markerOnly = await scanNoLog({ ...context, attemptFailure: undefined });
   assert.equal(markerOnly.scope, "attempt_only");
-  assert.equal(markerOnly.coverage, "attempt_marker_only");
-  assert.equal(markerOnly.file_count, 1);
-  assert.equal(markerOnly.row_count, 1);
+  assert.equal(markerOnly.coverage, "preclaim_and_marker");
+  assert.equal(markerOnly.file_count, 2);
+  assert.equal(markerOnly.row_count, 2);
   assert.equal(markerOnly.hit_count, 0);
   assert.equal(validateNoLogResult(markerOnly), true);
 

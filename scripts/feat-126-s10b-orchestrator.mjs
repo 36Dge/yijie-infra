@@ -67,6 +67,24 @@ const PREFLIGHT_MAKE_SHA_KEYS = Object.freeze([
   ["runtime", "RUNTIME_SHA"],
   ["infra", "INFRA_SHA"],
 ]);
+const ATTEMPT_PRECLAIM_KEYS = Object.freeze([
+  "kind",
+  "pid",
+  "ppid",
+  "repositories",
+  "run_id",
+  "schema_version",
+  "s10b_r8_executed",
+  "status",
+]);
+const ATTEMPT_PRECLAIM_FAILURE_KEYS = Object.freeze([
+  "failure_class",
+  "preclaim_sha256",
+  "run_id",
+  "schema_version",
+  "s10b_r8_executed",
+  "status",
+]);
 const ATTEMPT_MARKER_KEYS = Object.freeze([
   "binary_sha256",
   "kind",
@@ -1071,15 +1089,28 @@ export function validateNoLogResult(value) {
       "attempt_marker_and_failure",
       "attempt_ledger",
       "attempt_marker_only",
+      "preclaim_and_marker",
+      "preclaim_marker_and_failure",
+      "preclaim_attempt_ledger",
       "all_preflight_log_and_evidence_sources",
       "all_run_log_and_evidence_sources",
     ].includes(value.coverage) ||
     (value.scope === "attempt_only" && (
-      !["attempt_marker_only", "attempt_marker_and_failure", "attempt_ledger"].includes(value.coverage) ||
+      ![
+        "attempt_marker_only",
+        "attempt_marker_and_failure",
+        "attempt_ledger",
+        "preclaim_and_marker",
+        "preclaim_marker_and_failure",
+        "preclaim_attempt_ledger",
+      ].includes(value.coverage) ||
       value.file_count !== ({
         attempt_marker_only: 1,
         attempt_marker_and_failure: 2,
         attempt_ledger: 3,
+        preclaim_and_marker: 2,
+        preclaim_marker_and_failure: 3,
+        preclaim_attempt_ledger: 4,
       })[value.coverage]
     )) ||
     (value.scope === "preflight_artifacts" &&
@@ -1672,6 +1703,34 @@ function validateAttemptRepositories(repositories, expected) {
   );
 }
 
+export function validateAttemptPreclaim(value, authority) {
+  if (
+    value === null || Array.isArray(value) || typeof value !== "object" ||
+    !exactKeys(value, ATTEMPT_PRECLAIM_KEYS) || value.schema_version !== 1 ||
+    value.kind !== "feat126-s10b-preclaim" || value.status !== "reserved" ||
+    value.run_id !== authority?.runId || value.s10b_r8_executed !== false ||
+    !validateAttemptRepositories(value.repositories, authority?.repositories ?? {}) ||
+    !Number.isSafeInteger(value.pid) || value.pid <= 1 ||
+    !Number.isSafeInteger(value.ppid) || value.ppid <= 0
+  ) {
+    fail("orchestrator_attempt_evidence_invalid");
+  }
+  return Object.freeze({ ...value, repositories: Object.freeze({ ...value.repositories }) });
+}
+
+export function validateAttemptPreclaimFailure(value, authority) {
+  if (
+    value === null || Array.isArray(value) || typeof value !== "object" ||
+    !exactKeys(value, ATTEMPT_PRECLAIM_FAILURE_KEYS) || value.schema_version !== 1 ||
+    value.status !== "failed" || value.run_id !== authority?.runId ||
+    value.s10b_r8_executed !== false || !DIGEST_PATTERN.test(value.preclaim_sha256 ?? "") ||
+    !/^[a-z][a-z0-9_]{0,127}$/.test(value.failure_class ?? "")
+  ) {
+    fail("orchestrator_attempt_evidence_invalid");
+  }
+  return Object.freeze({ ...value });
+}
+
 const ATTEMPT_PHASE_PROCESS_RULES = Object.freeze({
   created: Object.freeze({ required: [], allowed: [] }),
   preflight_not_started: Object.freeze({ required: [], allowed: [] }),
@@ -1902,6 +1961,13 @@ function attemptPaths(attemptRoot, runId) {
   });
 }
 
+function preclaimPaths(attemptRoot, runId) {
+  return Object.freeze({
+    preclaimPath: resolve(attemptRoot, `${runId}.preclaim.v1.json`),
+    preclaimFailurePath: resolve(attemptRoot, `${runId}.preclaim-failure.v1.json`),
+  });
+}
+
 async function requireAttemptBinding(attempt, authority) {
   const expected = attemptPaths(attempt?.attemptRoot ?? "", authority?.runId ?? "");
   if (
@@ -1918,6 +1984,33 @@ async function requireAttemptBinding(attempt, authority) {
     true,
   );
   if (observed.digest !== attempt.markerSha256) fail("orchestrator_attempt_evidence_invalid");
+  const hasPreclaim = [
+    attempt.preclaimPath,
+    attempt.preclaimFailurePath,
+    attempt.preclaimSha256,
+    attempt.preclaim,
+  ].some((value) => value !== undefined);
+  if (hasPreclaim) {
+    const preclaimExpected = preclaimPaths(attempt.attemptRoot, authority.runId);
+    if (
+      attempt.preclaimPath !== preclaimExpected.preclaimPath ||
+      attempt.preclaimFailurePath !== preclaimExpected.preclaimFailurePath ||
+      !DIGEST_PATTERN.test(attempt.preclaimSha256 ?? "")
+    ) fail("orchestrator_attempt_evidence_invalid");
+    const preclaimObserved = await readAttemptJson(
+      attempt.preclaimPath,
+      4096,
+      validateAttemptPreclaim,
+      authority,
+      true,
+    );
+    if (
+      preclaimObserved.digest !== attempt.preclaimSha256 ||
+      preclaimObserved.value.pid !== observed.value.pid ||
+      preclaimObserved.value.ppid !== observed.value.ppid
+    ) fail("orchestrator_attempt_evidence_invalid");
+    await requireAbsentAttemptArtifact(attempt.preclaimFailurePath);
+  }
   return observed.value;
 }
 
@@ -1931,32 +2024,222 @@ async function requireAbsentAttemptArtifact(path) {
   fail("orchestrator_attempt_evidence_invalid");
 }
 
-export async function claimAttemptLedger(authority, options = {}) {
-  buildPreflightMakeInvocation(authority);
-  const attemptRoot = options.attemptRoot ?? ATTEMPT_ROOT;
-  await ensureOwnerOnlyDirectory(attemptRoot);
-  let identity = options.identity;
-  if (!identity) identity = await inspectProcessIdentity(process.pid);
-  if (!identity || identity.pid !== process.pid) fail("orchestrator_process_identity_unknown");
-  const scriptSha256 = options.scriptSha256 ?? await hashFile(fileURLToPath(import.meta.url));
-  if (!DIGEST_PATTERN.test(scriptSha256 ?? "")) fail("orchestrator_attempt_evidence_invalid");
+async function pathExists(path) {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if (error?.code === "ENOENT") return false;
+    fail("orchestrator_attempt_evidence_invalid");
+  }
+}
+
+async function createAttemptPreclaim(path, value) {
+  let handle;
+  try {
+    handle = await open(
+      path,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    await handle.writeFile(canonicalJsonBytes(value));
+    await handle.chmod(0o600);
+    await handle.sync();
+    return true;
+  } catch (error) {
+    if (error?.code === "EEXIST") return false;
+    fail("orchestrator_attempt_evidence_invalid");
+  } finally {
+    await handle?.close();
+  }
+}
+
+async function readAttemptPreclaim(path, authority, includeDigest = false) {
+  return await readAttemptJson(path, 4096, validateAttemptPreclaim, authority, includeDigest);
+}
+
+export async function readAttemptPreclaimFailure(path, authority) {
+  return await readAttemptJson(path, 4096, validateAttemptPreclaimFailure, authority);
+}
+
+async function persistAttemptPreclaimFailure(preclaim, authority, error) {
+  const primary = error instanceof S10BO1OrchestratorError
+    ? error
+    : new S10BO1OrchestratorError("orchestrator_internal_failure");
+  const failure = validateAttemptPreclaimFailure({
+    schema_version: 1,
+    status: "failed",
+    run_id: authority.runId,
+    preclaim_sha256: preclaim.preclaimSha256,
+    failure_class: primary.code,
+    s10b_r8_executed: false,
+  }, authority);
+  try {
+    await writeSecureJson(preclaim.preclaimFailurePath, failure);
+  } catch {
+    throw new S10BO1OrchestratorError(primary.code, {
+      business_failure_class: null,
+      cleanup_failure_class: null,
+      evidence_failure_class: "orchestrator_evidence_write_failed",
+      no_log_failure_class: null,
+      parent_failure_class: null,
+    });
+  }
+  throw primary;
+}
+
+async function loadExistingAttempt(authority, attemptRoot, identity, scriptSha256) {
   const { markerPath, failurePath, closurePath, reconcilePath } = attemptPaths(
     attemptRoot,
     authority.runId,
   );
-  const marker = validateAttemptMarker({
+  let existing;
+  for (let readAttempt = 0; readAttempt < 50; readAttempt += 1) {
+    try {
+      existing = await readAttemptJson(markerPath, 4096, validateAttemptMarker, authority, true);
+      break;
+    } catch (error) {
+      if (readAttempt === 49) throw error;
+      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+    }
+  }
+  if (
+    existing.value.script_sha256 !== scriptSha256 ||
+    existing.value.binary_sha256 !== identity.binary_sha256
+  ) fail("orchestrator_attempt_evidence_invalid");
+  const preclaim = preclaimPaths(attemptRoot, authority.runId);
+  let preclaimBinding = {};
+  if (await pathExists(preclaim.preclaimPath)) {
+    const observed = await readAttemptPreclaim(preclaim.preclaimPath, authority, true);
+    if (
+      observed.value.pid !== existing.value.pid || observed.value.ppid !== existing.value.ppid ||
+      await pathExists(preclaim.preclaimFailurePath)
+    ) fail("orchestrator_attempt_evidence_invalid");
+    preclaimBinding = {
+      ...preclaim,
+      preclaimSha256: observed.digest,
+      preclaim: observed.value,
+    };
+  }
+  return Object.freeze({
+    fresh: false,
+    attemptRoot,
+    markerPath,
+    failurePath,
+    closurePath,
+    reconcilePath,
+    markerSha256: existing.digest,
+    marker: existing.value,
+    ...preclaimBinding,
+  });
+}
+
+export async function claimAttemptLedger(authority, options = {}) {
+  buildPreflightMakeInvocation(authority);
+  const attemptRoot = options.attemptRoot ?? ATTEMPT_ROOT;
+  await ensureOwnerOnlyDirectory(attemptRoot);
+  const { markerPath, failurePath, closurePath, reconcilePath } = attemptPaths(
+    attemptRoot,
+    authority.runId,
+  );
+  const preclaim = preclaimPaths(attemptRoot, authority.runId);
+  const inspectIdentity = options.inspectIdentity ?? inspectProcessIdentity;
+  const resolveIdentity = async () => {
+    const identity = options.identity ?? await inspectIdentity(process.pid);
+    if (!identity || identity.pid !== process.pid) fail("orchestrator_process_identity_unknown");
+    return identity;
+  };
+  const resolveScriptSha256 = async () => {
+    const scriptSha256 = options.scriptSha256 ?? await hashFile(fileURLToPath(import.meta.url));
+    if (!DIGEST_PATTERN.test(scriptSha256 ?? "")) fail("orchestrator_attempt_evidence_invalid");
+    return scriptSha256;
+  };
+
+  if (await pathExists(markerPath)) {
+    return await loadExistingAttempt(
+      authority,
+      attemptRoot,
+      await resolveIdentity(),
+      await resolveScriptSha256(),
+    );
+  }
+
+  const preclaimValue = validateAttemptPreclaim({
     schema_version: 1,
-    kind: "feat126-s10bo2-attempt",
-    status: "claimed",
+    kind: "feat126-s10b-preclaim",
+    status: "reserved",
     run_id: authority.runId,
     repositories: authority.repositories,
-    pid: identity.pid,
-    ppid: identity.ppid,
-    start_identity: identity.start_identity,
-    binary_sha256: identity.binary_sha256,
-    script_sha256: scriptSha256,
+    pid: process.pid,
+    ppid: Math.max(process.ppid, 1),
     s10b_r8_executed: false,
   }, authority);
+  const preclaimFresh = await createAttemptPreclaim(preclaim.preclaimPath, preclaimValue);
+  if (!preclaimFresh) {
+    let existingPreclaim;
+    for (let readPreclaim = 0; readPreclaim < 50; readPreclaim += 1) {
+      try {
+        existingPreclaim = await readAttemptPreclaim(
+          preclaim.preclaimPath,
+          authority,
+          true,
+        );
+        break;
+      } catch (error) {
+        if (readPreclaim === 49) throw error;
+        await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+      }
+    }
+    for (let wait = 0; wait < 120; wait += 1) {
+      if (await pathExists(markerPath)) {
+        return await loadExistingAttempt(
+          authority,
+          attemptRoot,
+          await resolveIdentity(),
+          await resolveScriptSha256(),
+        );
+      }
+      if (await pathExists(preclaim.preclaimFailurePath)) {
+        const failure = await readAttemptPreclaimFailure(preclaim.preclaimFailurePath, authority);
+        if (failure.preclaim_sha256 !== existingPreclaim.digest) {
+          fail("orchestrator_attempt_evidence_invalid");
+        }
+        fail("orchestrator_existing_preclaim_failed");
+      }
+      await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+    }
+    fail("orchestrator_preclaim_incomplete");
+  }
+  const preclaimBinding = Object.freeze({
+    ...preclaim,
+    preclaimSha256: sha256(canonicalJsonBytes(preclaimValue)),
+    preclaim: preclaimValue,
+  });
+
+  let identity;
+  let scriptSha256;
+  let marker;
+  try {
+    identity = await resolveIdentity();
+    if (identity.ppid !== preclaimValue.ppid) fail("orchestrator_process_identity_unknown");
+    scriptSha256 = await resolveScriptSha256();
+    await requireAbsentAttemptArtifact(preclaim.preclaimFailurePath);
+    marker = validateAttemptMarker({
+      schema_version: 1,
+      kind: "feat126-s10bo2-attempt",
+      status: "claimed",
+      run_id: authority.runId,
+      repositories: authority.repositories,
+      pid: identity.pid,
+      ppid: identity.ppid,
+      start_identity: identity.start_identity,
+      binary_sha256: identity.binary_sha256,
+      script_sha256: scriptSha256,
+      s10b_r8_executed: false,
+    }, authority);
+  } catch (error) {
+    await persistAttemptPreclaimFailure(preclaimBinding, authority, error);
+  }
   const markerBytes = canonicalJsonBytes(marker);
   const markerSha256 = sha256(markerBytes);
   let handle;
@@ -1981,36 +2264,20 @@ export async function claimAttemptLedger(authority, options = {}) {
       reconcilePath,
       markerSha256,
       marker,
+      ...preclaimBinding,
     });
   } catch (error) {
-    if (error?.code !== "EEXIST") fail("orchestrator_attempt_evidence_invalid");
+    if (error?.code !== "EEXIST") {
+      await persistAttemptPreclaimFailure(
+        preclaimBinding,
+        authority,
+        new S10BO1OrchestratorError("orchestrator_attempt_evidence_invalid"),
+      );
+    }
   } finally {
     await handle?.close();
   }
-  let existing;
-  for (let readAttempt = 0; readAttempt < 50; readAttempt += 1) {
-    try {
-      existing = await readAttemptJson(markerPath, 4096, validateAttemptMarker, authority, true);
-      break;
-    } catch (error) {
-      if (readAttempt === 49) throw error;
-      await new Promise((resolveWait) => setTimeout(resolveWait, 10));
-    }
-  }
-  if (
-    existing.value.script_sha256 !== scriptSha256 ||
-    existing.value.binary_sha256 !== identity.binary_sha256
-  ) fail("orchestrator_attempt_evidence_invalid");
-  return Object.freeze({
-    fresh: false,
-    attemptRoot,
-    markerPath,
-    failurePath,
-    closurePath,
-    reconcilePath,
-    markerSha256: existing.digest,
-    marker: existing.value,
-  });
+  return await loadExistingAttempt(authority, attemptRoot, identity, scriptSha256);
 }
 
 export async function writeAttemptFailure(attempt, authority, value) {
@@ -3320,20 +3587,26 @@ export async function scanNoLog(context) {
         fail("orchestrator_no_log_invalid");
       }
     }
+    const hasPreclaim = typeof context.attempt.preclaimPath === "string";
     const files = [
+      ...(hasPreclaim ? [context.attempt.preclaimPath] : []),
       context.attempt.markerPath,
       ...(context.attemptFailure ? [context.attempt.failurePath] : []),
       ...(context.attemptClosure ? [context.attempt.closurePath] : []),
     ].sort();
     const scan = await scanNoLogFiles(files, literalPatterns, forbiddenPatterns);
+    let coverage;
+    if (context.attemptClosure) {
+      coverage = hasPreclaim ? "preclaim_attempt_ledger" : "attempt_ledger";
+    } else if (context.attemptFailure) {
+      coverage = hasPreclaim ? "preclaim_marker_and_failure" : "attempt_marker_and_failure";
+    } else {
+      coverage = hasPreclaim ? "preclaim_and_marker" : "attempt_marker_only";
+    }
     return Object.freeze({
       schema_version: 1,
       scope: "attempt_only",
-      coverage: context.attemptClosure
-        ? "attempt_ledger"
-        : context.attemptFailure
-          ? "attempt_marker_and_failure"
-          : "attempt_marker_only",
+      coverage,
       file_count: files.length,
       row_count: scan.rowCount,
       hit_count: scan.hitCount,
@@ -3370,6 +3643,7 @@ export async function scanNoLog(context) {
       ...(await Promise.all(
         scanRoots.map(([root, required, excluded]) => listInspectableFiles(root, required, excluded)),
       )).flat(),
+      ...(typeof context.attempt.preclaimPath === "string" ? [context.attempt.preclaimPath] : []),
       context.attempt.markerPath,
       ...(context.attemptFailure ? [context.attempt.failurePath] : []),
       ...(context.attemptClosure ? [context.attempt.closurePath] : []),
@@ -3378,7 +3652,10 @@ export async function scanNoLog(context) {
   } catch {
     fail("orchestrator_no_log_invalid");
   }
-  const requiredFiles = new Set([context.attempt.markerPath]);
+  const requiredFiles = new Set([
+    ...(typeof context.attempt.preclaimPath === "string" ? [context.attempt.preclaimPath] : []),
+    context.attempt.markerPath,
+  ]);
   if (context.phase === "preflight_failed") {
     requiredFiles.add(resolve(context.preflightEvidenceRoot, PREFLIGHT_FAILURE_EVIDENCE_FILE));
     requiredFiles.add(context.attempt.failurePath);
