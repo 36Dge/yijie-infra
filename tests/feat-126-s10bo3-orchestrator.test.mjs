@@ -462,6 +462,55 @@ test("S10BO3-003 retains the primary failure and reports all closure failures as
   });
 });
 
+test("S10BO3 corrective persists a known no-log scope when the completed scan fails", async () => {
+  let recordedClosure;
+  let observed;
+  await assert.rejects(
+    runStartupAbortFlow(authority, {
+      async runPreflight() {
+        throw new S10BO1OrchestratorError("preflight_authority_invalid");
+      },
+      async initiateDesktopAbort() {},
+      async verifyBusinessBoundary() {
+        return buildBusinessBoundaryEvidence(null, null, null, runId);
+      },
+      async cleanup() { return cleanupResult(); },
+      async recordFailure() {},
+      async scanNoLog() {
+        return noLogResult({
+          scope: "preflight_artifacts",
+          coverage: "all_preflight_log_and_evidence_sources",
+          file_count: 3,
+          row_count: 3,
+          hit_count: 1,
+        });
+      },
+      async recordClosure(value) {
+        const projected = attemptClosure({
+          failure_class: value.failureClass,
+          business_failure_class: value.businessFailureClass,
+          business_status: value.businessStatus,
+          cleanup_failure_class: value.cleanupFailureClass,
+          cleanup_scope: value.cleanupScope,
+          evidence_failure_class: value.evidenceFailureClass,
+          no_log_failure_class: value.noLogFailureClass,
+          no_log_scope: value.noLogScope,
+          parent_failure_class: value.parentFailureClass,
+        });
+        recordedClosure = validateAttemptClosure(projected, authority);
+      },
+    }),
+    (error) => {
+      observed = error;
+      return errorCode(error) === "preflight_authority_invalid";
+    },
+  );
+  assert.equal(recordedClosure.no_log_scope, "preflight_artifacts");
+  assert.equal(recordedClosure.no_log_failure_class, "orchestrator_no_log_invalid");
+  assert.equal(observed.closure.evidence_failure_class, null);
+  assert.equal(observed.closure.no_log_failure_class, "orchestrator_no_log_invalid");
+});
+
 test("S10BO3-004 attempt ledger consumes a run ID exactly once with O_EXCL", async (t) => {
   const { attemptRoot, attempt } = await claimTemporaryAttempt(t);
   assert.equal(attempt.fresh, true);
@@ -633,6 +682,17 @@ test("S10BO3-006 failure evidence is immutable, strict, and bound to the consume
   assert.deepEqual(await readAttemptClosure(attempt, authority), closure);
   assert.equal((await lstat(attempt.closurePath)).mode & 0o777, 0o600);
   assert.equal(validateAttemptClosure(closure, authority).s10b_r8_executed, false);
+  assert.equal(validateAttemptClosure({
+    ...closure,
+    cleanup_failure_class: "orchestrator_cleanup_unknown",
+    cleanup_scope: "run_artifacts",
+    no_log_failure_class: "orchestrator_no_log_invalid",
+    no_log_scope: "run_artifacts",
+  }, authority).no_log_scope, "run_artifacts");
+  assert.throws(
+    () => validateAttemptClosure({ ...closure, no_log_scope: null }, authority),
+    codeIs("orchestrator_attempt_evidence_invalid"),
+  );
   await assert.rejects(
     writeAttemptClosure(attempt, authority, { ...closure, failure_class: "other_failure" }),
     codeIs("orchestrator_evidence_write_failed"),
@@ -1014,13 +1074,29 @@ test("S10BO3-017 captures Compose logs before cleanup and marks leaks failed", a
     async readLogs() { return Buffer.from("ready\n", "utf8"); },
   });
   assert.equal(clean.status, "passed");
+  assert.equal(clean.schema_version, 2);
   assert.equal(clean.source_count, 2);
+  assert.equal(clean.hit_origin_set_sha256, sha256(""));
+  assert.equal(clean.hit_rule_set_sha256, sha256(""));
   const leaked = await captureRuntimeLogScan(context, {
     async list() { return ["a".repeat(12)]; },
     async readLogs() { return Buffer.from("Authorization: Bearer token\n", "utf8"); },
   });
   assert.equal(leaked.status, "failed");
   assert.equal(leaked.hit_count, 1);
+  assert.equal(leaked.hit_origin_set_sha256, sha256("a".repeat(12)));
+  assert.equal(leaked.hit_rule_set_sha256, sha256("bearer"));
+  assert.equal(validateRuntimeLogScan(leaked, runId).schema_version, 2);
+  const repeated = await captureRuntimeLogScan(context, {
+    async list() { return ["a".repeat(12), "b".repeat(12)]; },
+    async readLogs() { return Buffer.from("Authorization: Bearer token\n", "utf8"); },
+  });
+  assert.equal(repeated.hit_count, 2);
+  assert.equal(
+    repeated.hit_origin_set_sha256,
+    sha256(`${"a".repeat(12)}\n${"b".repeat(12)}`),
+  );
+  assert.equal(repeated.hit_rule_set_sha256, sha256("bearer"));
 });
 
 function apiProjection(canonicalHash) {
@@ -1072,6 +1148,20 @@ test("S10BO3-019 records marker-only absent-root reconcile without resume", asyn
   assert.equal(reconcile.status, "reconciled");
   assert.equal(reconcile.failure_class, "orchestrator_unclean_exit");
   assert.equal(reconcile.s10b_r8_executed, false);
+  const scopedFailure = buildAttemptReconcileEvidence(
+    attempt,
+    authority,
+    attemptFailure({ attempt_marker_sha256: attempt.markerSha256 }),
+    {
+      businessStatus: "passed",
+      cleanup: { scope: "run_artifacts" },
+      cleanupFailure: { code: "orchestrator_cleanup_unknown" },
+      noLog: { scope: "run_artifacts" },
+      noLogFailure: { code: "orchestrator_no_log_invalid" },
+    },
+  );
+  assert.equal(validateAttemptReconcile(scopedFailure, authority).cleanup_scope, "run_artifacts");
+  assert.equal(scopedFailure.no_log_scope, "run_artifacts");
 });
 
 test("S10BO3-020 requires persisted Host and Runtime ownership evidence", () => {

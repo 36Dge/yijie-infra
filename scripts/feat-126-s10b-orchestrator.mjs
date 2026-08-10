@@ -173,7 +173,7 @@ const NO_LOG_RESULT_KEYS = Object.freeze([
   "schema_version",
   "scope",
 ]);
-const RUNTIME_LOG_SCAN_KEYS = Object.freeze([
+const RUNTIME_LOG_SCAN_V1_KEYS = Object.freeze([
   "hit_count",
   "row_count",
   "run_id",
@@ -181,6 +181,11 @@ const RUNTIME_LOG_SCAN_KEYS = Object.freeze([
   "source_count",
   "source_set_sha256",
   "status",
+]);
+const RUNTIME_LOG_SCAN_V2_KEYS = Object.freeze([
+  ...RUNTIME_LOG_SCAN_V1_KEYS,
+  "hit_origin_set_sha256",
+  "hit_rule_set_sha256",
 ]);
 const BUSINESS_BOUNDARY_KEYS = Object.freeze([
   "api_after_sha256",
@@ -1134,14 +1139,30 @@ export function validateNoLogResult(value) {
 }
 
 export function validateRuntimeLogScan(value, runId) {
+  const versionOne = value?.schema_version === 1;
+  const versionTwo = value?.schema_version === 2;
+  const emptySetSha256 = sha256("");
   if (
     value === null || Array.isArray(value) || typeof value !== "object" ||
-    !exactKeys(value, RUNTIME_LOG_SCAN_KEYS) || value.schema_version !== 1 ||
+    (!versionOne && !versionTwo) ||
+    !exactKeys(value, versionTwo ? RUNTIME_LOG_SCAN_V2_KEYS : RUNTIME_LOG_SCAN_V1_KEYS) ||
     value.status !== (value.hit_count === 0 ? "passed" : "failed") ||
     value.run_id !== runId || !Number.isSafeInteger(value.source_count) ||
     value.source_count <= 0 || !Number.isSafeInteger(value.row_count) || value.row_count < 0 ||
     !Number.isSafeInteger(value.hit_count) || value.hit_count < 0 ||
-    !DIGEST_PATTERN.test(value.source_set_sha256 ?? "")
+    !DIGEST_PATTERN.test(value.source_set_sha256 ?? "") ||
+    (versionTwo && (
+      !DIGEST_PATTERN.test(value.hit_origin_set_sha256 ?? "") ||
+      !DIGEST_PATTERN.test(value.hit_rule_set_sha256 ?? "") ||
+      (value.hit_count === 0 && (
+        value.hit_origin_set_sha256 !== emptySetSha256 ||
+        value.hit_rule_set_sha256 !== emptySetSha256
+      )) ||
+      (value.hit_count > 0 && (
+        value.hit_origin_set_sha256 === emptySetSha256 ||
+        value.hit_rule_set_sha256 === emptySetSha256
+      ))
+    ))
   ) fail("orchestrator_no_log_invalid");
   return Object.freeze({ ...value });
 }
@@ -1875,8 +1896,8 @@ export function validateAttemptClosure(value, authority) {
     !validateFailureClassOrNull(value.no_log_failure_class) ||
     !validateFailureClassOrNull(value.parent_failure_class) ||
     (failed && (
-      (value.cleanup_failure_class === null) !== (value.cleanup_scope !== null) ||
-      (value.no_log_failure_class === null) !== (value.no_log_scope !== null) ||
+      (value.cleanup_failure_class === null && value.cleanup_scope === null) ||
+      (value.no_log_failure_class === null && value.no_log_scope === null) ||
       (value.business_failure_class === null &&
         !["passed", "not_applicable"].includes(value.business_status)) ||
       (value.business_failure_class !== null &&
@@ -1906,8 +1927,8 @@ export function validateAttemptReconcile(value, authority) {
     ![null, "attempt_only", "preflight_artifacts", "run_artifacts"].includes(value.no_log_scope) ||
     !validateFailureClassOrNull(value.cleanup_failure_class) ||
     !validateFailureClassOrNull(value.no_log_failure_class) ||
-    (value.cleanup_failure_class === null) !== (value.cleanup_scope !== null) ||
-    (value.no_log_failure_class === null) !== (value.no_log_scope !== null)
+    (value.cleanup_failure_class === null && value.cleanup_scope === null) ||
+    (value.no_log_failure_class === null && value.no_log_scope === null)
   ) fail("orchestrator_attempt_evidence_invalid");
   return Object.freeze({ ...value });
 }
@@ -3478,16 +3499,24 @@ function noLogPatternSet(context) {
 function scanNoLogBuffer(content, literalPatterns, forbiddenPatterns) {
   const value = Buffer.from(content).toString("utf8");
   let hitCount = 0;
+  const hitRules = [];
   const folded = value.toLocaleLowerCase("en-US");
-  for (const { value: pattern } of literalPatterns) {
-    if (folded.includes(pattern.toLocaleLowerCase("en-US"))) hitCount += 1;
+  for (const { name, value: pattern } of literalPatterns) {
+    if (folded.includes(pattern.toLocaleLowerCase("en-US"))) {
+      hitCount += 1;
+      hitRules.push(name);
+    }
   }
-  for (const [, pattern] of forbiddenPatterns) {
-    if (pattern.test(value)) hitCount += 1;
+  for (const [name, pattern] of forbiddenPatterns) {
+    if (pattern.test(value)) {
+      hitCount += 1;
+      hitRules.push(name);
+    }
   }
   return Object.freeze({
     rowCount: value.split("\n").filter(Boolean).length,
     hitCount,
+    hitRules: Object.freeze(hitRules),
   });
 }
 
@@ -3539,6 +3568,8 @@ export async function captureRuntimeLogScan(context, operations = {}) {
   const { literalPatterns, forbiddenPatterns } = noLogPatternSet(context);
   let rowCount = 0;
   let hitCount = 0;
+  const hitOrigins = [];
+  const hitRules = [];
   for (const containerId of containerIds) {
     let content;
     try {
@@ -3552,15 +3583,21 @@ export async function captureRuntimeLogScan(context, operations = {}) {
     const scan = scanNoLogBuffer(content, literalPatterns, forbiddenPatterns);
     rowCount += scan.rowCount;
     hitCount += scan.hitCount;
+    for (const rule of scan.hitRules) {
+      hitOrigins.push(containerId);
+      hitRules.push(rule);
+    }
   }
   return validateRuntimeLogScan({
-    schema_version: 1,
+    schema_version: 2,
     status: hitCount === 0 ? "passed" : "failed",
     run_id: context.runId,
     source_count: containerIds.length,
     row_count: rowCount,
     hit_count: hitCount,
     source_set_sha256: sha256(containerIds.join("\n")),
+    hit_origin_set_sha256: sha256([...new Set(hitOrigins)].sort().join("\n")),
+    hit_rule_set_sha256: sha256([...new Set(hitRules)].sort().join("\n")),
   }, context.runId);
 }
 
