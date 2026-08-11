@@ -428,7 +428,7 @@ test("S10BO2-004 binds direction, sequence, and exact FD3 close", async () => {
   );
 });
 
-test("S10BO2-005 reader accepts chunked ordered frames and treats EOF as parent-death failure", async () => {
+test("S10BO2-005 reader preserves FD4 frame ordering across timeout, EOF, and child exit", async () => {
   const stream = new PassThrough();
   const reader = createControlFrameReader(stream, { runId, nonce });
   const first = `${JSON.stringify({ schema_version: 1, run_id: runId, nonce, sequence: 1, kind: "component_ready" })}\n`;
@@ -437,6 +437,14 @@ test("S10BO2-005 reader accepts chunked ordered frames and treats EOF as parent-
   assert.equal((await reader.next("component_ready", 1000)).sequence, 1);
   stream.end();
   await assert.rejects(reader.next("abort_complete", 1000), (error) => errorCode(error) === "orchestrator_control_eof");
+
+  const timeoutStream = new PassThrough();
+  const timeoutReader = createControlFrameReader(timeoutStream, { runId, nonce });
+  await assert.rejects(
+    timeoutReader.next("component_ready", 20),
+    (error) => errorCode(error) === "orchestrator_control_timeout",
+  );
+  timeoutReader.destroy();
 
   const closedStream = new PassThrough();
   const closedReader = createControlFrameReader(closedStream, { runId, nonce });
@@ -510,6 +518,26 @@ test("S10BO2-005 reader accepts chunked ordered frames and treats EOF as parent-
     (error) => errorCode(error) === "driver_bind_failed",
   );
   assert.equal(desktopContext.phase, "desktop_starting");
+
+  for (const role of ["api", "fake", "desktop"]) {
+    const childExitStream = new PassThrough();
+    const childExitContext = {
+      phase: "desktop_spawned",
+      controlReader: createControlFrameReader(childExitStream, { runId, nonce }),
+      processes: {
+        api: { child: pendingChild() },
+        fake: { child: pendingChild() },
+        desktop: { child: pendingChild() },
+      },
+    };
+    const childExitBeforeFrame = readDesktopFrame(childExitContext, "component_ready");
+    childExitContext.processes[role].child.emit("exit", 1, null);
+    await assert.rejects(
+      childExitBeforeFrame,
+      (error) => errorCode(error) === `orchestrator_${role}_exited_early`,
+    );
+    childExitContext.controlReader.destroy();
+  }
 });
 
 test("S10BO2-006 executes the only allowed spawn and abort order", async () => {

@@ -188,9 +188,14 @@ const RUNTIME_LOG_SCAN_V2_KEYS = Object.freeze([
   "hit_origin_set_sha256",
   "hit_rule_set_sha256",
 ]);
-const RUNTIME_LOG_SCAN_V3_KEYS = Object.freeze([
+const RUNTIME_LOG_SCAN_V3_LEGACY_KEYS = Object.freeze([
   ...RUNTIME_LOG_SCAN_V2_KEYS,
   "hit_origin_rule_set_sha256",
+]);
+const RUNTIME_LOG_SCAN_V3_KEYS = Object.freeze([
+  ...RUNTIME_LOG_SCAN_V3_LEGACY_KEYS,
+  "hit_field_class_set_sha256",
+  "hit_origin_rule_field_class_set_sha256",
 ]);
 const BUSINESS_BOUNDARY_KEYS = Object.freeze([
   "api_after_sha256",
@@ -287,6 +292,8 @@ const DESKTOP_STARTUP_FAILURE_CLASSES = Object.freeze([
   "driver_control_channel_invalid",
   "driver_control_monitor_invalid",
   "driver_control_projection_invalid",
+  "driver_frontend_bootstrap_timeout",
+  "driver_frontend_ipc_timeout",
   "driver_frontend_startup_invalid",
   "driver_login_failed",
   "driver_login_projection_invalid",
@@ -299,6 +306,10 @@ const DESKTOP_STARTUP_FAILURE_CLASSES = Object.freeze([
   "driver_ready_emit_failed",
   "driver_run_id_invalid",
   "driver_secret_authority_invalid",
+  "driver_setup_panic",
+  "driver_setup_timeout",
+  "driver_page_load_timeout",
+  "driver_startup_timeout",
   "driver_tauri_startup_invalid",
 ]);
 const RUNTIME_LOG_SOURCE_KEYS = Object.freeze([
@@ -320,6 +331,13 @@ const STRUCTURED_NO_LOG_RULES = Object.freeze([
   "absolute_local_path",
   "sensitive_value_field",
   "unclassified_sensitive_field",
+]);
+const STRUCTURED_NO_LOG_FIELD_CLASSES = Object.freeze([
+  "literal_value",
+  "local_path",
+  "structured_sensitive",
+  "structured_unclassified",
+  "unstructured_pattern",
 ]);
 const S10_NAMED_VOLUME_KEYS = Object.freeze([
   "feat126_s10_api_postgres_data",
@@ -1234,6 +1252,8 @@ export function validateRuntimeLogScan(value, runId) {
   const versionOne = value?.schema_version === 1;
   const versionTwo = value?.schema_version === 2;
   const versionThree = value?.schema_version === 3;
+  const versionThreeLegacy = versionThree && exactKeys(value, RUNTIME_LOG_SCAN_V3_LEGACY_KEYS);
+  const versionThreeExplainable = versionThree && exactKeys(value, RUNTIME_LOG_SCAN_V3_KEYS);
   const emptySetSha256 = sha256("");
   const canonicalSourceSetSha256 = sha256(
     RUNTIME_LOG_SERVICE_ROLES
@@ -1244,12 +1264,9 @@ export function validateRuntimeLogScan(value, runId) {
   if (
     value === null || Array.isArray(value) || typeof value !== "object" ||
     (!versionOne && !versionTwo && !versionThree) ||
-    !exactKeys(
-      value,
-      versionThree
-        ? RUNTIME_LOG_SCAN_V3_KEYS
-        : versionTwo ? RUNTIME_LOG_SCAN_V2_KEYS : RUNTIME_LOG_SCAN_V1_KEYS,
-    ) ||
+    (versionThree
+      ? !versionThreeLegacy && !versionThreeExplainable
+      : !exactKeys(value, versionTwo ? RUNTIME_LOG_SCAN_V2_KEYS : RUNTIME_LOG_SCAN_V1_KEYS)) ||
     value.status !== (value.hit_count === 0 ? "passed" : "failed") ||
     value.run_id !== runId || !Number.isSafeInteger(value.source_count) ||
     value.source_count <= 0 || !Number.isSafeInteger(value.row_count) || value.row_count < 0 ||
@@ -1273,6 +1290,18 @@ export function validateRuntimeLogScan(value, runId) {
       !DIGEST_PATTERN.test(value.hit_origin_rule_set_sha256 ?? "") ||
       (value.hit_count === 0 && value.hit_origin_rule_set_sha256 !== emptySetSha256) ||
       (value.hit_count > 0 && value.hit_origin_rule_set_sha256 === emptySetSha256)
+    )) ||
+    (versionThreeExplainable && (
+      !DIGEST_PATTERN.test(value.hit_field_class_set_sha256 ?? "") ||
+      !DIGEST_PATTERN.test(value.hit_origin_rule_field_class_set_sha256 ?? "") ||
+      (value.hit_count === 0 && (
+        value.hit_field_class_set_sha256 !== emptySetSha256 ||
+        value.hit_origin_rule_field_class_set_sha256 !== emptySetSha256
+      )) ||
+      (value.hit_count > 0 && (
+        value.hit_field_class_set_sha256 === emptySetSha256 ||
+        value.hit_origin_rule_field_class_set_sha256 === emptySetSha256
+      ))
     ))
   ) fail("orchestrator_no_log_invalid");
   return Object.freeze({ ...value });
@@ -1535,6 +1564,8 @@ export async function assessProcessCleanup(records, inspect) {
 export async function runStartupAbortFlow(authority, operations) {
   const machine = createStartupAbortStateMachine();
   let primaryFailure;
+  let primaryFailurePersistenceAttempted = false;
+  let primaryEvidenceFailure;
   let cleanupPassed = false;
   try {
     machine.transition("preflight_running");
@@ -1573,6 +1604,21 @@ export async function runStartupAbortFlow(authority, operations) {
       machine.abort();
     } catch {
       // The original failure remains authoritative.
+    }
+    if (typeof operations.recordFailure === "function") {
+      primaryFailurePersistenceAttempted = true;
+      try {
+        await operations.recordFailure({
+          failureClass: primaryFailure.code,
+          businessFailureClass: null,
+          cleanupFailureClass: null,
+          parentFailureClass: null,
+        });
+      } catch (persistenceError) {
+        primaryEvidenceFailure = persistenceError instanceof S10BO1OrchestratorError
+          ? persistenceError
+          : new S10BO1OrchestratorError("orchestrator_evidence_write_failed");
+      }
     }
     try {
       await operations.initiateDesktopAbort?.();
@@ -1625,13 +1671,13 @@ export async function runStartupAbortFlow(authority, operations) {
     retainFirstSecondary(parentFailure);
   }
 
-  let evidenceFailure = primaryFailure?.closure?.evidence_failure_class
+  let evidenceFailure = primaryEvidenceFailure ?? (primaryFailure?.closure?.evidence_failure_class
     ? new S10BO1OrchestratorError(primaryFailure.closure.evidence_failure_class)
-    : undefined;
+    : undefined);
   if (evidenceFailure) retainFirstSecondary(evidenceFailure);
-  let failureRecorded = false;
+  let failureRecorded = primaryFailurePersistenceAttempted;
   const preNoLogFailure = primaryFailure ?? businessFailure ?? cleanupFailure ?? parentFailure;
-  if (preNoLogFailure && typeof operations.recordFailure === "function") {
+  if (!failureRecorded && preNoLogFailure && typeof operations.recordFailure === "function") {
     try {
       await operations.recordFailure({
         failureClass: preNoLogFailure.code,
@@ -1894,13 +1940,25 @@ const ATTEMPT_PHASE_PROCESS_RULES = Object.freeze({
   closed_pass: Object.freeze({ required: EXISTING_PROCESS_ROLES, allowed: EXISTING_PROCESS_ROLES }),
 });
 
+const PRE_OWNERSHIP_DESKTOP_FAILURE_CLASSES = Object.freeze([
+  ...DESKTOP_STARTUP_FAILURE_CLASSES,
+  "orchestrator_control_eof",
+  "orchestrator_control_frame_invalid",
+  "orchestrator_control_frame_oversize",
+  "orchestrator_control_order_invalid",
+  "orchestrator_control_timeout",
+  "orchestrator_api_exited_early",
+  "orchestrator_desktop_exited_early",
+  "orchestrator_fake_exited_early",
+]);
+
 function validateFailureClassOrNull(value) {
   return value === null || /^[a-z][a-z0-9_]{0,127}$/.test(value ?? "");
 }
 
-function isClosedDesktopStartupFailure(value) {
-  return value?.phase === "desktop_starting" &&
-    DESKTOP_STARTUP_FAILURE_CLASSES.includes(value.failure_class) &&
+function isKnownPreOwnershipDesktopFailure(value) {
+  return ["desktop_starting", "desktop_spawned"].includes(value?.phase) &&
+    PRE_OWNERSHIP_DESKTOP_FAILURE_CLASSES.includes(value.failure_class) &&
     JSON.stringify(value.process_roles) === JSON.stringify(["api", "desktop", "fake"]);
 }
 
@@ -1918,7 +1976,7 @@ export function validateReconcileFailureProcessState(failure) {
   if (
     failure && requiresCompleteDescendantProcessRoles(failure) &&
     failure.process_roles.length !== EXISTING_PROCESS_ROLES.length &&
-    !isClosedDesktopStartupFailure(failure)
+    !isKnownPreOwnershipDesktopFailure(failure)
   ) fail("orchestrator_cleanup_unknown");
   return true;
 }
@@ -1957,7 +2015,7 @@ function validateAttemptPhaseState(value) {
   if (
     requiresCompleteDescendantProcessRoles(value) &&
     roles.length !== EXISTING_PROCESS_ROLES.length && value.cleanup_failure_class === null &&
-    !isClosedDesktopStartupFailure(value)
+    !isKnownPreOwnershipDesktopFailure(value)
   ) return false;
   return true;
 }
@@ -3420,13 +3478,29 @@ export async function readDesktopFrame(context, expectedKind) {
     ? context.pendingDesktopFrame
     : context.controlReader.next(expectedKind);
   if (expectedKind === "component_ready") context.pendingDesktopFrame = null;
+  const settle = (kind, promise) => promise.then(
+    (value) => Object.freeze({ kind, value }),
+    (error) => Object.freeze({ error, kind }),
+  );
+  const controlOutcome = settle("control", controlFrame);
   const readers = [
-    controlFrame,
-    childExit(context.processes.api.child, "api"),
-    childExit(context.processes.fake.child, "fake"),
+    controlOutcome,
+    settle("api_exit", childExit(context.processes.api.child, "api")),
+    settle("fake_exit", childExit(context.processes.fake.child, "fake")),
+    settle("desktop_exit", childExit(context.processes.desktop.child, "desktop")),
   ];
   try {
-    const frame = await Promise.race(readers);
+    let outcome = await Promise.race(readers);
+    if (outcome.kind === "desktop_exit") {
+      const queuedControl = await Promise.race([
+        controlOutcome,
+        new Promise((resolveQueued) => setImmediate(() => resolveQueued(null))),
+      ]);
+      if (queuedControl !== null) outcome = queuedControl;
+    }
+    if (outcome.error) throw outcome.error;
+    if (outcome.kind !== "control") fail("orchestrator_internal_failure");
+    const frame = outcome.value;
     if (expectedKind === "component_ready" && context.processes.desktop.earlyExit) {
       fail("orchestrator_desktop_exited_early");
     }
@@ -3714,13 +3788,20 @@ function unclassifiedStructuredField(key) {
     /_(?:argv|binary|body|command|content|cwd|env|executable|headers|message|path|payload|prompt|query|request|response|uri|url)$/.test(key);
 }
 
+function publicRequestTarget(value) {
+  return value === "/healthz" || value === "/healthz/v2";
+}
+
 function approvedContextFieldValue(key, value) {
   if (emptyStructuredValue(value)) return true;
   if (key === "path" || key === "uri" || /_(?:path|uri)$/.test(key)) {
-    return value === "/healthz" || value === "/healthz/v2";
+    return publicRequestTarget(value);
   }
   if (key === "env") return value === "local";
   if (key === "argv") return Array.isArray(value) && value.length === 0;
+  if (key === "request" || key === "headers" || key.endsWith("_headers")) {
+    return value !== null && typeof value === "object";
+  }
   return key === "payload" &&
     value !== null && typeof value === "object" && !Array.isArray(value) &&
     exactKeys(value, ["status"]) && value.status === "ready";
@@ -3749,17 +3830,26 @@ function normalizedStructuredField(rawKey) {
     .replaceAll("-", "_");
 }
 
-function structuredNoLogRules(value) {
-  const rules = new Set();
+function structuredNoLogHits(value) {
+  const hits = new Map();
+  const addHit = (rule, fieldClass) => {
+    hits.set(JSON.stringify([rule, fieldClass]), Object.freeze({ rule, fieldClass }));
+  };
   function visit(current, sensitiveContext = false) {
     if (typeof current === "string") {
-      if (localAbsolutePath(current)) rules.add("absolute_local_path");
-      if (!sensitiveContext && /\bbearer\b/i.test(current)) rules.add("bearer");
-      if (!sensitiveContext && /\bcredentials?\b/i.test(current)) rules.add("credential");
-      if (!sensitiveContext && /\b(?:postgres(?:ql)?|redis):\/\//i.test(current)) {
-        rules.add("dsn");
+      if (localAbsolutePath(current)) addHit("absolute_local_path", "local_path");
+      if (!sensitiveContext && /\bbearer\b/i.test(current)) {
+        addHit("bearer", "unstructured_pattern");
       }
-      if (!sensitiveContext && /private[\s_-]*key/i.test(current)) rules.add("private_key");
+      if (!sensitiveContext && /\bcredentials?\b/i.test(current)) {
+        addHit("credential", "unstructured_pattern");
+      }
+      if (!sensitiveContext && /\b(?:postgres(?:ql)?|redis):\/\//i.test(current)) {
+        addHit("dsn", "unstructured_pattern");
+      }
+      if (!sensitiveContext && /private[\s_-]*key/i.test(current)) {
+        addHit("private_key", "unstructured_pattern");
+      }
       return;
     }
     if (Array.isArray(current)) {
@@ -3770,17 +3860,19 @@ function structuredNoLogRules(value) {
     for (const [rawKey, entry] of Object.entries(current)) {
       const key = normalizedStructuredField(rawKey);
       if (sensitiveStructuredField(key) && !emptyStructuredValue(entry)) {
-        rules.add("sensitive_value_field");
+        addHit("sensitive_value_field", "structured_sensitive");
       }
       if (unclassifiedStructuredField(key) &&
         !approvedContextFieldValue(key, entry)) {
-        rules.add("unclassified_sensitive_field");
+        addHit("unclassified_sensitive_field", "structured_unclassified");
       }
       visit(entry, sensitiveContext || sensitiveStructuredField(key));
     }
   }
   visit(value);
-  return rules;
+  return [...hits.values()].sort((left, right) => (
+    asciiCompare(left.rule, right.rule) || asciiCompare(left.fieldClass, right.fieldClass)
+  ));
 }
 
 function scanNoLogBuffer(content, literalPatterns, forbiddenPatterns) {
@@ -3790,10 +3882,13 @@ function scanNoLogBuffer(content, literalPatterns, forbiddenPatterns) {
   } catch {
     fail("orchestrator_no_log_invalid");
   }
-  const hitRules = new Set();
+  const hits = new Map();
+  const addHit = (rule, fieldClass) => {
+    hits.set(JSON.stringify([rule, fieldClass]), Object.freeze({ rule, fieldClass }));
+  };
   const folded = value.toLowerCase();
   for (const { name, value: pattern } of literalPatterns) {
-    if (folded.includes(pattern.toLowerCase())) hitRules.add(name);
+    if (folded.includes(pattern.toLowerCase())) addHit(name, "literal_value");
   }
   function parseUniqueJson(input) {
     try {
@@ -3810,9 +3905,11 @@ function scanNoLogBuffer(content, literalPatterns, forbiddenPatterns) {
       const bearerAuthorization = key === "authorization" &&
         /\bbearer\b/i.test(line.slice((match.index ?? 0) + match[0].length));
       if (sensitiveStructuredField(key) && !bearerAuthorization) {
-        hitRules.add("sensitive_value_field");
+        addHit("sensitive_value_field", "structured_sensitive");
       }
-      if (unclassifiedStructuredField(key)) hitRules.add("unclassified_sensitive_field");
+      if (unclassifiedStructuredField(key)) {
+        addHit("unclassified_sensitive_field", "structured_unclassified");
+      }
     }
   }
 
@@ -3820,12 +3917,14 @@ function scanNoLogBuffer(content, literalPatterns, forbiddenPatterns) {
   const unstructuredLines = [];
   const complete = parseUniqueJson(value.trim());
   if (complete.parsed) {
-    for (const rule of structuredNoLogRules(complete.structured)) hitRules.add(rule);
+    for (const hit of structuredNoLogHits(complete.structured)) addHit(hit.rule, hit.fieldClass);
   } else {
     for (const line of nonemptyLines) {
       const parsedLine = parseUniqueJson(line);
       if (parsedLine.parsed) {
-        for (const rule of structuredNoLogRules(parsedLine.structured)) hitRules.add(rule);
+        for (const hit of structuredNoLogHits(parsedLine.structured)) {
+          addHit(hit.rule, hit.fieldClass);
+        }
         continue;
       }
       unstructuredLines.push(line);
@@ -3834,13 +3933,17 @@ function scanNoLogBuffer(content, literalPatterns, forbiddenPatterns) {
   }
   const unstructured = unstructuredLines.join("\n");
   for (const [name, pattern] of forbiddenPatterns) {
-    if (pattern.test(unstructured)) hitRules.add(name);
+    if (pattern.test(unstructured)) {
+      addHit(name, name === "absolute_local_path" ? "local_path" : "unstructured_pattern");
+    }
   }
-  const sortedHitRules = [...hitRules].sort(asciiCompare);
+  const sortedHits = [...hits.values()].sort((left, right) => (
+    asciiCompare(left.rule, right.rule) || asciiCompare(left.fieldClass, right.fieldClass)
+  ));
   return Object.freeze({
     rowCount: nonemptyLines.length,
-    hitCount: sortedHitRules.length,
-    hitRules: Object.freeze(sortedHitRules),
+    hitCount: sortedHits.length,
+    hits: Object.freeze(sortedHits),
   });
 }
 
@@ -3849,6 +3952,7 @@ function noLogPatternDigest(literalPatterns, forbiddenPatterns, classificationRu
     ...literalPatterns.map(({ name }) => name),
     ...forbiddenPatterns.map(([name]) => name),
     ...classificationRules,
+    ...STRUCTURED_NO_LOG_FIELD_CLASSES,
   ])].sort(asciiCompare).join("\n"));
 }
 
@@ -3943,6 +4047,8 @@ export async function captureRuntimeLogScan(context, operations = {}) {
   const hitOrigins = [];
   const hitRules = [];
   const hitOriginRules = [];
+  const hitFieldClasses = [];
+  const hitOriginRuleFieldClasses = [];
   for (const source of sources) {
     let content;
     try {
@@ -3956,10 +4062,12 @@ export async function captureRuntimeLogScan(context, operations = {}) {
     const scan = scanNoLogBuffer(content, literalPatterns, forbiddenPatterns);
     rowCount += scan.rowCount;
     hitCount += scan.hitCount;
-    for (const rule of scan.hitRules) {
+    for (const { rule, fieldClass } of scan.hits) {
       hitOrigins.push(source.origin);
       hitRules.push(rule);
       hitOriginRules.push(JSON.stringify([source.origin, rule]));
+      hitFieldClasses.push(fieldClass);
+      hitOriginRuleFieldClasses.push(JSON.stringify([source.origin, rule, fieldClass]));
     }
   }
   return validateRuntimeLogScan({
@@ -3974,6 +4082,12 @@ export async function captureRuntimeLogScan(context, operations = {}) {
     hit_rule_set_sha256: sha256([...new Set(hitRules)].sort(asciiCompare).join("\n")),
     hit_origin_rule_set_sha256: sha256(
       [...new Set(hitOriginRules)].sort(asciiCompare).join("\n"),
+    ),
+    hit_field_class_set_sha256: sha256(
+      [...new Set(hitFieldClasses)].sort(asciiCompare).join("\n"),
+    ),
+    hit_origin_rule_field_class_set_sha256: sha256(
+      [...new Set(hitOriginRuleFieldClasses)].sort(asciiCompare).join("\n"),
     ),
   }, context.runId);
 }

@@ -401,13 +401,13 @@ test("S10BO3-003 retains the primary failure and reports all closure failures as
   );
   assert.deepEqual(
     calls,
-    ["preflight", "abort", "business", "cleanup", "parent", "record", "no_log"],
+    ["preflight", "record", "abort", "business", "cleanup", "parent", "no_log"],
   );
   assert.deepEqual(recorded, {
     failureClass: "preflight_authority_invalid",
     businessFailureClass: null,
-    cleanupFailureClass: "orchestrator_cleanup_unknown",
-    parentFailureClass: "orchestrator_parent_death",
+    cleanupFailureClass: null,
+    parentFailureClass: null,
   });
   assert.deepEqual(observed.closure, {
     business_failure_class: null,
@@ -462,6 +462,38 @@ test("S10BO3-003 retains the primary failure and reports all closure failures as
     no_log_failure_class: null,
     parent_failure_class: null,
   });
+});
+
+test("S10BO3 corrective attempts immutable primary failure persistence exactly once", async () => {
+  let persistenceAttempts = 0;
+  let recordedClosure;
+  let observed;
+  await assert.rejects(
+    runStartupAbortFlow(authority, {
+      async runPreflight() {
+        throw new S10BO1OrchestratorError("preflight_authority_invalid");
+      },
+      async recordFailure() {
+        persistenceAttempts += 1;
+        throw new S10BO1OrchestratorError("orchestrator_evidence_write_failed");
+      },
+      async initiateDesktopAbort() {},
+      async verifyBusinessBoundary() {
+        return buildBusinessBoundaryEvidence(null, null, null, runId);
+      },
+      async cleanup() { return cleanupResult(); },
+      async scanNoLog() { return noLogResult(); },
+      async recordClosure(value) { recordedClosure = value; },
+    }),
+    (error) => {
+      observed = error;
+      return errorCode(error) === "preflight_authority_invalid";
+    },
+  );
+  assert.equal(persistenceAttempts, 1);
+  assert.equal(recordedClosure.failureClass, "preflight_authority_invalid");
+  assert.equal(recordedClosure.evidenceFailureClass, "orchestrator_evidence_write_failed");
+  assert.equal(observed.closure.evidence_failure_class, "orchestrator_evidence_write_failed");
 });
 
 test("S10BO3 corrective persists a known no-log scope when the completed scan fails", async () => {
@@ -615,8 +647,8 @@ test("S10BO3 corrective persists a closed Desktop startup leaf without continuat
   assert.equal(desktopStarts, 1);
   assert.deepEqual(calls, [
     "preflight", "build_desktop", "dependencies", "api", "fake", "desktop",
-    "read:component_ready", "failure_abort", "business_boundary_check", "cleanup",
-    "record_failure", "no_log", "record_closure",
+    "read:component_ready", "record_failure", "failure_abort", "business_boundary_check",
+    "cleanup", "no_log", "record_closure",
   ]);
   assert.equal(calls.includes("ownership"), false);
   assert.equal(calls.includes("normal_abort"), false);
@@ -1129,7 +1161,7 @@ test("S10BO3-012 closes a partial owner-only run root without treating it as abs
   );
 });
 
-test("S10BO3-013 rejects unknown inventory and phase-incomplete descendant evidence", () => {
+test("S10BO3-013 accepts only known pre-ownership Desktop failures with incomplete descendants", () => {
   const listeners = [5432, 8443, 9443, 18080, 18081, 18082].map((port) => ({
     port,
     listening: false,
@@ -1182,16 +1214,36 @@ test("S10BO3-013 rejects unknown inventory and phase-incomplete descendant evide
   };
   assert.equal(validateAttemptFailure(desktopStartupLeaf, authority).phase, "desktop_starting");
   assert.equal(validateReconcileFailureProcessState(desktopStartupLeaf), true);
-  const genericDesktopStartup = {
+  for (const failureClass of [
+    "orchestrator_control_timeout",
+    "orchestrator_control_eof",
+    "orchestrator_control_frame_invalid",
+    "orchestrator_control_frame_oversize",
+    "orchestrator_control_order_invalid",
+    "orchestrator_api_exited_early",
+    "orchestrator_desktop_exited_early",
+    "orchestrator_fake_exited_early",
+  ]) {
+    for (const phase of ["desktop_starting", "desktop_spawned"]) {
+      const knownFailure = {
+        ...desktopStartupLeaf,
+        failure_class: failureClass,
+        phase,
+      };
+      assert.equal(validateAttemptFailure(knownFailure, authority).phase, phase);
+      assert.equal(validateReconcileFailureProcessState(knownFailure), true);
+    }
+  }
+  const unknownDesktopStartup = {
     ...desktopStartupLeaf,
-    failure_class: "orchestrator_control_eof",
+    failure_class: "orchestrator_internal_failure",
   };
   assert.throws(
-    () => validateAttemptFailure(genericDesktopStartup, authority),
+    () => validateAttemptFailure(unknownDesktopStartup, authority),
     codeIs("orchestrator_attempt_evidence_invalid"),
   );
   assert.throws(
-    () => validateReconcileFailureProcessState(genericDesktopStartup),
+    () => validateReconcileFailureProcessState(unknownDesktopStartup),
     codeIs("orchestrator_cleanup_unknown"),
   );
   assert.throws(
@@ -1290,6 +1342,8 @@ test("S10BO3-017 captures Compose logs before cleanup and marks leaks failed", a
   assert.equal(clean.hit_origin_set_sha256, sha256(""));
   assert.equal(clean.hit_rule_set_sha256, sha256(""));
   assert.equal(clean.hit_origin_rule_set_sha256, sha256(""));
+  assert.equal(clean.hit_field_class_set_sha256, sha256(""));
+  assert.equal(clean.hit_origin_rule_field_class_set_sha256, sha256(""));
   const rotatedIds = ["a", "b", "c", "d"].map((value) => value.repeat(12));
   const rotated = await captureRuntimeLogScan(context, {
     async list() { return sources(rotatedIds).reverse(); },
@@ -1308,6 +1362,27 @@ test("S10BO3-017 captures Compose logs before cleanup and marks leaks failed", a
   });
   assert.equal(benign.status, "passed");
   assert.equal(benign.hit_count, 0);
+  const caddyAccessLog = await readFile(
+    "tests/fixtures/feat-126-caddy-2.11.4-access-log.jsonl",
+  );
+  const caddyFixture = await captureRuntimeLogScan(context, {
+    async list() { return canonicalSources; },
+    readLogs: logsWith([canonicalSources[1].container_id], caddyAccessLog),
+  });
+  assert.equal(caddyFixture.status, "passed");
+  assert.equal(caddyFixture.hit_count, 0);
+  const caddySensitiveShape = JSON.parse(caddyAccessLog.toString("utf8"));
+  caddySensitiveShape.request.headers.Authorization = ["opaque-value"];
+  const caddySensitive = await captureRuntimeLogScan(context, {
+    async list() { return canonicalSources; },
+    readLogs: logsWith(
+      [canonicalSources[1].container_id],
+      `${JSON.stringify(caddySensitiveShape)}\n`,
+    ),
+  });
+  assert.equal(caddySensitive.status, "failed");
+  assert.equal(caddySensitive.hit_rule_set_sha256, sha256("sensitive_value_field"));
+  assert.equal(caddySensitive.hit_field_class_set_sha256, sha256("structured_sensitive"));
   const sensitiveValue = await captureRuntimeLogScan(context, {
     async list() { return canonicalSources; },
     readLogs: logsWith([canonicalSources[0].container_id], '{"token":"opaque-value"}\n'),
@@ -1316,9 +1391,14 @@ test("S10BO3-017 captures Compose logs before cleanup and marks leaks failed", a
   assert.equal(sensitiveValue.hit_count, 1);
   assert.equal(sensitiveValue.hit_origin_set_sha256, sha256(origins[0]));
   assert.equal(sensitiveValue.hit_rule_set_sha256, sha256("sensitive_value_field"));
+  assert.equal(sensitiveValue.hit_field_class_set_sha256, sha256("structured_sensitive"));
   assert.equal(
     sensitiveValue.hit_origin_rule_set_sha256,
     sha256(JSON.stringify([origins[0], "sensitive_value_field"])),
+  );
+  assert.equal(
+    sensitiveValue.hit_origin_rule_field_class_set_sha256,
+    sha256(JSON.stringify([origins[0], "sensitive_value_field", "structured_sensitive"])),
   );
   assert.equal(validateRuntimeLogScan(sensitiveValue, runId).schema_version, 3);
   const sensitiveKey = await captureRuntimeLogScan(context, {
@@ -1448,6 +1528,7 @@ test("S10BO3-017 captures Compose logs before cleanup and marks leaks failed", a
     sha256(origins.slice(0, 2).join("\n")),
   );
   assert.equal(repeated.hit_rule_set_sha256, sha256("bearer"));
+  assert.equal(repeated.hit_field_class_set_sha256, sha256("unstructured_pattern"));
   assert.equal(
     repeated.hit_origin_rule_set_sha256,
     sha256(origins.slice(0, 2).map((origin) => JSON.stringify([origin, "bearer"])).join("\n")),
@@ -1519,6 +1600,12 @@ test("S10BO3-017 captures Compose logs before cleanup and marks leaks failed", a
     hit_rule_set_sha256: sha256("sensitive_value_field"),
   }, runId).schema_version, 2);
   assert.equal(validateRuntimeLogScan(clean, runId).schema_version, 3);
+  const {
+    hit_field_class_set_sha256: _fieldClassDigest,
+    hit_origin_rule_field_class_set_sha256: _originRuleFieldClassDigest,
+    ...legacyV3
+  } = clean;
+  assert.equal(validateRuntimeLogScan(legacyV3, runId).schema_version, 3);
   assert.throws(
     () => validateRuntimeLogScan({ ...clean, source_count: 3 }, runId),
     codeIs("orchestrator_no_log_invalid"),
