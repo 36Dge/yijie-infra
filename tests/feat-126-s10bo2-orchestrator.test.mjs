@@ -30,6 +30,7 @@ import {
   createParentIdentityGuard,
   createControlFrameReader,
   createStartupAbortStateMachine,
+  desktopProductionBuildFeatures,
   desktopEnvironment,
   encodeControlFrame,
   inspectProcessIdentity,
@@ -1218,7 +1219,18 @@ test("S10BO2-014 source uses direct feature Desktop with FD3/FD4 and keeps busin
   const plan = buildOrchestratorPlan({ runId, environment, arguments_: [] });
   assert.equal(plan.business_cases, "disabled");
   assert.equal(plan.states.includes("s10b_002"), false);
-  assert.match(source, /cargo[\s\S]*--features[\s\S]*feat126-s10-driver/);
+  assert.equal(
+    desktopProductionBuildFeatures(),
+    "feat126-s10-driver,tauri/custom-protocol",
+  );
+  assert.throws(
+    () => desktopProductionBuildFeatures(["feat126-s10-driver"]),
+    (error) => errorCode(error) === "orchestrator_desktop_build_invalid",
+  );
+  assert.match(
+    source,
+    /cargo[\s\S]*--features[\s\S]*desktopProductionBuildFeatures\(\)/,
+  );
   assert.match(source, /extraStdio:\s*\["pipe", "pipe"\]/);
   assert.match(source, /child\.stdio\[3\]/);
   assert.match(source, /child\.stdio\[4\]/);
@@ -1226,6 +1238,8 @@ test("S10BO2-014 source uses direct feature Desktop with FD3/FD4 and keeps busin
   assert.match(source, /vite[\s\S]*--outDir[\s\S]*frontendDistRoot/);
   assert.match(source, /CARGO_TARGET_DIR/);
   assert.match(source, /TAURI_CONFIG/);
+  assert.doesNotMatch(source, /(?:pnpm|npm|yarn)[\s\S]{0,80}["'](?:dev|serve)["']/);
+  assert.doesNotMatch(source, /(?:localhost|127\.0\.0\.1):142[01]/);
   assert.match(source, /\/usr\/bin\/vmmap/);
   assert.match(source, /Launch Time:/);
   assert.match(source, /createParentIdentityGuard/);

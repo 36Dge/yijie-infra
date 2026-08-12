@@ -1,0 +1,12 @@
+{"level":"info","ts":1,"msg":"using config from file","file":"/etc/caddy/Caddyfile"}
+{"level":"info","ts":2,"msg":"adapted config to JSON","adapter":"caddyfile"}
+{"level":"info","ts":3,"logger":"admin","msg":"admin endpoint started","address":"localhost:2019","enforce_origin":false}
+{"level":"info","ts":4,"logger":"http.auto_https","msg":"enabling automatic TLS certificate management","domains":["localhost"]}
+{"level":"info","ts":5,"logger":"http.auto_https","msg":"enabling automatic HTTP->HTTPS redirects","server_name":"srv0"}
+{"level":"info","ts":6,"logger":"tls.cache.maintenance","msg":"started background certificate maintenance","cache":"synthetic-cache"}
+{"level":"info","ts":7,"logger":"tls","msg":"cleaning storage unit","storage":"FileStorage:/data/caddy","storage_path":"/data/caddy"}
+{"level":"info","ts":8,"logger":"tls","msg":"finished cleaning storage units"}
+{"level":"debug","ts":9,"logger":"http.handlers.reverse_proxy","msg":"selected upstream","upstream":"host.docker.internal:18080"}
+{"level":"debug","ts":10,"logger":"http.handlers.reverse_proxy","msg":"upstream roundtrip","upstream":"host.docker.internal:18080","duration":0.001}
+{"level":"info","ts":11,"msg":"autosaved config (load with --resume flag)","file":"/config/caddy/autosave.json","path":"/config/caddy/autosave.json"}
+{"level":"info","ts":12,"msg":"serving initial configuration"}

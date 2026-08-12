@@ -1336,7 +1336,23 @@ test("S10BO3-017 captures Compose logs before cleanup and marks leaks failed", a
     async readLogs() { return Buffer.from("ready\n", "utf8"); },
   });
   assert.equal(clean.status, "passed");
-  assert.equal(clean.schema_version, 3);
+  assert.equal(clean.schema_version, 4);
+  assert.deepEqual(Object.keys(clean).sort(), [
+    "hit_count",
+    "hit_field_class_set_sha256",
+    "hit_origin_rule_field_class_reason_class_set_sha256",
+    "hit_origin_rule_field_class_set_sha256",
+    "hit_origin_rule_set_sha256",
+    "hit_origin_set_sha256",
+    "hit_reason_class_set_sha256",
+    "hit_rule_set_sha256",
+    "row_count",
+    "run_id",
+    "schema_version",
+    "source_count",
+    "source_set_sha256",
+    "status",
+  ]);
   assert.equal(clean.source_count, 4);
   assert.equal(clean.source_set_sha256, sha256(origins.join("\n")));
   assert.equal(clean.hit_origin_set_sha256, sha256(""));
@@ -1344,6 +1360,8 @@ test("S10BO3-017 captures Compose logs before cleanup and marks leaks failed", a
   assert.equal(clean.hit_origin_rule_set_sha256, sha256(""));
   assert.equal(clean.hit_field_class_set_sha256, sha256(""));
   assert.equal(clean.hit_origin_rule_field_class_set_sha256, sha256(""));
+  assert.equal(clean.hit_reason_class_set_sha256, sha256(""));
+  assert.equal(clean.hit_origin_rule_field_class_reason_class_set_sha256, sha256(""));
   const rotatedIds = ["a", "b", "c", "d"].map((value) => value.repeat(12));
   const rotated = await captureRuntimeLogScan(context, {
     async list() { return sources(rotatedIds).reverse(); },
@@ -1371,6 +1389,33 @@ test("S10BO3-017 captures Compose logs before cleanup and marks leaks failed", a
   });
   assert.equal(caddyFixture.status, "passed");
   assert.equal(caddyFixture.hit_count, 0);
+  const caddySystemLog = await readFile(
+    "tests/fixtures/feat-126-caddy-2.11.4-system-log.jsonl",
+  );
+  const caddySystemFixture = await captureRuntimeLogScan(context, {
+    async list() { return canonicalSources; },
+    readLogs: logsWith([canonicalSources[1].container_id], caddySystemLog),
+  });
+  assert.equal(caddySystemFixture.status, "passed");
+  assert.equal(caddySystemFixture.hit_count, 0);
+  assert.equal(caddySystemFixture.hit_reason_class_set_sha256, sha256(""));
+  const caddySystemShapeAtForeignOrigin = await captureRuntimeLogScan(context, {
+    async list() { return canonicalSources; },
+    readLogs: logsWith([canonicalSources[0].container_id], caddySystemLog),
+  });
+  assert.equal(caddySystemShapeAtForeignOrigin.status, "failed");
+  assert.equal(
+    caddySystemShapeAtForeignOrigin.hit_reason_class_set_sha256,
+    sha256("unclassified_context_value"),
+  );
+  const reorderedCaddySystemFixture = await captureRuntimeLogScan(context, {
+    async list() { return sources(["a", "b", "c", "d"].map((value) => value.repeat(12))).reverse(); },
+    readLogs: logsWith(["b".repeat(12)], Buffer.from(
+      caddySystemLog.toString("utf8").trimEnd().split("\n").reverse().join("\n") + "\n",
+      "utf8",
+    )),
+  });
+  assert.deepEqual(reorderedCaddySystemFixture, caddySystemFixture);
   const caddySensitiveShape = JSON.parse(caddyAccessLog.toString("utf8"));
   caddySensitiveShape.request.headers.Authorization = ["opaque-value"];
   const caddySensitive = await captureRuntimeLogScan(context, {
@@ -1383,6 +1428,7 @@ test("S10BO3-017 captures Compose logs before cleanup and marks leaks failed", a
   assert.equal(caddySensitive.status, "failed");
   assert.equal(caddySensitive.hit_rule_set_sha256, sha256("sensitive_value_field"));
   assert.equal(caddySensitive.hit_field_class_set_sha256, sha256("structured_sensitive"));
+  assert.equal(caddySensitive.hit_reason_class_set_sha256, sha256("sensitive_nonempty_value"));
   const sensitiveValue = await captureRuntimeLogScan(context, {
     async list() { return canonicalSources; },
     readLogs: logsWith([canonicalSources[0].container_id], '{"token":"opaque-value"}\n'),
@@ -1400,7 +1446,7 @@ test("S10BO3-017 captures Compose logs before cleanup and marks leaks failed", a
     sensitiveValue.hit_origin_rule_field_class_set_sha256,
     sha256(JSON.stringify([origins[0], "sensitive_value_field", "structured_sensitive"])),
   );
-  assert.equal(validateRuntimeLogScan(sensitiveValue, runId).schema_version, 3);
+  assert.equal(validateRuntimeLogScan(sensitiveValue, runId).schema_version, 4);
   const sensitiveKey = await captureRuntimeLogScan(context, {
     async list() { return canonicalSources; },
     readLogs: logsWith([canonicalSources[0].container_id], '{"apiKey":"opaque-value"}\n'),
@@ -1448,7 +1494,7 @@ test("S10BO3-017 captures Compose logs before cleanup and marks leaks failed", a
   });
   assert.equal(prettyBenign.status, "passed");
   assert.equal(prettyBenign.hit_count, 0);
-  for (const unclassifiedField of ["message", "content", "prompt", "binary"]) {
+  for (const unclassifiedField of ["message", "msg", "content", "prompt", "binary"]) {
     const unclassifiedVariant = await captureRuntimeLogScan(context, {
       async list() { return canonicalSources; },
       readLogs: logsWith(
@@ -1461,7 +1507,100 @@ test("S10BO3-017 captures Compose logs before cleanup and marks leaks failed", a
       unclassifiedVariant.hit_rule_set_sha256,
       sha256("unclassified_sensitive_field"),
     );
+    assert.equal(
+      unclassifiedVariant.hit_reason_class_set_sha256,
+      sha256("unclassified_caddy_system_value"),
+    );
   }
+  const unknownCaddySystemShape = await captureRuntimeLogScan(context, {
+    async list() { return canonicalSources; },
+    readLogs: logsWith(
+      [canonicalSources[1].container_id],
+      '{"logger":"admin","msg":"unknown synthetic system event"}\n',
+    ),
+  });
+  assert.equal(unknownCaddySystemShape.status, "failed");
+  assert.equal(
+    unknownCaddySystemShape.hit_reason_class_set_sha256,
+    sha256("unclassified_caddy_system_value"),
+  );
+  assert.equal(
+    unknownCaddySystemShape.hit_origin_rule_field_class_reason_class_set_sha256,
+    sha256(JSON.stringify([
+      origins[1],
+      "unclassified_sensitive_field",
+      "structured_unclassified",
+      "unclassified_caddy_system_value",
+    ])),
+  );
+  const stableUnknownCaddySystemShape = await captureRuntimeLogScan(context, {
+    async list() { return sources(["a", "b", "c", "d"].map((value) => value.repeat(12))).reverse(); },
+    readLogs: logsWith(
+      ["b".repeat(12)],
+      '{"msg":"unknown synthetic system event","logger":"admin"}\n',
+    ),
+  });
+  assert.deepEqual(stableUnknownCaddySystemShape, unknownCaddySystemShape);
+  const unknownCaddyField = await captureRuntimeLogScan(context, {
+    async list() { return canonicalSources; },
+    readLogs: logsWith(
+      [canonicalSources[1].container_id],
+      '{"msg":"handled request","mystery":"opaque-value"}\n',
+    ),
+  });
+  assert.equal(unknownCaddyField.status, "failed");
+  assert.equal(
+    unknownCaddyField.hit_reason_class_set_sha256,
+    sha256("unclassified_caddy_system_value"),
+  );
+  const unknownCaddyMetadataValue = await captureRuntimeLogScan(context, {
+    async list() { return canonicalSources; },
+    readLogs: logsWith(
+      [canonicalSources[1].container_id],
+      '{"logger":"unknown.module","msg":"handled request"}\n',
+    ),
+  });
+  assert.equal(unknownCaddyMetadataValue.status, "failed");
+  assert.equal(
+    unknownCaddyMetadataValue.hit_reason_class_set_sha256,
+    sha256("unclassified_caddy_system_value"),
+  );
+  const unknownEmptyCaddyField = await captureRuntimeLogScan(context, {
+    async list() { return canonicalSources; },
+    readLogs: logsWith(
+      [canonicalSources[1].container_id],
+      '{"msg":"handled request","mystery":""}\n',
+    ),
+  });
+  assert.equal(unknownEmptyCaddyField.status, "failed");
+  assert.equal(
+    unknownEmptyCaddyField.hit_reason_class_set_sha256,
+    sha256("unclassified_caddy_system_value"),
+  );
+  const unknownUnstructuredCaddyLine = await captureRuntimeLogScan(context, {
+    async list() { return canonicalSources; },
+    readLogs: logsWith(
+      [canonicalSources[1].container_id],
+      "opaque synthetic system line\n",
+    ),
+  });
+  assert.equal(unknownUnstructuredCaddyLine.status, "failed");
+  assert.equal(
+    unknownUnstructuredCaddyLine.hit_reason_class_set_sha256,
+    sha256("unclassified_caddy_system_value"),
+  );
+  const nestedCaddySensitive = await captureRuntimeLogScan(context, {
+    async list() { return canonicalSources; },
+    readLogs: logsWith(
+      [canonicalSources[1].container_id],
+      '{"logger":"admin","context":{"token":"opaque-value"}}\n',
+    ),
+  });
+  assert.equal(nestedCaddySensitive.status, "failed");
+  assert.equal(
+    nestedCaddySensitive.hit_reason_class_set_sha256,
+    sha256("sensitive_nonempty_value"),
+  );
   const unclassified = await captureRuntimeLogScan(context, {
     async list() { return canonicalSources; },
     readLogs: logsWith(
@@ -1522,16 +1661,30 @@ test("S10BO3-017 captures Compose logs before cleanup and marks leaks failed", a
       "Authorization: Bearer token\n",
     ),
   });
-  assert.equal(repeated.hit_count, 2);
+  assert.equal(repeated.hit_count, 3);
   assert.equal(
     repeated.hit_origin_set_sha256,
     sha256(origins.slice(0, 2).join("\n")),
   );
-  assert.equal(repeated.hit_rule_set_sha256, sha256("bearer"));
-  assert.equal(repeated.hit_field_class_set_sha256, sha256("unstructured_pattern"));
+  assert.equal(
+    repeated.hit_rule_set_sha256,
+    sha256(["bearer", "unclassified_sensitive_field"].join("\n")),
+  );
+  assert.equal(
+    repeated.hit_field_class_set_sha256,
+    sha256(["structured_unclassified", "unstructured_pattern"].join("\n")),
+  );
+  assert.equal(
+    repeated.hit_reason_class_set_sha256,
+    sha256(["unclassified_caddy_system_value", "unstructured_pattern_match"].join("\n")),
+  );
   assert.equal(
     repeated.hit_origin_rule_set_sha256,
-    sha256(origins.slice(0, 2).map((origin) => JSON.stringify([origin, "bearer"])).join("\n")),
+    sha256([
+      JSON.stringify([origins[0], "bearer"]),
+      JSON.stringify([origins[1], "bearer"]),
+      JSON.stringify([origins[1], "unclassified_sensitive_field"]),
+    ].sort().join("\n")),
   );
 
   const invalidSources = [
@@ -1599,12 +1752,22 @@ test("S10BO3-017 captures Compose logs before cleanup and marks leaks failed", a
     hit_origin_set_sha256: sha256(origins[0]),
     hit_rule_set_sha256: sha256("sensitive_value_field"),
   }, runId).schema_version, 2);
-  assert.equal(validateRuntimeLogScan(clean, runId).schema_version, 3);
+  assert.equal(validateRuntimeLogScan(clean, runId).schema_version, 4);
+  const {
+    hit_reason_class_set_sha256: _v4ReasonDigest,
+    hit_origin_rule_field_class_reason_class_set_sha256: _v4TupleDigest,
+    ...explainableV3
+  } = clean;
+  explainableV3.schema_version = 3;
+  assert.equal(validateRuntimeLogScan(explainableV3, runId).schema_version, 3);
   const {
     hit_field_class_set_sha256: _fieldClassDigest,
     hit_origin_rule_field_class_set_sha256: _originRuleFieldClassDigest,
+    hit_reason_class_set_sha256: _reasonClassDigest,
+    hit_origin_rule_field_class_reason_class_set_sha256: _originRuleFieldClassReasonClassDigest,
     ...legacyV3
   } = clean;
+  legacyV3.schema_version = 3;
   assert.equal(validateRuntimeLogScan(legacyV3, runId).schema_version, 3);
   assert.throws(
     () => validateRuntimeLogScan({ ...clean, source_count: 3 }, runId),
@@ -1620,6 +1783,18 @@ test("S10BO3-017 captures Compose logs before cleanup and marks leaks failed", a
   );
   assert.throws(
     () => validateRuntimeLogScan({ ...clean, hit_origin_rule_set_sha256: emptySetSha256, hit_count: 1, status: "failed" }, runId),
+    codeIs("orchestrator_no_log_invalid"),
+  );
+  const {
+    hit_reason_class_set_sha256: _missingReasonDigest,
+    ...missingV4ReasonDigest
+  } = clean;
+  assert.throws(
+    () => validateRuntimeLogScan(missingV4ReasonDigest, runId),
+    codeIs("orchestrator_no_log_invalid"),
+  );
+  assert.throws(
+    () => validateRuntimeLogScan({ ...clean, unexpected: true }, runId),
     codeIs("orchestrator_no_log_invalid"),
   );
 });

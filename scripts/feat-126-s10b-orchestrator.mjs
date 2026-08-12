@@ -197,6 +197,11 @@ const RUNTIME_LOG_SCAN_V3_KEYS = Object.freeze([
   "hit_field_class_set_sha256",
   "hit_origin_rule_field_class_set_sha256",
 ]);
+const RUNTIME_LOG_SCAN_V4_KEYS = Object.freeze([
+  ...RUNTIME_LOG_SCAN_V3_KEYS,
+  "hit_origin_rule_field_class_reason_class_set_sha256",
+  "hit_reason_class_set_sha256",
+]);
 const BUSINESS_BOUNDARY_KEYS = Object.freeze([
   "api_after_sha256",
   "api_before_sha256",
@@ -338,6 +343,18 @@ const STRUCTURED_NO_LOG_FIELD_CLASSES = Object.freeze([
   "structured_sensitive",
   "structured_unclassified",
   "unstructured_pattern",
+]);
+const STRUCTURED_NO_LOG_REASON_CLASSES = Object.freeze([
+  "literal_authority_match",
+  "local_machine_path_value",
+  "sensitive_nonempty_value",
+  "unclassified_context_value",
+  "unclassified_caddy_system_value",
+  "unstructured_pattern_match",
+]);
+const DESKTOP_PRODUCTION_FEATURES = Object.freeze([
+  "feat126-s10-driver",
+  "tauri/custom-protocol",
 ]);
 const S10_NAMED_VOLUME_KEYS = Object.freeze([
   "feat126_s10_api_postgres_data",
@@ -1252,8 +1269,11 @@ export function validateRuntimeLogScan(value, runId) {
   const versionOne = value?.schema_version === 1;
   const versionTwo = value?.schema_version === 2;
   const versionThree = value?.schema_version === 3;
+  const versionFour = value?.schema_version === 4;
   const versionThreeLegacy = versionThree && exactKeys(value, RUNTIME_LOG_SCAN_V3_LEGACY_KEYS);
   const versionThreeExplainable = versionThree && exactKeys(value, RUNTIME_LOG_SCAN_V3_KEYS);
+  const versionAtLeastThree = versionThree || versionFour;
+  const versionExplainable = versionThreeExplainable || versionFour;
   const emptySetSha256 = sha256("");
   const canonicalSourceSetSha256 = sha256(
     RUNTIME_LOG_SERVICE_ROLES
@@ -1263,8 +1283,10 @@ export function validateRuntimeLogScan(value, runId) {
   );
   if (
     value === null || Array.isArray(value) || typeof value !== "object" ||
-    (!versionOne && !versionTwo && !versionThree) ||
-    (versionThree
+    (!versionOne && !versionTwo && !versionThree && !versionFour) ||
+    (versionFour
+      ? !exactKeys(value, RUNTIME_LOG_SCAN_V4_KEYS)
+      : versionThree
       ? !versionThreeLegacy && !versionThreeExplainable
       : !exactKeys(value, versionTwo ? RUNTIME_LOG_SCAN_V2_KEYS : RUNTIME_LOG_SCAN_V1_KEYS)) ||
     value.status !== (value.hit_count === 0 ? "passed" : "failed") ||
@@ -1272,7 +1294,7 @@ export function validateRuntimeLogScan(value, runId) {
     value.source_count <= 0 || !Number.isSafeInteger(value.row_count) || value.row_count < 0 ||
     !Number.isSafeInteger(value.hit_count) || value.hit_count < 0 ||
     !DIGEST_PATTERN.test(value.source_set_sha256 ?? "") ||
-    ((versionTwo || versionThree) && (
+    ((versionTwo || versionAtLeastThree) && (
       !DIGEST_PATTERN.test(value.hit_origin_set_sha256 ?? "") ||
       !DIGEST_PATTERN.test(value.hit_rule_set_sha256 ?? "") ||
       (value.hit_count === 0 && (
@@ -1284,14 +1306,14 @@ export function validateRuntimeLogScan(value, runId) {
         value.hit_rule_set_sha256 === emptySetSha256
       ))
     )) ||
-    (versionThree && (
+    (versionAtLeastThree && (
       value.source_count !== RUNTIME_LOG_SERVICE_ROLES.length ||
       value.source_set_sha256 !== canonicalSourceSetSha256 ||
       !DIGEST_PATTERN.test(value.hit_origin_rule_set_sha256 ?? "") ||
       (value.hit_count === 0 && value.hit_origin_rule_set_sha256 !== emptySetSha256) ||
       (value.hit_count > 0 && value.hit_origin_rule_set_sha256 === emptySetSha256)
     )) ||
-    (versionThreeExplainable && (
+    (versionExplainable && (
       !DIGEST_PATTERN.test(value.hit_field_class_set_sha256 ?? "") ||
       !DIGEST_PATTERN.test(value.hit_origin_rule_field_class_set_sha256 ?? "") ||
       (value.hit_count === 0 && (
@@ -1301,6 +1323,18 @@ export function validateRuntimeLogScan(value, runId) {
       (value.hit_count > 0 && (
         value.hit_field_class_set_sha256 === emptySetSha256 ||
         value.hit_origin_rule_field_class_set_sha256 === emptySetSha256
+      ))
+    )) ||
+    (versionFour && (
+      !DIGEST_PATTERN.test(value.hit_reason_class_set_sha256 ?? "") ||
+      !DIGEST_PATTERN.test(value.hit_origin_rule_field_class_reason_class_set_sha256 ?? "") ||
+      (value.hit_count === 0 && (
+        value.hit_reason_class_set_sha256 !== emptySetSha256 ||
+        value.hit_origin_rule_field_class_reason_class_set_sha256 !== emptySetSha256
+      )) ||
+      (value.hit_count > 0 && (
+        value.hit_reason_class_set_sha256 === emptySetSha256 ||
+        value.hit_origin_rule_field_class_reason_class_set_sha256 === emptySetSha256
       ))
     ))
   ) fail("orchestrator_no_log_invalid");
@@ -3091,6 +3125,14 @@ export async function executePreflight(authority, signal, runner = runCommand) {
   );
 }
 
+export function desktopProductionBuildFeatures(features = DESKTOP_PRODUCTION_FEATURES) {
+  if (
+    !Array.isArray(features) ||
+    JSON.stringify(features) !== JSON.stringify(DESKTOP_PRODUCTION_FEATURES)
+  ) fail("orchestrator_desktop_build_invalid");
+  return features.join(",");
+}
+
 async function verifyRepositoryAuthority(repositories, signal) {
   for (const [role, repository] of Object.entries(REPOSITORIES)) {
     const head = (await runCommand(
@@ -3158,7 +3200,7 @@ async function buildDesktop(context) {
       "--manifest-path",
       resolve(DESKTOP_ROOT, "src-tauri/Cargo.toml"),
       "--features",
-      "feat126-s10-driver",
+      desktopProductionBuildFeatures(),
     ],
     {
       cwd: DESKTOP_ROOT,
@@ -3776,6 +3818,7 @@ function unclassifiedStructuredField(key) {
     "executable",
     "headers",
     "message",
+    "msg",
     "path",
     "payload",
     "prompt",
@@ -3785,7 +3828,7 @@ function unclassifiedStructuredField(key) {
     "uri",
     "url",
   ].includes(key) ||
-    /_(?:argv|binary|body|command|content|cwd|env|executable|headers|message|path|payload|prompt|query|request|response|uri|url)$/.test(key);
+    /_(?:argv|binary|body|command|content|cwd|env|executable|headers|message|msg|path|payload|prompt|query|request|response|uri|url)$/.test(key);
 }
 
 function publicRequestTarget(value) {
@@ -3799,12 +3842,98 @@ function approvedContextFieldValue(key, value) {
   }
   if (key === "env") return value === "local";
   if (key === "argv") return Array.isArray(value) && value.length === 0;
+  if (key === "status") return value === "ready";
   if (key === "request" || key === "headers" || key.endsWith("_headers")) {
     return value !== null && typeof value === "object";
   }
   return key === "payload" &&
     value !== null && typeof value === "object" && !Array.isArray(value) &&
     exactKeys(value, ["status"]) && value.status === "ready";
+}
+
+function approvedCaddySystemFieldValue(key, value) {
+  if (key === "message" || key === "msg") {
+    return [
+      "adapted config to JSON",
+      "admin endpoint started",
+      "autosaved config",
+      "autosaved config (load with --resume flag)",
+      "certificate cache maintenance started",
+      "cleaning storage unit",
+      "enabling automatic HTTP->HTTPS redirects",
+      "enabling automatic TLS certificate management",
+      "finished cleaning storage units",
+      "handled request",
+      "initial configuration loaded",
+      "selected upstream",
+      "serving initial configuration",
+      "started background certificate maintenance",
+      "upstream roundtrip",
+      "using config from file",
+    ].includes(value);
+  }
+  if (unclassifiedStructuredField(key) && approvedContextFieldValue(key, value)) return true;
+  if (key === "level") return value === "info" || value === "debug";
+  if (key === "ts" || key === "duration") return typeof value === "number" && value >= 0;
+  if (key === "file") {
+    return value === "/etc/caddy/Caddyfile" || value === "/config/caddy/autosave.json";
+  }
+  if (key === "config_file") return value === "/etc/caddy/Caddyfile";
+  if (key === "autosave_file") return value === "/config/caddy/autosave.json";
+  if (key === "path" || key === "storage_path") {
+    return value === "/config/caddy/autosave.json" || value === "/data/caddy";
+  }
+  if (key === "adapter") return value === "caddyfile";
+  if (key === "logger") {
+    return [
+      "admin",
+      "http.auto_https",
+      "http.handlers.reverse_proxy",
+      "http.log.access",
+      "tls",
+      "tls.cache.maintenance",
+    ].includes(value);
+  }
+  if (key === "storage") return value === "FileStorage:/data/caddy";
+  if (key === "address") return value === "localhost:2019";
+  if (key === "enforce_origin" || key === "resumed") return value === false;
+  if (key === "env") return value === "local";
+  if (key === "argv") return Array.isArray(value) && value.length === 0;
+  if (key === "domains") {
+    return Array.isArray(value) && value.length === 1 && value[0] === "localhost";
+  }
+  if (key === "server_name") return value === "srv0" || value === "localhost";
+  if (key === "cache") return value === "synthetic-cache";
+  if (key === "upstream") return value === "host.docker.internal:18080";
+  if (key === "request" || key === "headers" || key === "resp_headers" ||
+      key === "tls" || key === "context") {
+    return value !== null && typeof value === "object" && !Array.isArray(value);
+  }
+  if (key === "remote_ip" || key === "client_ip") return value === "127.0.0.1";
+  if (key === "remote_port") return typeof value === "string" && /^\d{1,5}$/.test(value);
+  if (key === "proto") return value === "HTTP/1.1" || value === "";
+  if (key === "method") return value === "GET";
+  if (key === "host") return value === "localhost:8443";
+  if (key === "uri") return publicRequestTarget(value);
+  if (key === "user_agent") {
+    return Array.isArray(value) && value.length === 1 && value[0] === "curl/8.7.1";
+  }
+  if (key === "accept") return Array.isArray(value) && value.length === 1 && value[0] === "*/*";
+  if (key === "version") return value === 772;
+  if (key === "cipher_suite") return value === 4865;
+  if (key === "bytes_read") return value === 0;
+  if (key === "user_id") return value === "";
+  if (key === "size") return value === 6;
+  if (key === "status") return value === 200 || value === "ready";
+  if (key === "payload") {
+    return value !== null && typeof value === "object" && !Array.isArray(value) &&
+      exactKeys(value, ["status"]) && value.status === "ready";
+  }
+  if (key === "server") return Array.isArray(value) && value.length === 1 && value[0] === "Caddy";
+  if (key === "content_type") {
+    return Array.isArray(value) && value.length === 1 && value[0] === "text/plain; charset=utf-8";
+  }
+  return false;
 }
 
 function localAbsolutePath(value) {
@@ -3830,25 +3959,28 @@ function normalizedStructuredField(rawKey) {
     .replaceAll("-", "_");
 }
 
-function structuredNoLogHits(value) {
+function structuredNoLogHits(value, origin = null) {
   const hits = new Map();
-  const addHit = (rule, fieldClass) => {
-    hits.set(JSON.stringify([rule, fieldClass]), Object.freeze({ rule, fieldClass }));
+  const addHit = (rule, fieldClass, reasonClass) => {
+    const key = JSON.stringify([rule, fieldClass, reasonClass]);
+    hits.set(key, Object.freeze({ rule, fieldClass, reasonClass }));
   };
   function visit(current, sensitiveContext = false) {
     if (typeof current === "string") {
-      if (localAbsolutePath(current)) addHit("absolute_local_path", "local_path");
+      if (localAbsolutePath(current)) {
+        addHit("absolute_local_path", "local_path", "local_machine_path_value");
+      }
       if (!sensitiveContext && /\bbearer\b/i.test(current)) {
-        addHit("bearer", "unstructured_pattern");
+        addHit("bearer", "unstructured_pattern", "unstructured_pattern_match");
       }
       if (!sensitiveContext && /\bcredentials?\b/i.test(current)) {
-        addHit("credential", "unstructured_pattern");
+        addHit("credential", "unstructured_pattern", "unstructured_pattern_match");
       }
       if (!sensitiveContext && /\b(?:postgres(?:ql)?|redis):\/\//i.test(current)) {
-        addHit("dsn", "unstructured_pattern");
+        addHit("dsn", "unstructured_pattern", "unstructured_pattern_match");
       }
       if (!sensitiveContext && /private[\s_-]*key/i.test(current)) {
-        addHit("private_key", "unstructured_pattern");
+        addHit("private_key", "unstructured_pattern", "unstructured_pattern_match");
       }
       return;
     }
@@ -3859,23 +3991,37 @@ function structuredNoLogHits(value) {
     if (current === null || typeof current !== "object") return;
     for (const [rawKey, entry] of Object.entries(current)) {
       const key = normalizedStructuredField(rawKey);
-      if (sensitiveStructuredField(key) && !emptyStructuredValue(entry)) {
-        addHit("sensitive_value_field", "structured_sensitive");
+      const sensitiveField = sensitiveStructuredField(key);
+      const approvedContext = approvedContextFieldValue(key, entry);
+      const caddyOrigin = origin === "compose:feat126-s10-caddy";
+      if (sensitiveField && !emptyStructuredValue(entry)) {
+        addHit("sensitive_value_field", "structured_sensitive", "sensitive_nonempty_value");
       }
-      if (unclassifiedStructuredField(key) &&
-        !approvedContextFieldValue(key, entry)) {
-        addHit("unclassified_sensitive_field", "structured_unclassified");
+      if (
+        !sensitiveField &&
+        (caddyOrigin
+          ? !approvedCaddySystemFieldValue(key, entry)
+          : unclassifiedStructuredField(key) && !approvedContext)
+      ) {
+        addHit(
+          "unclassified_sensitive_field",
+          "structured_unclassified",
+          caddyOrigin
+            ? "unclassified_caddy_system_value"
+            : "unclassified_context_value",
+        );
       }
-      visit(entry, sensitiveContext || sensitiveStructuredField(key));
+      visit(entry, sensitiveContext || sensitiveField);
     }
   }
   visit(value);
   return [...hits.values()].sort((left, right) => (
-    asciiCompare(left.rule, right.rule) || asciiCompare(left.fieldClass, right.fieldClass)
+    asciiCompare(left.rule, right.rule) || asciiCompare(left.fieldClass, right.fieldClass) ||
+    asciiCompare(left.reasonClass, right.reasonClass)
   ));
 }
 
-function scanNoLogBuffer(content, literalPatterns, forbiddenPatterns) {
+function scanNoLogBuffer(content, literalPatterns, forbiddenPatterns, origin = null) {
   let value;
   try {
     value = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(content));
@@ -3883,12 +4029,15 @@ function scanNoLogBuffer(content, literalPatterns, forbiddenPatterns) {
     fail("orchestrator_no_log_invalid");
   }
   const hits = new Map();
-  const addHit = (rule, fieldClass) => {
-    hits.set(JSON.stringify([rule, fieldClass]), Object.freeze({ rule, fieldClass }));
+  const addHit = (rule, fieldClass, reasonClass) => {
+    const key = JSON.stringify([rule, fieldClass, reasonClass]);
+    hits.set(key, Object.freeze({ rule, fieldClass, reasonClass }));
   };
   const folded = value.toLowerCase();
   for (const { name, value: pattern } of literalPatterns) {
-    if (folded.includes(pattern.toLowerCase())) addHit(name, "literal_value");
+    if (folded.includes(pattern.toLowerCase())) {
+      addHit(name, "literal_value", "literal_authority_match");
+    }
   }
   function parseUniqueJson(input) {
     try {
@@ -3905,10 +4054,16 @@ function scanNoLogBuffer(content, literalPatterns, forbiddenPatterns) {
       const bearerAuthorization = key === "authorization" &&
         /\bbearer\b/i.test(line.slice((match.index ?? 0) + match[0].length));
       if (sensitiveStructuredField(key) && !bearerAuthorization) {
-        addHit("sensitive_value_field", "structured_sensitive");
+        addHit("sensitive_value_field", "structured_sensitive", "sensitive_nonempty_value");
       }
       if (unclassifiedStructuredField(key)) {
-        addHit("unclassified_sensitive_field", "structured_unclassified");
+        addHit(
+          "unclassified_sensitive_field",
+          "structured_unclassified",
+          origin === "compose:feat126-s10-caddy"
+            ? "unclassified_caddy_system_value"
+            : "unclassified_context_value",
+        );
       }
     }
   }
@@ -3917,28 +4072,44 @@ function scanNoLogBuffer(content, literalPatterns, forbiddenPatterns) {
   const unstructuredLines = [];
   const complete = parseUniqueJson(value.trim());
   if (complete.parsed) {
-    for (const hit of structuredNoLogHits(complete.structured)) addHit(hit.rule, hit.fieldClass);
+    for (const hit of structuredNoLogHits(complete.structured, origin)) {
+      addHit(hit.rule, hit.fieldClass, hit.reasonClass);
+    }
   } else {
     for (const line of nonemptyLines) {
       const parsedLine = parseUniqueJson(line);
       if (parsedLine.parsed) {
-        for (const hit of structuredNoLogHits(parsedLine.structured)) {
-          addHit(hit.rule, hit.fieldClass);
+        for (const hit of structuredNoLogHits(parsedLine.structured, origin)) {
+          addHit(hit.rule, hit.fieldClass, hit.reasonClass);
         }
         continue;
       }
       unstructuredLines.push(line);
       classifyUnstructuredLine(line);
+      if (origin === "compose:feat126-s10-caddy" && line !== "ready") {
+        addHit(
+          "unclassified_sensitive_field",
+          "structured_unclassified",
+          "unclassified_caddy_system_value",
+        );
+      }
     }
   }
   const unstructured = unstructuredLines.join("\n");
   for (const [name, pattern] of forbiddenPatterns) {
     if (pattern.test(unstructured)) {
-      addHit(name, name === "absolute_local_path" ? "local_path" : "unstructured_pattern");
+      addHit(
+        name,
+        name === "absolute_local_path" ? "local_path" : "unstructured_pattern",
+        name === "absolute_local_path"
+          ? "local_machine_path_value"
+          : "unstructured_pattern_match",
+      );
     }
   }
   const sortedHits = [...hits.values()].sort((left, right) => (
-    asciiCompare(left.rule, right.rule) || asciiCompare(left.fieldClass, right.fieldClass)
+    asciiCompare(left.rule, right.rule) || asciiCompare(left.fieldClass, right.fieldClass) ||
+    asciiCompare(left.reasonClass, right.reasonClass)
   ));
   return Object.freeze({
     rowCount: nonemptyLines.length,
@@ -3953,6 +4124,7 @@ function noLogPatternDigest(literalPatterns, forbiddenPatterns, classificationRu
     ...forbiddenPatterns.map(([name]) => name),
     ...classificationRules,
     ...STRUCTURED_NO_LOG_FIELD_CLASSES,
+    ...STRUCTURED_NO_LOG_REASON_CLASSES,
   ])].sort(asciiCompare).join("\n"));
 }
 
@@ -4049,6 +4221,8 @@ export async function captureRuntimeLogScan(context, operations = {}) {
   const hitOriginRules = [];
   const hitFieldClasses = [];
   const hitOriginRuleFieldClasses = [];
+  const hitReasonClasses = [];
+  const hitOriginRuleFieldClassReasonClasses = [];
   for (const source of sources) {
     let content;
     try {
@@ -4059,19 +4233,23 @@ export async function captureRuntimeLogScan(context, operations = {}) {
     if (!Buffer.isBuffer(content) || content.length > CHILD_OUTPUT_MAX_BYTES) {
       fail("orchestrator_no_log_invalid");
     }
-    const scan = scanNoLogBuffer(content, literalPatterns, forbiddenPatterns);
+    const scan = scanNoLogBuffer(content, literalPatterns, forbiddenPatterns, source.origin);
     rowCount += scan.rowCount;
     hitCount += scan.hitCount;
-    for (const { rule, fieldClass } of scan.hits) {
+    for (const { rule, fieldClass, reasonClass } of scan.hits) {
       hitOrigins.push(source.origin);
       hitRules.push(rule);
       hitOriginRules.push(JSON.stringify([source.origin, rule]));
       hitFieldClasses.push(fieldClass);
       hitOriginRuleFieldClasses.push(JSON.stringify([source.origin, rule, fieldClass]));
+      hitReasonClasses.push(reasonClass);
+      hitOriginRuleFieldClassReasonClasses.push(
+        JSON.stringify([source.origin, rule, fieldClass, reasonClass]),
+      );
     }
   }
   return validateRuntimeLogScan({
-    schema_version: 3,
+    schema_version: 4,
     status: hitCount === 0 ? "passed" : "failed",
     run_id: context.runId,
     source_count: sources.length,
@@ -4088,6 +4266,12 @@ export async function captureRuntimeLogScan(context, operations = {}) {
     ),
     hit_origin_rule_field_class_set_sha256: sha256(
       [...new Set(hitOriginRuleFieldClasses)].sort(asciiCompare).join("\n"),
+    ),
+    hit_reason_class_set_sha256: sha256(
+      [...new Set(hitReasonClasses)].sort(asciiCompare).join("\n"),
+    ),
+    hit_origin_rule_field_class_reason_class_set_sha256: sha256(
+      [...new Set(hitOriginRuleFieldClassReasonClasses)].sort(asciiCompare).join("\n"),
     ),
   }, context.runId);
 }
