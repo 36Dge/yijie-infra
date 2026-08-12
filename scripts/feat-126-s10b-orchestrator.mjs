@@ -3870,7 +3870,7 @@ function approvedCaddySystemFieldValue(key, value) {
       return true;
     }
     if (
-      /^failed to sufficiently increase receive buffer size \(was: [1-9][0-9]* KiB, wanted: [1-9][0-9]* KiB, got: [1-9][0-9]* KiB\)\. See https:\/\/github\.com\/quic-go\/quic-go\/wiki\/UDP-Buffer-Sizes for details\.$/.test(value)
+      /^failed to sufficiently increase receive buffer size \(was: [1-9][0-9]* kiB, wanted: [1-9][0-9]* kiB, got: [1-9][0-9]* kiB\)\. See https:\/\/github\.com\/quic-go\/quic-go\/wiki\/UDP-Buffer-Sizes for details\.$/.test(value)
     ) {
       return true;
     }
@@ -3883,11 +3883,13 @@ function approvedCaddySystemFieldValue(key, value) {
       "Caddyfile input is not formatted; run 'caddy fmt --overwrite' to fix inconsistencies",
       "certificate cache maintenance started",
       "cleaning storage unit",
+      "automatic HTTP->HTTPS redirects are disabled",
       "enabling automatic HTTP->HTTPS redirects",
       "enabling automatic TLS certificate management",
       "finished cleaning storage units",
       "GOMEMLIMIT is updated",
       "handled request",
+      "received request",
       "enabling HTTP/3 listener",
       "done waiting on internal rate limiter",
       "issuing certificate",
@@ -3938,6 +3940,7 @@ function approvedCaddySystemFieldValue(key, value) {
   if (key === "logger") {
     return [
       "admin",
+      "admin.api",
       "http",
       "http.auto_https",
       "http.handlers.reverse_proxy",
@@ -3951,7 +3954,7 @@ function approvedCaddySystemFieldValue(key, value) {
     ].includes(value);
   }
   if (key === "storage") return value === "FileStorage:/data/caddy";
-  if (key === "address") return value === "localhost:2019";
+  if (key === "address") return value === "localhost:2019" || value === "127.0.0.1:2019";
   if (key === "enforce_origin" || key === "resumed") return value === false;
   if (key === "env") return value === "local";
   if (key === "argv") return Array.isArray(value) && value.length === 0;
@@ -3995,12 +3998,19 @@ function approvedCaddySystemFieldValue(key, value) {
   if (key === "remote_port") return typeof value === "string" && /^\d{1,5}$/.test(value);
   if (key === "proto") return value === "HTTP/1.1" || value === "";
   if (key === "method") return value === "GET";
-  if (key === "host") return value === "localhost:8443";
-  if (key === "uri") return publicRequestTarget(value);
+  if (key === "host") return value === "localhost:8443" || value === "127.0.0.1:2019";
+  if (key === "uri") return publicRequestTarget(value) || value === "/config/";
   if (key === "user_agent") {
-    return Array.isArray(value) && value.length === 1 && value[0] === "curl/8.7.1";
+    return Array.isArray(value) && value.length === 1 &&
+      (value[0] === "curl/8.7.1" || value[0] === "Wget");
   }
   if (key === "accept") return Array.isArray(value) && value.length === 1 && value[0] === "*/*";
+  if (key === "accept_encoding") {
+    return Array.isArray(value) && value.length === 1 && value[0] === "identity";
+  }
+  if (key === "connection") {
+    return Array.isArray(value) && value.length === 1 && value[0] === "close";
+  }
   if (key === "version") return value === 772;
   if (key === "cipher_suite") return value === 4865;
   if (key === "bytes_read") return value === 0;
@@ -4041,6 +4051,23 @@ function approvedCaddyAccessEvent(value) {
     exactKeys(value.resp_headers, ["Server", "Content-Type"]);
 }
 
+function approvedCaddyAdminHealthcheckEvent(value) {
+  if (
+    !exactKeys(value, [
+      "level", "ts", "logger", "msg", "method", "host", "uri", "remote_ip",
+      "remote_port", "headers",
+    ]) || value.level !== "info" || value.logger !== "admin.api" ||
+    value.msg !== "received request" || value.method !== "GET" ||
+    value.host !== "127.0.0.1:2019" || value.uri !== "/config/" ||
+    value.remote_ip !== "127.0.0.1" || !/^\d{1,5}$/.test(value.remote_port ?? "") ||
+    value.headers === null || typeof value.headers !== "object" || Array.isArray(value.headers)
+  ) return false;
+  return exactKeys(value.headers, ["Accept", "Connection", "User-Agent"]) &&
+    Object.entries(value.headers).every(([key, entry]) => (
+      approvedCaddySystemFieldValue(normalizedStructuredField(key), entry)
+    ));
+}
+
 function approvedCaddySystemEvent(value) {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const message = typeof value.msg === "string" ? value.msg : value.message;
@@ -4052,6 +4079,7 @@ function approvedCaddySystemEvent(value) {
   if (message === "handled request") {
     return value.logger === "http.log.access" && approvedCaddyAccessEvent(value);
   }
+  if (message === "received request") return approvedCaddyAdminHealthcheckEvent(value);
   if (/^maxprocs: Leaving GOMAXPROCS=[1-9][0-9]?: CPU quota undefined$/.test(message)) {
     return schema("level", "ts", "msg");
   }
@@ -4060,7 +4088,7 @@ function approvedCaddySystemEvent(value) {
   }
   switch (message) {
     case "GOMEMLIMIT is updated":
-      return schema("level", "ts", "msg", "package", "GOMEMLIMIT", "previous");
+      return schema("level", "ts", "msg", "GOMEMLIMIT", "previous");
     case "using config from file":
       return schema("level", "ts", "msg", "file");
     case "adapted config to JSON":
@@ -4074,8 +4102,11 @@ function approvedCaddySystemEvent(value) {
       return value.logger === "http.auto_https" &&
         schema("level", "ts", "logger", "msg", "server_name", "https_port");
     case "enabling automatic TLS certificate management":
-      return value.logger === "http.auto_https" &&
+      return value.logger === "http" &&
         schema("level", "ts", "logger", "msg", "domains");
+    case "automatic HTTP->HTTPS redirects are disabled":
+      return value.logger === "http.auto_https" &&
+        schema("level", "ts", "logger", "msg", "server_name");
     case "enabling automatic HTTP->HTTPS redirects":
       return value.logger === "http.auto_https" &&
         schema("level", "ts", "logger", "msg", "server_name");
@@ -4107,11 +4138,14 @@ function approvedCaddySystemEvent(value) {
         schema("level", "ts", "logger", "msg", "path");
     case "cleaning storage unit":
       return value.logger === "tls" &&
-        schema("level", "ts", "logger", "msg", "storage", "storage_path");
+        schema("level", "ts", "logger", "msg", "storage");
     case "storage cleaning happened too recently; skipping for now":
       return value.logger === "tls" && value.try_again > value.ts &&
         Math.abs((value.try_again - value.ts) - value.try_again_in) <= 1 &&
-        schema("level", "ts", "logger", "msg", "instance", "try_again", "try_again_in");
+        schema(
+          "level", "ts", "logger", "msg", "storage", "instance", "try_again",
+          "try_again_in",
+        );
     case "selected upstream":
       return value.logger === "http.handlers.reverse_proxy" &&
         schema("level", "ts", "logger", "msg", "upstream");
@@ -4119,7 +4153,7 @@ function approvedCaddySystemEvent(value) {
       return value.logger === "http.handlers.reverse_proxy" &&
         schema("level", "ts", "logger", "msg", "upstream", "duration");
     case "autosaved config (load with --resume flag)":
-      return schema("level", "ts", "msg", "file", "path");
+      return schema("level", "ts", "msg", "file");
     case "finished cleaning storage units":
       return value.logger === "tls" && schema("level", "ts", "logger", "msg");
     case "serving initial configuration":
