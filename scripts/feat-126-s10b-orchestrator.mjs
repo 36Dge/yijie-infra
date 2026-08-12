@@ -14,6 +14,7 @@ import {
 import http from "node:http";
 import net from "node:net";
 import { isAbsolute, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import YAML from "yaml";
@@ -1614,6 +1615,15 @@ export async function runStartupAbortFlow(authority, operations) {
   let primaryFailurePersistenceAttempted = false;
   let primaryEvidenceFailure;
   let cleanupPassed = false;
+  let noLogAuthorityCaptureAttempted = false;
+  const captureNoLogAuthority = async () => {
+    if (noLogAuthorityCaptureAttempted) return;
+    noLogAuthorityCaptureAttempted = true;
+    if (typeof operations.captureNoLogAuthority !== "function") {
+      fail("orchestrator_no_log_invalid");
+    }
+    await operations.captureNoLogAuthority();
+  };
   try {
     machine.transition("preflight_running");
     const summary = await operations.runPreflight();
@@ -1633,6 +1643,7 @@ export async function runStartupAbortFlow(authority, operations) {
     if (ready.kind !== "component_ready" || ready.sequence !== 1) fail("orchestrator_control_order_invalid");
     validateOwnership(await operations.readOwnership());
     machine.transition("component_ready");
+    await captureNoLogAuthority();
     await operations.sendAbort();
     machine.transition("abort_sent");
     const complete = await operations.readDesktopFrame("abort_complete");
@@ -1651,6 +1662,11 @@ export async function runStartupAbortFlow(authority, operations) {
       machine.abort();
     } catch {
       // The original failure remains authoritative.
+    }
+    try {
+      await captureNoLogAuthority();
+    } catch {
+      // The original startup failure remains primary; the final no-log scan fails closed.
     }
     if (typeof operations.recordFailure === "function") {
       primaryFailurePersistenceAttempted = true;
@@ -3779,12 +3795,192 @@ async function listInspectableFiles(root, required, excludedDirectories = new Se
   return found.sort();
 }
 
-function noLogPatternSet(context) {
+async function validateStateRootMetadata(root) {
+  async function visit(directory) {
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch {
+      fail("orchestrator_no_log_invalid");
+    }
+    for (const entry of entries) {
+      const path = resolve(directory, entry.name);
+      if (entry.isSymbolicLink()) fail("orchestrator_no_log_invalid");
+      let metadata;
+      try {
+        metadata = await lstat(path);
+      } catch {
+        fail("orchestrator_no_log_invalid");
+      }
+      if (
+        metadata.isSymbolicLink() || !ownedByCurrentUser(metadata) ||
+        (metadata.mode & 0o022) !== 0 || (await realpath(path)) !== path
+      ) fail("orchestrator_no_log_invalid");
+      if (metadata.isDirectory()) await visit(path);
+      else if (!metadata.isFile() || metadata.nlink !== 1) {
+        fail("orchestrator_no_log_invalid");
+      }
+    }
+  }
+  try {
+    await lstat(root);
+  } catch (error) {
+    if (error?.code === "ENOENT") return;
+    fail("orchestrator_no_log_invalid");
+  }
+  try {
+    await requireOwnerDirectory(root);
+  } catch {
+    fail("orchestrator_no_log_invalid");
+  }
+  await visit(root);
+}
+
+function encodedSecretPatterns(name, bytes) {
+  const patterns = [
+    { name: `${name}:hex`, value: bytes.toString("hex") },
+    { name: `${name}:base64`, value: bytes.toString("base64") },
+    { name: `${name}:base64url`, value: bytes.toString("base64url") },
+  ];
+  try {
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes).trim();
+    if (text.length >= 16 && !/[\r\n\0]/.test(text)) {
+      patterns.push({ name: `${name}:text`, value: text });
+    }
+  } catch {
+    // Binary synthetic secrets remain covered by their closed encodings.
+  }
+  return patterns;
+}
+
+async function optionalSecureSecret(path, maximumBytes, minimumBytes = 1) {
+  try {
+    await lstat(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    fail("orchestrator_no_log_invalid");
+  }
+  try {
+    return await readSecureFile(path, maximumBytes, [0o600], minimumBytes);
+  } catch {
+    fail("orchestrator_no_log_invalid");
+  }
+}
+
+async function runScopedSecretPatterns(context) {
+  if (!context.runRoot || context.runRootPresent === false) return [];
+  const requireComplete = context.requireCompleteNoLogAuthority === true || [
+    "component_ready", "abort_sent", "abort_complete", "desktop_exited",
+  ].includes(context.phase);
+  const patterns = [];
+  const hostHome = resolve(context.runRoot, "host-home");
+  const apiToken = await optionalSecureSecret(resolve(hostHome, "api-token"), 1024);
+  if (requireComplete && apiToken === null) fail("orchestrator_no_log_invalid");
+  if (apiToken !== null) {
+    let token;
+    try {
+      token = new TextDecoder("utf-8", { fatal: true }).decode(apiToken).trim();
+    } catch {
+      fail("orchestrator_no_log_invalid");
+    }
+    if (!/^[A-Za-z0-9_-]{43}$/.test(token)) fail("orchestrator_no_log_invalid");
+    patterns.push({ name: "state_secret:host_api_token", value: token });
+  }
+  const receiptKey = await optionalSecureSecret(
+    resolve(hostHome, "cleanup-receipt.key"),
+    32,
+    32,
+  );
+  if (requireComplete && receiptKey === null) fail("orchestrator_no_log_invalid");
+  if (receiptKey !== null) {
+    patterns.push(...encodedSecretPatterns("state_secret:host_receipt_key", receiptKey));
+  }
+
+  const secretRoot = resolve(context.runRoot, "secure-storage", "ephemeral-secrets");
+  const roles = [
+    ["chat_sqlcipher", "chat-sqlcipher-v1.secret", 1, 32],
+    ["receipt_hmac", "receipt-hmac-v1.secret", 2, 32],
+    ["native_auth", "native-auth-v1.secret", 3, 16 * 1024],
+  ];
+  let secretRootPresent = true;
+  try {
+    await lstat(secretRoot);
+  } catch (error) {
+    if (error?.code === "ENOENT") secretRootPresent = false;
+    else fail("orchestrator_no_log_invalid");
+  }
+  if (!secretRootPresent) {
+    if (requireComplete) fail("orchestrator_no_log_invalid");
+    return patterns;
+  }
+  try {
+    await requireOwnerDirectory(secretRoot);
+    const entries = await readdir(secretRoot, { withFileTypes: true });
+    if (
+      entries.some((entry) => !entry.isFile() || !roles.some(([, basename]) => basename === entry.name))
+    ) fail("orchestrator_no_log_invalid");
+  } catch {
+    fail("orchestrator_no_log_invalid");
+  }
+  for (const [role, basename, tag, maximumPayloadBytes] of roles) {
+    const encoded = await optionalSecureSecret(
+      resolve(secretRoot, basename),
+      14 + maximumPayloadBytes,
+      15,
+    );
+    if (requireComplete && encoded === null) fail("orchestrator_no_log_invalid");
+    if (encoded === null) continue;
+    const payloadLength = encoded.length >= 14 ? encoded.readUInt32BE(10) : -1;
+    if (
+      encoded.length !== 14 + payloadLength ||
+      !encoded.subarray(0, 8).equals(Buffer.from([0x59, 0x4a, 0x31, 0x32, 0x36, 0x53, 0x31, 0x00])) ||
+      encoded[8] !== tag || encoded[9] !== 0 || payloadLength < 1 ||
+      payloadLength > maximumPayloadBytes || (tag !== 3 && payloadLength !== 32)
+    ) fail("orchestrator_no_log_invalid");
+    patterns.push(...encodedSecretPatterns(
+      `state_secret:ephemeral_${role}`,
+      encoded.subarray(14),
+    ));
+  }
+  return patterns;
+}
+
+export async function captureRunScopedNoLogAuthority(context) {
+  try {
+    const patterns = await runScopedSecretPatterns(context);
+    context.runScopedSecretPatterns = Object.freeze(patterns.map((pattern) => Object.freeze({
+      name: pattern.name,
+      value: pattern.value,
+    })));
+    context.noLogAuthorityCaptureFailed = false;
+  } catch (error) {
+    context.noLogAuthorityCaptureFailed = true;
+    throw error;
+  }
+}
+
+async function noLogPatternSet(context) {
+  if (context.noLogAuthorityCaptureFailed === true) fail("orchestrator_no_log_invalid");
+  let scopedPatterns;
+  if (context.runScopedSecretPatterns !== undefined) {
+    if (
+      !Array.isArray(context.runScopedSecretPatterns) ||
+      context.runScopedSecretPatterns.some(({ name, value } = {}) => (
+        typeof name !== "string" || typeof value !== "string" || value.length === 0
+      ))
+    ) fail("orchestrator_no_log_invalid");
+    scopedPatterns = context.runScopedSecretPatterns;
+  } else if (context.noLogAuthorityCaptureRequired === true) {
+    fail("orchestrator_no_log_invalid");
+  } else {
+    scopedPatterns = await runScopedSecretPatterns(context);
+  }
   const literalPatterns = [
     ...[...context.secrets.entries()].map(([name, value]) => ({
       name: `secret:${name}`,
       value,
     })),
+    ...scopedPatterns,
     { name: "synthetic_owner", value: SYNTHETIC_OWNER_ID },
     { name: "synthetic_tenant", value: SYNTHETIC_TENANT_ID },
     { name: "run_root", value: context.runRoot },
@@ -4391,6 +4587,104 @@ async function scanNoLogFiles(files, literalPatterns, forbiddenPatterns) {
   return Object.freeze({ rowCount, hitCount });
 }
 
+async function scanRuntimeLogDatabase(path, literalPatterns, forbiddenPatterns, required) {
+  let metadata;
+  try {
+    metadata = await lstat(path);
+  } catch (error) {
+    if (!required && error?.code === "ENOENT") {
+      return Object.freeze({ present: false, rowCount: 0, hitCount: 0 });
+    }
+    fail("orchestrator_no_log_invalid");
+  }
+  if (
+    !metadata.isFile() || metadata.isSymbolicLink() || !ownedByCurrentUser(metadata) ||
+    metadata.nlink !== 1 || (metadata.mode & 0o022) !== 0 || metadata.size > 16 * 1024 * 1024 ||
+    (await realpath(path)) !== path
+  ) fail("orchestrator_no_log_invalid");
+  let database;
+  let result;
+  let operationError;
+  try {
+    database = new DatabaseSync(path, { readOnly: true });
+    const tables = database.prepare(
+      "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name ASC",
+    ).all().map(({ name }) => name);
+    if (JSON.stringify(tables) !== JSON.stringify([
+      "_sqlx_migrations", "logs", "sqlite_sequence",
+    ])) fail("orchestrator_no_log_invalid");
+    const columns = database.prepare("PRAGMA table_info(logs)").all().map((column) => ({
+      cid: column.cid,
+      name: column.name,
+      type: column.type,
+      notnull: column.notnull,
+      dflt_value: column.dflt_value,
+      pk: column.pk,
+    }));
+    if (JSON.stringify(columns) !== JSON.stringify([
+      { cid: 0, name: "id", type: "INTEGER", notnull: 0, dflt_value: null, pk: 1 },
+      { cid: 1, name: "ts", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 2, name: "ts_nanos", type: "INTEGER", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 3, name: "level", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 4, name: "target", type: "TEXT", notnull: 1, dflt_value: null, pk: 0 },
+      { cid: 5, name: "feedback_log_body", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 },
+      { cid: 6, name: "module_path", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 },
+      { cid: 7, name: "file", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 },
+      { cid: 8, name: "line", type: "INTEGER", notnull: 0, dflt_value: null, pk: 0 },
+      { cid: 9, name: "thread_id", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 },
+      { cid: 10, name: "process_uuid", type: "TEXT", notnull: 0, dflt_value: null, pk: 0 },
+      { cid: 11, name: "estimated_bytes", type: "INTEGER", notnull: 1, dflt_value: "0", pk: 0 },
+    ])) fail("orchestrator_no_log_invalid");
+    const rows = database.prepare(
+      "SELECT level, target, feedback_log_body, module_path, file " +
+      "FROM logs ORDER BY id ASC LIMIT 4097",
+    ).all();
+    if (rows.length > 4096) fail("orchestrator_no_log_invalid");
+    let rowCount = 0;
+    let hitCount = 0;
+    let totalBytes = 0;
+    for (const row of rows) {
+      if (
+        typeof row.level !== "string" || typeof row.target !== "string" ||
+        ![row.feedback_log_body, row.module_path, row.file].every(
+          (value) => value === null || typeof value === "string",
+        )
+      ) fail("orchestrator_no_log_invalid");
+      const rowHits = new Set();
+      for (const value of [
+        row.level, row.target, row.feedback_log_body, row.module_path, row.file,
+      ]) {
+        if (value === null) continue;
+        const content = Buffer.from(`${value}\n`, "utf8");
+        totalBytes += content.length;
+        if (totalBytes > CHILD_OUTPUT_MAX_BYTES) fail("orchestrator_no_log_invalid");
+        const scan = scanNoLogBuffer(content, literalPatterns, forbiddenPatterns);
+        for (const hit of scan.hits) {
+          rowHits.add(JSON.stringify([hit.rule, hit.fieldClass, hit.reasonClass]));
+        }
+      }
+      rowCount += 1;
+      hitCount += rowHits.size;
+    }
+    result = Object.freeze({ present: true, rowCount, hitCount });
+  } catch (error) {
+    operationError = error instanceof S10BO1OrchestratorError
+      ? error
+      : new S10BO1OrchestratorError("orchestrator_no_log_invalid");
+  }
+  let closeFailed = false;
+  if (database) {
+    try {
+      database.close();
+    } catch {
+      closeFailed = true;
+    }
+  }
+  if (operationError) throw operationError;
+  if (closeFailed || !result) fail("orchestrator_no_log_invalid");
+  return result;
+}
+
 export async function captureRuntimeLogScan(context, operations = {}) {
   if (
     !context?.composeLogsRequired || !RUN_ID_PATTERN.test(context.runId ?? "") ||
@@ -4459,7 +4753,7 @@ export async function captureRuntimeLogScan(context, operations = {}) {
       RUNTIME_LOG_SERVICE_ROLES.map((role) => `compose:${role}`).sort(asciiCompare),
     )
   ) fail("orchestrator_no_log_invalid");
-  const { literalPatterns, forbiddenPatterns } = noLogPatternSet(context);
+  const { literalPatterns, forbiddenPatterns } = await noLogPatternSet(context);
   let rowCount = 0;
   let hitCount = 0;
   const hitOrigins = [];
@@ -4526,7 +4820,7 @@ export async function scanNoLog(context) {
   if (!context?.runRoot || !(context.secrets instanceof Map) || !context.attempt?.markerPath) {
     fail("orchestrator_no_log_invalid");
   }
-  const { literalPatterns, forbiddenPatterns, classificationRules } = noLogPatternSet(context);
+  const { literalPatterns, forbiddenPatterns, classificationRules } = await noLogPatternSet(context);
   if (context.runRootPresent === false) {
     if (
       context.phase !== "preflight_failed" || context.composeAttempted !== false ||
@@ -4591,13 +4885,15 @@ export async function scanNoLog(context) {
     [context.preflightEvidenceRoot, true],
     [resolve(context.runRoot, "bootstrap-evidence"), false],
     [resolve(context.runRoot, "host"), false],
-    [resolve(context.runRoot, "host-home"), false],
-    [resolve(context.runRoot, "codex-home"), false],
     [resolve(context.runRoot, "secure-storage"), false, new Set(["ephemeral-secrets"])],
   ];
   let files;
   try {
     await requireOwnerDirectory(context.runRoot);
+    await Promise.all([
+      validateStateRootMetadata(resolve(context.runRoot, "host-home")),
+      validateStateRootMetadata(resolve(context.runRoot, "codex-home")),
+    ]);
     files = [...new Set([
       ...(await Promise.all(
         scanRoots.map(([root, required, excluded]) => listInspectableFiles(root, required, excluded)),
@@ -4670,6 +4966,12 @@ export async function scanNoLog(context) {
   if ([...requiredFiles].some((path) => !files.includes(path))) {
     fail("orchestrator_no_log_invalid");
   }
+  const runtimeDatabaseScan = await scanRuntimeLogDatabase(
+    resolve(context.runRoot, "codex-home", "logs_2.sqlite"),
+    literalPatterns,
+    forbiddenPatterns,
+    Boolean(context.runtimeEvidence || context.descendantProcesses?.runtime),
+  );
   const scan = await scanNoLogFiles(files, literalPatterns, forbiddenPatterns);
   return Object.freeze({
     schema_version: 1,
@@ -4677,9 +4979,9 @@ export async function scanNoLog(context) {
     coverage: preflightOnly
       ? "all_preflight_log_and_evidence_sources"
       : "all_run_log_and_evidence_sources",
-    file_count: files.length,
-    row_count: scan.rowCount + (runtimeLogScan?.row_count ?? 0),
-    hit_count: scan.hitCount + (runtimeLogScan?.hit_count ?? 0),
+    file_count: files.length + (runtimeDatabaseScan.present ? 1 : 0),
+    row_count: scan.rowCount + runtimeDatabaseScan.rowCount + (runtimeLogScan?.row_count ?? 0),
+    hit_count: scan.hitCount + runtimeDatabaseScan.hitCount + (runtimeLogScan?.hit_count ?? 0),
     external_source_count: runtimeLogScan?.source_count ?? 0,
     external_row_count: runtimeLogScan?.row_count ?? 0,
     external_source_set_sha256: runtimeLogScan?.source_set_sha256 ?? sha256(""),
@@ -4916,6 +5218,8 @@ function createLiveOperations(authority, attempt, parentGuard = createParentIden
     composeCleanupRequired: false,
     composeLogsRequired: false,
     cleanupUnknown: false,
+    noLogAuthorityCaptureRequired: true,
+    noLogAuthorityCaptureFailed: false,
     processes: {},
     parentSignal: parentController.signal,
   };
@@ -5006,6 +5310,8 @@ function createLiveOperations(authority, attempt, parentGuard = createParentIden
         };
         throw error;
       }
+      context.noLogAuthorityCaptureRequired = true;
+      context.noLogAuthorityCaptureFailed = false;
       context.parentSignal = parentController.signal;
       return context.summary;
     },
@@ -5063,6 +5369,11 @@ function createLiveOperations(authority, attempt, parentGuard = createParentIden
       context.phase = "component_ready";
       requireParentAlive();
       return ownership;
+    },
+    async captureNoLogAuthority() {
+      requireParentAlive();
+      await captureRunScopedNoLogAuthority(context);
+      requireParentAlive();
     },
     async sendAbort() {
       requireParentAlive();
@@ -5661,6 +5972,17 @@ async function reconcileClaimedAttempt(authority, attempt) {
   const baselineVolumeNames = failure
     ? volumeNamesFromKeys(authority.runId, failure.retained_volume_keys)
     : volumeNamesFromKeys(authority.runId, S10_NAMED_VOLUME_KEYS);
+  const reconcileNoLogAuthority = {
+    runRoot,
+    runRootPresent: true,
+    phase: failure?.phase ?? "desktop_exited",
+    requireCompleteNoLogAuthority: expectedRoles.includes("desktop"),
+  };
+  try {
+    await captureRunScopedNoLogAuthority(reconcileNoLogAuthority);
+  } catch {
+    // Cleanup remains mandatory; the later no-log result fails closed.
+  }
   let reconciled;
   let cleanupFailure;
   try {
@@ -5701,6 +6023,11 @@ async function reconcileClaimedAttempt(authority, attempt) {
         closure,
         reconciled.records,
       );
+      noLogContext.noLogAuthorityCaptureRequired = true;
+      noLogContext.noLogAuthorityCaptureFailed =
+        reconcileNoLogAuthority.noLogAuthorityCaptureFailed;
+      noLogContext.runScopedSecretPatterns =
+        reconcileNoLogAuthority.runScopedSecretPatterns;
       noLog = await scanNoLog(noLogContext);
       validateNoLogResult(noLog);
       try {

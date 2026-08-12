@@ -4,16 +4,19 @@ import { createHash } from "node:crypto";
 import { EventEmitter, once } from "node:events";
 import {
   chmod,
+  link,
   mkdir,
   mkdtemp,
   readFile,
   realpath,
   rm,
+  symlink,
   unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { PassThrough, Writable } from "node:stream";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
@@ -25,6 +28,7 @@ import {
   S10BO1OrchestratorError,
   buildOrchestratorPlan,
   assessProcessCleanup,
+  captureRunScopedNoLogAuthority,
   classifyProjectVolumes,
   closeControlWriter,
   createParentIdentityGuard,
@@ -134,6 +138,44 @@ function noLogResult(overrides = {}) {
   };
 }
 
+function createRuntimeLogDatabase(path) {
+  const database = new DatabaseSync(path);
+  database.exec(`
+    CREATE TABLE _sqlx_migrations (
+      version BIGINT PRIMARY KEY,
+      description TEXT NOT NULL,
+      installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      success BOOLEAN NOT NULL,
+      checksum BLOB NOT NULL,
+      execution_time BIGINT NOT NULL
+    );
+    CREATE TABLE logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER NOT NULL,
+      ts_nanos INTEGER NOT NULL,
+      level TEXT NOT NULL,
+      target TEXT NOT NULL,
+      feedback_log_body TEXT,
+      module_path TEXT,
+      file TEXT,
+      line INTEGER,
+      thread_id TEXT,
+      process_uuid TEXT,
+      estimated_bytes INTEGER NOT NULL DEFAULT 0
+    );
+  `);
+  database.close();
+}
+
+function encodeEphemeralSecret(tag, payload) {
+  const header = Buffer.alloc(14);
+  Buffer.from([0x59, 0x4a, 0x31, 0x32, 0x36, 0x53, 0x31, 0x00]).copy(header, 0);
+  header[8] = tag;
+  header[9] = 0;
+  header.writeUInt32BE(payload.length, 10);
+  return Buffer.concat([header, payload]);
+}
+
 function businessBoundaryResult(overrides = {}) {
   return {
     schema_version: 1,
@@ -235,6 +277,7 @@ function flowOperations(calls, overrides = {}) {
       calls.push("ownership");
       return { infra: { children: ["api", "fake", "desktop"] }, desktop: { children: ["host"] }, host: { children: ["runtime"] } };
     },
+    async captureNoLogAuthority() { calls.push("capture_no_log_authority"); },
     async sendAbort() { calls.push("send:abort"); },
     async waitForDesktopExit() { calls.push("desktop_exit"); },
     async initiateDesktopAbort() { calls.push("desktop_abort"); },
@@ -548,9 +591,26 @@ test("S10BO2-006 executes the only allowed spawn and abort order", async () => {
   assert.equal(result.s10b_r8_executed, false);
   assert.deepEqual(calls, [
     "preflight", "build_desktop", "dependencies", "api", "fake", "desktop",
-    "read:component_ready", "ownership", "send:abort", "read:abort_complete",
+    "read:component_ready", "ownership", "capture_no_log_authority", "send:abort", "read:abort_complete",
     "read:eof", "desktop_exit", "business_boundary", "cleanup", "no_log",
   ]);
+});
+
+test("S10BO2-006 captures the no-log authority before abort can remove secrets", async () => {
+  const calls = [];
+  const operations = flowOperations(calls, {
+    async captureNoLogAuthority() {
+      calls.push("capture_no_log_authority");
+      calls.push("ephemeral_secrets_present");
+    },
+    async sendAbort() {
+      assert.equal(calls.includes("ephemeral_secrets_present"), true);
+      calls.push("send:abort");
+    },
+  });
+  const result = await runStartupAbortFlow({ runId, repositories }, operations);
+  assert.equal(result.status, "passed");
+  assert.ok(calls.indexOf("capture_no_log_authority") < calls.indexOf("send:abort"));
 });
 
 test("S10BO2-007 unexpected exit initiates Desktop-owned abort then exact cleanup", async () => {
@@ -1116,6 +1176,8 @@ test("S10BO2-013 scans all evidence roots and fails closed when a root is missin
   const preflightEvidenceRoot = resolve(runRoot, "preflight-evidence");
   const hostRoot = resolve(runRoot, "host");
   const hostInstance = resolve(hostRoot, nonce);
+  const hostHome = resolve(runRoot, "host-home");
+  const codexHome = resolve(runRoot, "codex-home");
   const attemptPreclaim = resolve(runRoot, "preclaim.v1.json");
   const attemptMarker = resolve(runRoot, "attempt.v1.json");
   const runtimeLogScan = {
@@ -1127,7 +1189,9 @@ test("S10BO2-013 scans all evidence roots and fails closed when a root is missin
     hit_count: 0,
     source_set_sha256: "e".repeat(64),
   };
-  for (const directory of [logRoot, evidenceRoot, preflightEvidenceRoot, hostRoot, hostInstance]) {
+  for (const directory of [
+    logRoot, evidenceRoot, preflightEvidenceRoot, hostRoot, hostInstance, hostHome, codexHome,
+  ]) {
     await mkdir(directory, { mode: 0o700 });
     await chmod(directory, 0o700);
   }
@@ -1143,6 +1207,39 @@ test("S10BO2-013 scans all evidence roots and fails closed when a root is missin
     await writeFile(path, value, { mode: 0o600 });
     await chmod(path, 0o600);
   }
+  const hostState = resolve(hostHome, "sessions.db");
+  const runtimeState = resolve(codexHome, "state_5.sqlite-wal");
+  const apiToken = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789_-AbCdE";
+  const receiptKey = Buffer.alloc(32, 0xab);
+  const chatSqlcipherKey = Buffer.alloc(32, 0xbc);
+  const receiptHmacKey = Buffer.alloc(32, 0xcd);
+  const nativeAuthSecret = Buffer.alloc(48, 0xde);
+  await writeFile(hostState, Buffer.from([0x53, 0x51, 0x4c, 0x69, 0xff]), { mode: 0o600 });
+  await chmod(hostState, 0o600);
+  await writeFile(runtimeState, Buffer.alloc(2 * 1024 * 1024, 0xff), { mode: 0o644 });
+  await chmod(runtimeState, 0o644);
+  const runtimeLogDatabase = resolve(codexHome, "logs_2.sqlite");
+  createRuntimeLogDatabase(runtimeLogDatabase);
+  await chmod(runtimeLogDatabase, 0o644);
+  await writeFile(resolve(hostHome, "api-token"), `${apiToken}\n`, { mode: 0o600 });
+  await chmod(resolve(hostHome, "api-token"), 0o600);
+  await writeFile(resolve(hostHome, "cleanup-receipt.key"), receiptKey, { mode: 0o600 });
+  await chmod(resolve(hostHome, "cleanup-receipt.key"), 0o600);
+  const secureStorageRoot = resolve(runRoot, "secure-storage");
+  const ephemeralSecretRoot = resolve(secureStorageRoot, "ephemeral-secrets");
+  await mkdir(secureStorageRoot, { mode: 0o700 });
+  await chmod(secureStorageRoot, 0o700);
+  await mkdir(ephemeralSecretRoot, { mode: 0o700 });
+  await chmod(ephemeralSecretRoot, 0o700);
+  for (const [basename, tag, payload] of [
+    ["chat-sqlcipher-v1.secret", 1, chatSqlcipherKey],
+    ["receipt-hmac-v1.secret", 2, receiptHmacKey],
+    ["native-auth-v1.secret", 3, nativeAuthSecret],
+  ]) {
+    const path = resolve(ephemeralSecretRoot, basename);
+    await writeFile(path, encodeEphemeralSecret(tag, payload), { mode: 0o600 });
+    await chmod(path, 0o600);
+  }
   const context = {
     runRoot,
     logRoot,
@@ -1153,7 +1250,7 @@ test("S10BO2-013 scans all evidence roots and fails closed when a root is missin
     runtimeLogScan,
   };
   const clean = await scanNoLog(context);
-  assert.equal(clean.file_count, 7);
+  assert.equal(clean.file_count, 8);
   assert.equal(clean.hit_count, 0);
   assert.equal(
     (await scanNoLog({
@@ -1179,6 +1276,139 @@ test("S10BO2-013 scans all evidence roots and fails closed when a root is missin
   await writeFile(apiEvidence, `${JSON.stringify(processRecord("api", 0))}\n`, { mode: 0o600 });
   await chmod(apiEvidence, 0o600);
   assert.equal((await scanNoLog(processContext)).hit_count, 0);
+
+  const writableLogDatabase = new DatabaseSync(runtimeLogDatabase);
+  writableLogDatabase.prepare(
+    "INSERT INTO logs " +
+    "(ts, ts_nanos, level, target, feedback_log_body, module_path, file) " +
+    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+  ).run(1, 0, "INFO", "runtime::worker", "ready", "runtime::module", "src/main.rs");
+  writableLogDatabase.close();
+  assert.equal((await scanNoLog(context)).hit_count, 0);
+  const cleanupBenignLogDatabase = new DatabaseSync(runtimeLogDatabase);
+  cleanupBenignLogDatabase.exec("DELETE FROM logs");
+  cleanupBenignLogDatabase.close();
+
+  const sensitiveLogDatabase = new DatabaseSync(runtimeLogDatabase);
+  sensitiveLogDatabase.prepare(
+    "INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body) VALUES (?, ?, ?, ?, ?)",
+  ).run(1, 0, "INFO", "synthetic", apiToken);
+  sensitiveLogDatabase.close();
+  assert.equal((await scanNoLog(context)).hit_count > 0, true);
+  const cleanupLogDatabase = new DatabaseSync(runtimeLogDatabase);
+  cleanupLogDatabase.exec("DELETE FROM logs");
+  cleanupLogDatabase.close();
+
+  const extraTableDatabase = new DatabaseSync(runtimeLogDatabase);
+  extraTableDatabase.exec("CREATE TABLE unexpected (value TEXT)");
+  extraTableDatabase.close();
+  await assert.rejects(
+    scanNoLog(context),
+    (error) => errorCode(error) === "orchestrator_no_log_invalid",
+  );
+  const removeExtraTableDatabase = new DatabaseSync(runtimeLogDatabase);
+  removeExtraTableDatabase.exec("DROP TABLE unexpected");
+  removeExtraTableDatabase.close();
+
+  const extraColumnDatabase = new DatabaseSync(runtimeLogDatabase);
+  extraColumnDatabase.exec("ALTER TABLE logs ADD COLUMN unexpected TEXT");
+  extraColumnDatabase.close();
+  await assert.rejects(
+    scanNoLog(context),
+    (error) => errorCode(error) === "orchestrator_no_log_invalid",
+  );
+  await unlink(runtimeLogDatabase);
+  createRuntimeLogDatabase(runtimeLogDatabase);
+  await chmod(runtimeLogDatabase, 0o644);
+
+  const oversizedDatabase = new DatabaseSync(runtimeLogDatabase);
+  const insertLog = oversizedDatabase.prepare(
+    "INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body) VALUES (?, ?, ?, ?, ?)"
+  );
+  for (let index = 0; index < 4097; index += 1) {
+    insertLog.run(index + 2, 0, "INFO", "synthetic", null);
+  }
+  oversizedDatabase.close();
+  await assert.rejects(
+    scanNoLog(context),
+    (error) => errorCode(error) === "orchestrator_no_log_invalid",
+  );
+  const removeOversizedRowsDatabase = new DatabaseSync(runtimeLogDatabase);
+  removeOversizedRowsDatabase.exec("DELETE FROM logs");
+  removeOversizedRowsDatabase.close();
+
+  const oversizedProjectionDatabase = new DatabaseSync(runtimeLogDatabase);
+  oversizedProjectionDatabase.prepare(
+    "INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body) VALUES (?, ?, ?, ?, ?)",
+  ).run(1, 0, "INFO", "synthetic", "x".repeat(1024 * 1024));
+  oversizedProjectionDatabase.close();
+  await assert.rejects(
+    scanNoLog(context),
+    (error) => errorCode(error) === "orchestrator_no_log_invalid",
+  );
+  const removeOversizedProjectionDatabase = new DatabaseSync(runtimeLogDatabase);
+  removeOversizedProjectionDatabase.exec("DELETE FROM logs");
+  removeOversizedProjectionDatabase.close();
+
+  const runtimeLogHardlink = resolve(codexHome, "logs_2-copy.sqlite");
+  await link(runtimeLogDatabase, runtimeLogHardlink);
+  await assert.rejects(
+    scanNoLog(context),
+    (error) => errorCode(error) === "orchestrator_no_log_invalid",
+  );
+  await unlink(runtimeLogHardlink);
+  await chmod(runtimeLogDatabase, 0o666);
+  await assert.rejects(
+    scanNoLog(context),
+    (error) => errorCode(error) === "orchestrator_no_log_invalid",
+  );
+  await chmod(runtimeLogDatabase, 0o644);
+
+  const stateSymlink = resolve(codexHome, "foreign-state");
+  await symlink(runtimeState, stateSymlink);
+  await assert.rejects(
+    scanNoLog(context),
+    (error) => errorCode(error) === "orchestrator_no_log_invalid",
+  );
+  await unlink(stateSymlink);
+  await chmod(runtimeState, 0o666);
+  await assert.rejects(
+    scanNoLog(context),
+    (error) => errorCode(error) === "orchestrator_no_log_invalid",
+  );
+  await chmod(runtimeState, 0o644);
+
+  const stateSecretLeak = resolve(evidenceRoot, "state-secret-leak.json");
+  await writeFile(
+    stateSecretLeak,
+    `${JSON.stringify({ token: apiToken, receipt: receiptKey.toString("hex") })}\n`,
+    { mode: 0o600 },
+  );
+  await chmod(stateSecretLeak, 0o600);
+  assert.equal((await scanNoLog(context)).hit_count > 0, true);
+  await unlink(stateSecretLeak);
+
+  const capturedAuthorityContext = {
+    ...context,
+    phase: "component_ready",
+    noLogAuthorityCaptureRequired: true,
+  };
+  await captureRunScopedNoLogAuthority(capturedAuthorityContext);
+  await unlink(resolve(hostHome, "api-token"));
+  await unlink(resolve(hostHome, "cleanup-receipt.key"));
+  await rm(ephemeralSecretRoot, { recursive: true });
+  await writeFile(
+    stateSecretLeak,
+    `${JSON.stringify({ token: apiToken, secret: nativeAuthSecret.toString("hex") })}\n`,
+    { mode: 0o600 },
+  );
+  await chmod(stateSecretLeak, 0o600);
+  assert.equal((await scanNoLog(capturedAuthorityContext)).hit_count > 0, true);
+  await unlink(stateSecretLeak);
+  await assert.rejects(
+    scanNoLog({ ...context, noLogAuthorityCaptureRequired: true }),
+    (error) => errorCode(error) === "orchestrator_no_log_invalid",
+  );
 
   await unlink(attemptPreclaim);
   await assert.rejects(
