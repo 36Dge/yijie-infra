@@ -23,6 +23,7 @@
 {"level":"warn","ts":23,"logger":"pki.ca.local","msg":"root certificate trust store installation disabled; unconfigured clients may show warnings","path":"storage:pki/authorities/local/root.crt"}
 {"level":"info","ts":24,"logger":"tls","msg":"cleaning storage unit","storage":"FileStorage:/data/caddy","storage_path":"/data/caddy"}
 {"level":"info","ts":25,"logger":"tls","msg":"finished cleaning storage units"}
+{"level":"info","ts":25.5,"logger":"tls","msg":"storage cleaning happened too recently; skipping for now","instance":"019fbd88-cbc3-4bf1-934d-7b05cd693f80","try_again":86425.5,"try_again_in":86400}
 {"level":"debug","ts":26,"logger":"http.handlers.reverse_proxy","msg":"selected upstream","upstream":"host.docker.internal:18080"}
 {"level":"debug","ts":27,"logger":"http.handlers.reverse_proxy","msg":"upstream roundtrip","upstream":"host.docker.internal:18080","duration":0.001}
 {"level":"info","ts":28,"msg":"autosaved config (load with --resume flag)","file":"/config/caddy/autosave.json","path":"/config/caddy/autosave.json"}

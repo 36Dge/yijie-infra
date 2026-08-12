@@ -3905,6 +3905,7 @@ function approvedCaddySystemFieldValue(key, value) {
       "selected upstream",
       "serving initial configuration",
       "started background certificate maintenance",
+      "storage cleaning happened too recently; skipping for now",
       "upstream roundtrip",
       "using config from file",
       "waiting on internal rate limiter",
@@ -3972,6 +3973,11 @@ function approvedCaddySystemFieldValue(key, value) {
   if (key === "account") return value === "";
   if (key === "issuer") return value === "local";
   if (key === "attempt") return value === 1;
+  if (key === "instance") return RUN_ID_PATTERN.test(value);
+  if (key === "try_again") return typeof value === "number" && Number.isFinite(value) && value > 0;
+  if (key === "try_again_in") {
+    return typeof value === "number" && Number.isFinite(value) && value > 0 && value <= 86_400;
+  }
   if (key === "origins") {
     return Array.isArray(value) && JSON.stringify([...value].sort()) === JSON.stringify([
       "//127.0.0.1:2019",
@@ -4102,6 +4108,10 @@ function approvedCaddySystemEvent(value) {
     case "cleaning storage unit":
       return value.logger === "tls" &&
         schema("level", "ts", "logger", "msg", "storage", "storage_path");
+    case "storage cleaning happened too recently; skipping for now":
+      return value.logger === "tls" && value.try_again > value.ts &&
+        Math.abs((value.try_again - value.ts) - value.try_again_in) <= 1 &&
+        schema("level", "ts", "logger", "msg", "instance", "try_again", "try_again_in");
     case "selected upstream":
       return value.logger === "http.handlers.reverse_proxy" &&
         schema("level", "ts", "logger", "msg", "upstream");

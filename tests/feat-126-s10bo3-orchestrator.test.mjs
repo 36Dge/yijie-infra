@@ -1487,7 +1487,10 @@ test("S10BO3-017 captures Compose logs before cleanup and marks leaks failed", a
     .replace("GOMAXPROCS=2", "GOMAXPROCS=3")
     .replace('"GOMEMLIMIT":268435456', '"GOMEMLIMIT":536870912')
     .replace('"previous":9223372036854776000', '"previous":1073741824')
-    .replace('"cache":"0x1a2b3c4d"', '"cache":"0xdeadbeef"');
+    .replaceAll('"cache":"0x1a2b3c4d"', '"cache":"0xdeadbeef"')
+    .replace('"instance":"019fbd88-cbc3-4bf1-934d-7b05cd693f80"', '"instance":"019fbd88-cbc3-4bf1-934d-7b05cd693f81"')
+    .replace('"try_again":86425.5', '"try_again":43225.5')
+    .replace('"try_again_in":86400', '"try_again_in":43200');
   const dynamicCaddySystemFixture = await captureRuntimeLogScan(context, {
     async list() { return canonicalSources; },
     readLogs: logsWith([canonicalSources[1].container_id], dynamicCaddySystemLog),
@@ -1503,6 +1506,9 @@ test("S10BO3-017 captures Compose logs before cleanup and marks leaks failed", a
     ['"logger":"http.log","msg":"server running"', '"logger":"http","msg":"server running"', ["unclassified_caddy_system_value"]],
     ['"logger":"tls.obtain","msg":"acquiring lock"', '"logger":"admin","msg":"acquiring lock"', ["unclassified_caddy_system_value"]],
     ['"msg":"server running","name":"srv0"', '"msg":"server running","identifier":"localhost"', ["unclassified_caddy_system_value"]],
+    ['"instance":"019fbd88-cbc3-4bf1-934d-7b05cd693f80"', '"instance":"opaque"', ["unclassified_caddy_system_value"]],
+    ['"try_again":86425.5', '"try_again":1', ["unclassified_caddy_system_value"]],
+    ['"try_again_in":86400', '"try_again_in":0', ["unclassified_caddy_system_value"]],
   ]) {
     const invalidCaddySystemFixture = await captureRuntimeLogScan(context, {
       async list() { return canonicalSources; },
