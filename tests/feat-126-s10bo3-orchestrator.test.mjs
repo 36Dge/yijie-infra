@@ -58,6 +58,7 @@ import {
   validatePreflightFailureBinding,
   validateReconcileFailureProcessState,
   validateRuntimeLogScan,
+  validateStartupFailureControlFrame,
   writeAttemptClosure,
   writeAttemptFailure,
   writeAttemptReconcile,
@@ -545,7 +546,40 @@ test("S10BO3 corrective persists a known no-log scope when the completed scan fa
   assert.equal(observed.closure.no_log_failure_class, "orchestrator_no_log_invalid");
 });
 
-test("S10BO3 corrective persists a closed Desktop startup leaf without continuation", async (t) => {
+test("S10BO3 corrective persists every closed Desktop login leaf without continuation", async (t) => {
+  const loginFailureClasses = [
+    "driver_login_authorization_page_failed",
+    "driver_login_authorization_request_invalid",
+    "driver_login_authorization_start_failed",
+    "driver_login_callback_rejected",
+    "driver_login_concurrent",
+    "driver_login_credential_submit_failed",
+    "driver_login_credentials_rejected",
+    "driver_login_failed",
+    "driver_login_form_invalid",
+    "driver_login_runtime_invalid",
+    "driver_login_secret_invalid",
+    "driver_login_session_failed",
+    "driver_login_storage_failed",
+    "driver_login_token_exchange_failed",
+  ];
+  for (const failureClass of loginFailureClasses) {
+    const nonce = "12600000-0000-4000-8000-000000000071";
+    const frame = {
+      schema_version: 1,
+      run_id: runId,
+      nonce,
+      sequence: 1,
+      kind: "startup_failed",
+      failure_class: failureClass,
+    };
+    assert.equal(validateStartupFailureControlFrame(frame, {
+      allowedKinds: ["abort_complete", "component_ready", "startup_failed"],
+      nonce,
+      previousSequence: 0,
+      runId,
+    }).failure_class, failureClass);
+  }
   const { root, attempt } = await writeSyntheticAttemptFiles(t, "feat126-s10bo3-desktop-leaf-");
   const retainedVolumeKeys = [
     "feat126_s10_api_postgres_data",
@@ -568,7 +602,7 @@ test("S10BO3 corrective persists a closed Desktop startup leaf without continuat
       async readDesktopFrame(kind) {
         calls.push(`read:${kind}`);
         phase = "desktop_starting";
-        throw new S10BO1OrchestratorError("driver_bind_failed");
+        throw new S10BO1OrchestratorError("driver_login_credentials_rejected");
       },
       async readOwnership() { calls.push("ownership"); throw new Error("unreachable"); },
       async sendAbort() { calls.push("normal_abort"); throw new Error("unreachable"); },
@@ -632,15 +666,15 @@ test("S10BO3 corrective persists a closed Desktop startup leaf without continuat
         }));
       },
     }),
-    codeIs("driver_bind_failed"),
+    codeIs("driver_login_credentials_rejected"),
   );
   const failure = await readAttemptFailure(attempt, authority);
   const closure = await readAttemptClosure(attempt, authority);
-  assert.equal(failure.failure_class, "driver_bind_failed");
+  assert.equal(failure.failure_class, "driver_login_credentials_rejected");
   assert.equal(failure.phase, "desktop_starting");
   assert.deepEqual(failure.process_roles, ["api", "desktop", "fake"]);
   assert.equal(failure.cleanup_failure_class, null);
-  assert.equal(closure.failure_class, "driver_bind_failed");
+  assert.equal(closure.failure_class, "driver_login_credentials_rejected");
   assert.equal(closure.evidence_failure_class, null);
   assert.equal(closure.business_status, "not_applicable");
   assert.equal(boundary.scope, "not_started");
@@ -1370,16 +1404,26 @@ test("S10BO3-017 captures Compose logs before cleanup and marks leaks failed", a
   assert.equal(rotated.source_set_sha256, clean.source_set_sha256);
   const benign = await captureRuntimeLogScan(context, {
     async list() { return canonicalSources; },
-    async readLogs() {
-      return Buffer.from(
-        '{"path":"/healthz","uri":"/healthz/v2","env":"local","payload":{"status":"ready"},"argv":[]}\n' +
-          '{"token":"","secret":null,"authorization":{}}\n',
-        "utf8",
-      );
-    },
+    readLogs: logsWith(
+      [canonicalSources[0].container_id],
+      '{"path":"/healthz","uri":"/healthz/v2","env":"local","payload":{"status":"ready"},"argv":[]}\n' +
+        '{"token":"","secret":null,"authorization":{}}\n',
+    ),
   });
   assert.equal(benign.status, "passed");
   assert.equal(benign.hit_count, 0);
+  const genericShapeAtCaddyOrigin = await captureRuntimeLogScan(context, {
+    async list() { return canonicalSources; },
+    readLogs: logsWith(
+      [canonicalSources[1].container_id],
+      '{"path":"/healthz","uri":"/healthz/v2","env":"local","payload":{"status":"ready"},"argv":[]}\n',
+    ),
+  });
+  assert.equal(genericShapeAtCaddyOrigin.status, "failed");
+  assert.equal(
+    genericShapeAtCaddyOrigin.hit_reason_class_set_sha256,
+    sha256("unclassified_caddy_system_value"),
+  );
   const caddyAccessLog = await readFile(
     "tests/fixtures/feat-126-caddy-2.11.4-access-log.jsonl",
   );
@@ -1399,6 +1443,80 @@ test("S10BO3-017 captures Compose logs before cleanup and marks leaks failed", a
   assert.equal(caddySystemFixture.status, "passed");
   assert.equal(caddySystemFixture.hit_count, 0);
   assert.equal(caddySystemFixture.hit_reason_class_set_sha256, sha256(""));
+  for (const invalidRoot of [
+    `${JSON.stringify([JSON.parse(caddyAccessLog.toString("utf8"))])}\n`,
+    '"ready"\n',
+    "null\n",
+  ]) {
+    const invalidCaddyRoot = await captureRuntimeLogScan(context, {
+      async list() { return canonicalSources; },
+      readLogs: logsWith([canonicalSources[1].container_id], invalidRoot),
+    });
+    assert.equal(invalidCaddyRoot.schema_version, 4);
+    assert.equal(invalidCaddyRoot.status, "failed");
+    assert.equal(invalidCaddyRoot.hit_count, 1);
+    assert.equal(
+      invalidCaddyRoot.hit_reason_class_set_sha256,
+      sha256("unclassified_caddy_system_value"),
+    );
+    assert.deepEqual(Object.keys(invalidCaddyRoot).sort(), Object.keys(caddySystemFixture).sort());
+  }
+  for (const nestedField of ["request", "headers", "tls", "resp_headers"]) {
+    const malformedAccess = structuredClone(JSON.parse(caddyAccessLog.toString("utf8")));
+    if (nestedField === "request" || nestedField === "resp_headers") {
+      malformedAccess[nestedField] = null;
+    } else {
+      malformedAccess.request[nestedField] = null;
+    }
+    const invalidCaddyAccess = await captureRuntimeLogScan(context, {
+      async list() { return canonicalSources; },
+      readLogs: logsWith(
+        [canonicalSources[1].container_id],
+        `${JSON.stringify(malformedAccess)}\n`,
+      ),
+    });
+    assert.equal(invalidCaddyAccess.schema_version, 4);
+    assert.equal(invalidCaddyAccess.status, "failed");
+    assert.equal(
+      invalidCaddyAccess.hit_reason_class_set_sha256,
+      sha256("unclassified_caddy_system_value"),
+    );
+    assert.deepEqual(Object.keys(invalidCaddyAccess).sort(), Object.keys(caddySystemFixture).sort());
+  }
+  const dynamicCaddySystemLog = caddySystemLog.toString("utf8")
+    .replace("GOMAXPROCS=2", "GOMAXPROCS=3")
+    .replace('"GOMEMLIMIT":268435456', '"GOMEMLIMIT":536870912')
+    .replace('"previous":9223372036854776000', '"previous":1073741824')
+    .replace('"cache":"0x1a2b3c4d"', '"cache":"0xdeadbeef"');
+  const dynamicCaddySystemFixture = await captureRuntimeLogScan(context, {
+    async list() { return canonicalSources; },
+    readLogs: logsWith([canonicalSources[1].container_id], dynamicCaddySystemLog),
+  });
+  assert.deepEqual(dynamicCaddySystemFixture, caddySystemFixture);
+  for (const [needle, replacement, reasonClasses] of [
+    ["GOMAXPROCS=2", "GOMAXPROCS=0", ["unclassified_caddy_system_value"]],
+    ['"GOMEMLIMIT":268435456', '"GOMEMLIMIT":1', ["unclassified_caddy_system_value"]],
+    ['"cache":"0x1a2b3c4d"', '"cache":"opaque"', ["unclassified_caddy_system_value"]],
+    ['"origins":["//localhost:2019","//[::1]:2019","//127.0.0.1:2019"]', '"origins":["//other:2019"]', ["unclassified_caddy_system_value"]],
+    ['"addr":":8443"', '"addr":"0.0.0.0:8443"', ["unclassified_caddy_system_value"]],
+    ['"path":"storage:pki/authorities/local/root.crt"', '"path":"/private/opaque"', ["local_machine_path_value", "unclassified_caddy_system_value"]],
+    ['"logger":"http.log","msg":"server running"', '"logger":"http","msg":"server running"', ["unclassified_caddy_system_value"]],
+    ['"logger":"tls.obtain","msg":"acquiring lock"', '"logger":"admin","msg":"acquiring lock"', ["unclassified_caddy_system_value"]],
+    ['"msg":"server running","name":"srv0"', '"msg":"server running","identifier":"localhost"', ["unclassified_caddy_system_value"]],
+  ]) {
+    const invalidCaddySystemFixture = await captureRuntimeLogScan(context, {
+      async list() { return canonicalSources; },
+      readLogs: logsWith(
+        [canonicalSources[1].container_id],
+        caddySystemLog.toString("utf8").replace(needle, replacement),
+      ),
+    });
+    assert.equal(invalidCaddySystemFixture.status, "failed");
+    assert.equal(
+      invalidCaddySystemFixture.hit_reason_class_set_sha256,
+      sha256(reasonClasses.join("\n")),
+    );
+  }
   const caddySystemShapeAtForeignOrigin = await captureRuntimeLogScan(context, {
     async list() { return canonicalSources; },
     readLogs: logsWith([canonicalSources[0].container_id], caddySystemLog),
@@ -1426,9 +1544,18 @@ test("S10BO3-017 captures Compose logs before cleanup and marks leaks failed", a
     ),
   });
   assert.equal(caddySensitive.status, "failed");
-  assert.equal(caddySensitive.hit_rule_set_sha256, sha256("sensitive_value_field"));
-  assert.equal(caddySensitive.hit_field_class_set_sha256, sha256("structured_sensitive"));
-  assert.equal(caddySensitive.hit_reason_class_set_sha256, sha256("sensitive_nonempty_value"));
+  assert.equal(
+    caddySensitive.hit_rule_set_sha256,
+    sha256(["sensitive_value_field", "unclassified_sensitive_field"].join("\n")),
+  );
+  assert.equal(
+    caddySensitive.hit_field_class_set_sha256,
+    sha256(["structured_sensitive", "structured_unclassified"].join("\n")),
+  );
+  assert.equal(
+    caddySensitive.hit_reason_class_set_sha256,
+    sha256(["sensitive_nonempty_value", "unclassified_caddy_system_value"].join("\n")),
+  );
   const sensitiveValue = await captureRuntimeLogScan(context, {
     async list() { return canonicalSources; },
     readLogs: logsWith([canonicalSources[0].container_id], '{"token":"opaque-value"}\n'),
@@ -1599,7 +1726,7 @@ test("S10BO3-017 captures Compose logs before cleanup and marks leaks failed", a
   assert.equal(nestedCaddySensitive.status, "failed");
   assert.equal(
     nestedCaddySensitive.hit_reason_class_set_sha256,
-    sha256("sensitive_nonempty_value"),
+    sha256(["sensitive_nonempty_value", "unclassified_caddy_system_value"].join("\n")),
   );
   const unclassified = await captureRuntimeLogScan(context, {
     async list() { return canonicalSources; },

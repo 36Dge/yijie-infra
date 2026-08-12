@@ -300,8 +300,21 @@ const DESKTOP_STARTUP_FAILURE_CLASSES = Object.freeze([
   "driver_frontend_bootstrap_timeout",
   "driver_frontend_ipc_timeout",
   "driver_frontend_startup_invalid",
+  "driver_login_authorization_page_failed",
+  "driver_login_authorization_request_invalid",
+  "driver_login_authorization_start_failed",
+  "driver_login_callback_rejected",
+  "driver_login_concurrent",
+  "driver_login_credential_submit_failed",
+  "driver_login_credentials_rejected",
   "driver_login_failed",
+  "driver_login_form_invalid",
   "driver_login_projection_invalid",
+  "driver_login_runtime_invalid",
+  "driver_login_secret_invalid",
+  "driver_login_session_failed",
+  "driver_login_storage_failed",
+  "driver_login_token_exchange_failed",
   "driver_nonce_invalid",
   "driver_profile_invalid",
   "driver_project_invalid",
@@ -3853,27 +3866,52 @@ function approvedContextFieldValue(key, value) {
 
 function approvedCaddySystemFieldValue(key, value) {
   if (key === "message" || key === "msg") {
+    if (/^maxprocs: Leaving GOMAXPROCS=[1-9][0-9]?: CPU quota undefined$/.test(value)) {
+      return true;
+    }
+    if (
+      /^failed to sufficiently increase receive buffer size \(was: [1-9][0-9]* KiB, wanted: [1-9][0-9]* KiB, got: [1-9][0-9]* KiB\)\. See https:\/\/github\.com\/quic-go\/quic-go\/wiki\/UDP-Buffer-Sizes for details\.$/.test(value)
+    ) {
+      return true;
+    }
     return [
       "adapted config to JSON",
       "admin endpoint started",
+      "acquiring lock",
       "autosaved config",
       "autosaved config (load with --resume flag)",
+      "Caddyfile input is not formatted; run 'caddy fmt --overwrite' to fix inconsistencies",
       "certificate cache maintenance started",
       "cleaning storage unit",
       "enabling automatic HTTP->HTTPS redirects",
       "enabling automatic TLS certificate management",
       "finished cleaning storage units",
+      "GOMEMLIMIT is updated",
       "handled request",
+      "enabling HTTP/3 listener",
+      "done waiting on internal rate limiter",
+      "issuing certificate",
+      "lock acquired",
+      "obtaining certificate",
+      "certificate obtained successfully",
+      "releasing lock",
+      "root certificate trust store installation disabled; unconfigured clients may show warnings",
+      "server is listening only on the HTTPS port but has no TLS connection policies; adding one to enable TLS",
+      "server running",
+      "shutting down apps, then terminating",
+      "shutdown complete",
+      "stopped background certificate maintenance",
       "initial configuration loaded",
       "selected upstream",
       "serving initial configuration",
       "started background certificate maintenance",
       "upstream roundtrip",
       "using config from file",
+      "waiting on internal rate limiter",
     ].includes(value);
   }
   if (unclassifiedStructuredField(key) && approvedContextFieldValue(key, value)) return true;
-  if (key === "level") return value === "info" || value === "debug";
+  if (key === "level") return value === "info" || value === "debug" || value === "warn";
   if (key === "ts" || key === "duration") return typeof value === "number" && value >= 0;
   if (key === "file") {
     return value === "/etc/caddy/Caddyfile" || value === "/config/caddy/autosave.json";
@@ -3881,17 +3919,34 @@ function approvedCaddySystemFieldValue(key, value) {
   if (key === "config_file") return value === "/etc/caddy/Caddyfile";
   if (key === "autosave_file") return value === "/config/caddy/autosave.json";
   if (key === "path" || key === "storage_path") {
-    return value === "/config/caddy/autosave.json" || value === "/data/caddy";
+    return value === "/config/caddy/autosave.json" || value === "/data/caddy" ||
+      value === "storage:pki/authorities/local/root.crt";
   }
   if (key === "adapter") return value === "caddyfile";
+  if (key === "line") return Number.isSafeInteger(value) && value > 0 && value <= 4096;
+  if (key === "package") {
+    return value === "github.com/KimMachineGun/automemlimit/memlimit";
+  }
+  if (key === "gomemlimit") {
+    return Number.isSafeInteger(value) && value >= 16 * 1024 * 1024 && value <= 16 * 1024 ** 3;
+  }
+  if (key === "previous") {
+    return value === 9223372036854776000 ||
+      (Number.isSafeInteger(value) && value >= 16 * 1024 * 1024 && value <= 16 * 1024 ** 3);
+  }
   if (key === "logger") {
     return [
       "admin",
+      "http",
       "http.auto_https",
       "http.handlers.reverse_proxy",
+      "http.log",
       "http.log.access",
+      "pki.ca.local",
       "tls",
       "tls.cache.maintenance",
+      "tls.issuance.internal",
+      "tls.obtain",
     ].includes(value);
   }
   if (key === "storage") return value === "FileStorage:/data/caddy";
@@ -3902,9 +3957,30 @@ function approvedCaddySystemFieldValue(key, value) {
   if (key === "domains") {
     return Array.isArray(value) && value.length === 1 && value[0] === "localhost";
   }
-  if (key === "server_name") return value === "srv0" || value === "localhost";
-  if (key === "cache") return value === "synthetic-cache";
+  if (key === "server_name") return value === "srv0" || value === "srv1" || value === "localhost";
+  if (key === "cache") return value === "synthetic-cache" || /^0x[0-9a-f]{6,16}$/.test(value);
+  if (key === "addr") return value === ":8443" || value === ":9443";
+  if (key === "https_port") return value === 8443 || value === 9443;
+  if (key === "protocols") {
+    return Array.isArray(value) && JSON.stringify(value) === JSON.stringify(["h1", "h2", "h3"]);
+  }
+  if (key === "identifier") return value === "localhost";
+  if (key === "identifiers") {
+    return Array.isArray(value) && value.length === 1 && value[0] === "localhost";
+  }
+  if (key === "ca") return value === "local";
+  if (key === "account") return value === "";
+  if (key === "issuer") return value === "local";
+  if (key === "attempt") return value === 1;
+  if (key === "origins") {
+    return Array.isArray(value) && JSON.stringify([...value].sort()) === JSON.stringify([
+      "//127.0.0.1:2019",
+      "//[::1]:2019",
+      "//localhost:2019",
+    ]);
+  }
   if (key === "upstream") return value === "host.docker.internal:18080";
+  if (key === "name") return value === "srv0" || value === "srv1";
   if (key === "request" || key === "headers" || key === "resp_headers" ||
       key === "tls" || key === "context") {
     return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -3936,6 +4012,115 @@ function approvedCaddySystemFieldValue(key, value) {
   return false;
 }
 
+function approvedCaddyAccessEvent(value) {
+  return exactKeys(value, [
+    "level", "ts", "logger", "msg", "request", "bytes_read", "user_id", "duration",
+    "size", "status", "resp_headers",
+  ]) &&
+    value.request !== null && typeof value.request === "object" && !Array.isArray(value.request) &&
+    value.request.headers !== null && typeof value.request.headers === "object" &&
+    !Array.isArray(value.request.headers) &&
+    value.request.tls !== null && typeof value.request.tls === "object" &&
+    !Array.isArray(value.request.tls) &&
+    value.resp_headers !== null && typeof value.resp_headers === "object" &&
+    !Array.isArray(value.resp_headers) &&
+    exactKeys(value.request, [
+      "remote_ip", "remote_port", "client_ip", "proto", "method", "host", "uri", "headers",
+      "tls",
+    ]) &&
+    exactKeys(value.request.headers, ["User-Agent", "Accept"]) &&
+    exactKeys(value.request.tls, [
+      "resumed", "version", "cipher_suite", "proto", "server_name",
+    ]) &&
+    exactKeys(value.resp_headers, ["Server", "Content-Type"]);
+}
+
+function approvedCaddySystemEvent(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const message = typeof value.msg === "string" ? value.msg : value.message;
+  if (typeof message !== "string") return false;
+  const schema = (...keys) => exactKeys(value, keys);
+  if (!Object.entries(value).every(([key, entry]) => (
+    approvedCaddySystemFieldValue(normalizedStructuredField(key), entry)
+  ))) return false;
+  if (message === "handled request") {
+    return value.logger === "http.log.access" && approvedCaddyAccessEvent(value);
+  }
+  if (/^maxprocs: Leaving GOMAXPROCS=[1-9][0-9]?: CPU quota undefined$/.test(message)) {
+    return schema("level", "ts", "msg");
+  }
+  if (message.startsWith("failed to sufficiently increase receive buffer size ")) {
+    return schema("level", "ts", "msg");
+  }
+  switch (message) {
+    case "GOMEMLIMIT is updated":
+      return schema("level", "ts", "msg", "package", "GOMEMLIMIT", "previous");
+    case "using config from file":
+      return schema("level", "ts", "msg", "file");
+    case "adapted config to JSON":
+      return schema("level", "ts", "msg", "adapter");
+    case "Caddyfile input is not formatted; run 'caddy fmt --overwrite' to fix inconsistencies":
+      return schema("level", "ts", "msg", "adapter", "file", "line");
+    case "admin endpoint started":
+      return value.logger === "admin" &&
+        schema("level", "ts", "logger", "msg", "address", "enforce_origin", "origins");
+    case "server is listening only on the HTTPS port but has no TLS connection policies; adding one to enable TLS":
+      return value.logger === "http.auto_https" &&
+        schema("level", "ts", "logger", "msg", "server_name", "https_port");
+    case "enabling automatic TLS certificate management":
+      return value.logger === "http.auto_https" &&
+        schema("level", "ts", "logger", "msg", "domains");
+    case "enabling automatic HTTP->HTTPS redirects":
+      return value.logger === "http.auto_https" &&
+        schema("level", "ts", "logger", "msg", "server_name");
+    case "started background certificate maintenance":
+    case "stopped background certificate maintenance":
+      return value.logger === "tls.cache.maintenance" &&
+        schema("level", "ts", "logger", "msg", "cache");
+    case "enabling HTTP/3 listener":
+      return value.logger === "http" && schema("level", "ts", "logger", "msg", "addr");
+    case "server running":
+      return value.logger === "http.log" &&
+        schema("level", "ts", "logger", "msg", "name", "protocols");
+    case "waiting on internal rate limiter":
+    case "done waiting on internal rate limiter":
+      return value.logger === "tls.issuance.internal" &&
+        schema("level", "ts", "logger", "msg", "identifiers", "ca", "account");
+    case "acquiring lock":
+    case "lock acquired":
+    case "obtaining certificate":
+    case "issuing certificate":
+    case "releasing lock":
+      return value.logger === "tls.obtain" &&
+        schema("level", "ts", "logger", "msg", "identifier");
+    case "certificate obtained successfully":
+      return value.logger === "tls.obtain" &&
+        schema("level", "ts", "logger", "msg", "identifier", "issuer");
+    case "root certificate trust store installation disabled; unconfigured clients may show warnings":
+      return value.logger === "pki.ca.local" &&
+        schema("level", "ts", "logger", "msg", "path");
+    case "cleaning storage unit":
+      return value.logger === "tls" &&
+        schema("level", "ts", "logger", "msg", "storage", "storage_path");
+    case "selected upstream":
+      return value.logger === "http.handlers.reverse_proxy" &&
+        schema("level", "ts", "logger", "msg", "upstream");
+    case "upstream roundtrip":
+      return value.logger === "http.handlers.reverse_proxy" &&
+        schema("level", "ts", "logger", "msg", "upstream", "duration");
+    case "autosaved config (load with --resume flag)":
+      return schema("level", "ts", "msg", "file", "path");
+    case "finished cleaning storage units":
+      return value.logger === "tls" && schema("level", "ts", "logger", "msg");
+    case "serving initial configuration":
+    case "shutting down apps, then terminating":
+    case "shutdown complete":
+      return schema("level", "ts", "msg");
+    default:
+      return false;
+  }
+}
+
 function localAbsolutePath(value) {
   if (typeof value !== "string") return false;
   if (/^[A-Za-z]:[\\/](?:Users|Documents and Settings)[\\/]/.test(value)) return true;
@@ -3965,7 +4150,18 @@ function structuredNoLogHits(value, origin = null) {
     const key = JSON.stringify([rule, fieldClass, reasonClass]);
     hits.set(key, Object.freeze({ rule, fieldClass, reasonClass }));
   };
-  function visit(current, sensitiveContext = false) {
+  function visit(current, sensitiveContext = false, depth = 0) {
+    const caddyOrigin = origin === "compose:feat126-s10-caddy";
+    if (
+      caddyOrigin && depth === 0 &&
+      (current === null || typeof current !== "object" || Array.isArray(current))
+    ) {
+      addHit(
+        "unclassified_sensitive_field",
+        "structured_unclassified",
+        "unclassified_caddy_system_value",
+      );
+    }
     if (typeof current === "string") {
       if (localAbsolutePath(current)) {
         addHit("absolute_local_path", "local_path", "local_machine_path_value");
@@ -3985,15 +4181,21 @@ function structuredNoLogHits(value, origin = null) {
       return;
     }
     if (Array.isArray(current)) {
-      for (const entry of current) visit(entry, sensitiveContext);
+      for (const entry of current) visit(entry, sensitiveContext, depth + 1);
       return;
     }
     if (current === null || typeof current !== "object") return;
+    if (caddyOrigin && depth === 0 && !approvedCaddySystemEvent(current)) {
+      addHit(
+        "unclassified_sensitive_field",
+        "structured_unclassified",
+        "unclassified_caddy_system_value",
+      );
+    }
     for (const [rawKey, entry] of Object.entries(current)) {
       const key = normalizedStructuredField(rawKey);
       const sensitiveField = sensitiveStructuredField(key);
       const approvedContext = approvedContextFieldValue(key, entry);
-      const caddyOrigin = origin === "compose:feat126-s10-caddy";
       if (sensitiveField && !emptyStructuredValue(entry)) {
         addHit("sensitive_value_field", "structured_sensitive", "sensitive_nonempty_value");
       }
@@ -4011,7 +4213,7 @@ function structuredNoLogHits(value, origin = null) {
             : "unclassified_context_value",
         );
       }
-      visit(entry, sensitiveContext || sensitiveField);
+      visit(entry, sensitiveContext || sensitiveField, depth + 1);
     }
   }
   visit(value);
