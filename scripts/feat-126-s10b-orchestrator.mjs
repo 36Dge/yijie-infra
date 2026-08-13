@@ -56,9 +56,11 @@ const R8_CASE_RESULT_KEYS = Object.freeze([
   ...CONTROL_KEYS, "assertion_count", "assertion_set_sha256", "case_id", "status",
 ]);
 const STARTUP_FAILURE_CONTROL_KEYS = Object.freeze([...CONTROL_KEYS, "failure_class"]);
+const POST_READY_FAILURE_CONTROL_KEYS = Object.freeze([...CONTROL_KEYS, "failure_class"]);
 const CONTROL_MAX_BYTES = 1024;
 const CONTROL_TIMEOUT_MS = 60_000;
 const R8_CASE_TIMEOUT_MS = 120_000;
+const DESKTOP_EXIT_DRAIN_TIMEOUT_MS = 100;
 const GUARDED_CONTROL_WRITERS = new WeakSet();
 const PROCESS_STOP_TIMEOUT_MS = 8_000;
 const CHILD_OUTPUT_MAX_BYTES = 1024 * 1024;
@@ -340,7 +342,9 @@ const RUNTIME_PROCESS_EVIDENCE_KEYS = Object.freeze([
 ]);
 const EXISTING_PROCESS_ROLES = Object.freeze(["api", "desktop", "fake", "host", "runtime"]);
 const INFRA_CONTROL_KINDS = Object.freeze(["abort"]);
-const DESKTOP_CONTROL_KINDS = Object.freeze(["abort_complete", "component_ready", "startup_failed"]);
+const DESKTOP_CONTROL_KINDS = Object.freeze([
+  "abort_complete", "component_failed", "component_ready", "startup_failed",
+]);
 const DESKTOP_STARTUP_FAILURE_CLASSES = Object.freeze([
   "driver_app_data_invalid",
   "driver_authority_invalid",
@@ -380,6 +384,13 @@ const DESKTOP_STARTUP_FAILURE_CLASSES = Object.freeze([
   "driver_page_load_timeout",
   "driver_startup_timeout",
   "driver_tauri_startup_invalid",
+]);
+const DESKTOP_POST_READY_FAILURE_CLASSES = Object.freeze([
+  "driver_case_create_failed",
+  "driver_case_failed",
+  "driver_case_result_failed",
+  "driver_control_projection_invalid",
+  "driver_frontend_startup_invalid",
 ]);
 const RUNTIME_LOG_SOURCE_KEYS = Object.freeze([
   "container_id",
@@ -1003,7 +1014,7 @@ export function validateStartupFailureControlFrame(frame, authority) {
     new Set(authority.allowedKinds).size !== authority.allowedKinds.length ||
     authority.allowedKinds.some((kind) => !DESKTOP_CONTROL_KINDS.includes(kind)) ||
     JSON.stringify([...authority.allowedKinds].sort(asciiCompare)) !== JSON.stringify(
-      [...DESKTOP_CONTROL_KINDS].sort(asciiCompare),
+      [...DESKTOP_CONTROL_KINDS].filter((kind) => kind !== "component_failed").sort(asciiCompare),
     ) ||
     frame === null || typeof frame !== "object" || Array.isArray(frame) ||
     !exactKeys(frame, STARTUP_FAILURE_CONTROL_KEYS) || frame.schema_version !== 1 ||
@@ -1021,6 +1032,24 @@ export function validateStartupFailureControlFrame(frame, authority) {
     kind: "startup_failed",
     failure_class: frame.failure_class,
   });
+}
+
+export function validatePostReadyFailureControlFrame(frame, authority) {
+  if (
+    authority === null || typeof authority !== "object" || Array.isArray(authority) ||
+    !exactKeys(authority, ["allowedKinds", "nonce", "previousSequence", "runId"]) ||
+    !RUN_ID_PATTERN.test(authority.runId ?? "") || !RUN_ID_PATTERN.test(authority.nonce ?? "") ||
+    !Array.isArray(authority.allowedKinds) ||
+    JSON.stringify([...authority.allowedKinds].sort(asciiCompare)) !==
+      JSON.stringify([...DESKTOP_CONTROL_KINDS].sort(asciiCompare)) ||
+    authority.previousSequence < 1 ||
+    frame === null || typeof frame !== "object" || Array.isArray(frame) ||
+    !exactKeys(frame, POST_READY_FAILURE_CONTROL_KEYS) || frame.schema_version !== 1 ||
+    frame.run_id !== authority.runId || frame.nonce !== authority.nonce ||
+    !Number.isSafeInteger(frame.sequence) || frame.sequence !== authority.previousSequence + 1 ||
+    frame.kind !== "component_failed" || !DESKTOP_POST_READY_FAILURE_CLASSES.includes(frame.failure_class)
+  ) fail("orchestrator_control_frame_invalid");
+  return Object.freeze({ ...frame });
 }
 
 export function parseControlFrame(output, authority) {
@@ -1050,6 +1079,9 @@ export function parseControlFrame(output, authority) {
   }
   if (frame?.kind === "startup_failed") {
     return validateStartupFailureControlFrame(frame, authority);
+  }
+  if (frame?.kind === "component_failed") {
+    return validatePostReadyFailureControlFrame(frame, authority);
   }
   return validateControlFrame(
     frame,
@@ -1097,6 +1129,7 @@ export function createControlFrameReader(stream, authority) {
   return Object.freeze({
     get sequence() { return previousSequence; },
     async next(expectedKind, timeoutMs = CONTROL_TIMEOUT_MS) {
+      if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) timeoutMs = CONTROL_TIMEOUT_MS;
       if (closed) fail("orchestrator_control_eof");
       while (buffered.indexOf(0x0a) === -1) {
         const result = await withTimeout(iterator.next(), timeoutMs, "orchestrator_control_timeout");
@@ -1117,8 +1150,13 @@ export function createControlFrameReader(stream, authority) {
         runId: authority.runId,
         nonce: authority.nonce,
         previousSequence,
-        allowedKinds: DESKTOP_CONTROL_KINDS,
+        allowedKinds: previousSequence === 0
+          ? DESKTOP_CONTROL_KINDS.filter((kind) => kind !== "component_failed")
+          : DESKTOP_CONTROL_KINDS,
       });
+      if (frame.kind === "component_failed") {
+        throw new S10BO1OrchestratorError(frame.failure_class);
+      }
       if (frame.kind === "startup_failed") {
         if (expectedKind !== "component_ready" || previousSequence !== 0) {
           fail("orchestrator_control_order_invalid");
@@ -1187,16 +1225,22 @@ export function createR8ControlFrameReader(stream, authority) {
       } catch { fail("orchestrator_control_frame_invalid"); }
       previousSequence += 1;
       const caseResult = expectedKind === "case_result";
+      const postReadyFailure = frame?.kind === "component_failed";
       if (
         frame === null || Array.isArray(frame) || typeof frame !== "object" ||
-        !exactKeys(frame, caseResult ? R8_CASE_RESULT_KEYS : CONTROL_KEYS) ||
+        !exactKeys(frame, postReadyFailure
+          ? POST_READY_FAILURE_CONTROL_KEYS
+          : caseResult ? R8_CASE_RESULT_KEYS : CONTROL_KEYS) ||
         frame.schema_version !== 1 || frame.run_id !== authority.runId ||
         frame.nonce !== authority.nonce || frame.sequence !== previousSequence ||
-        frame.kind !== expectedKind ||
-        (caseResult && (frame.case_id !== expectedCaseId || frame.status !== "passed" ||
+        (postReadyFailure
+          ? (previousSequence < 2 || !DESKTOP_POST_READY_FAILURE_CLASSES.includes(frame.failure_class))
+          : frame.kind !== expectedKind) ||
+        (!postReadyFailure && caseResult && (frame.case_id !== expectedCaseId || frame.status !== "passed" ||
           !Number.isSafeInteger(frame.assertion_count) || frame.assertion_count <= 0 ||
           !DIGEST_PATTERN.test(frame.assertion_set_sha256 ?? "")))
       ) fail("orchestrator_control_frame_invalid");
+      if (postReadyFailure) throw new S10BO1OrchestratorError(frame.failure_class);
       return Object.freeze({ ...frame });
     },
     async expectEof(timeoutMs = CONTROL_TIMEOUT_MS) {
@@ -1964,8 +2008,23 @@ function r8CompletedCaseCountForPhase(phase) {
 export function r8NoLogRequiredEvidenceNames(context) {
   if (!context?.r8) return Object.freeze([]);
   const names = new Set();
-  if (context.apiVerifierBefore) names.add("api-verifier-before.v1.json");
-  const finalCount = context.r8FakeAuthorities?.length ?? 0;
+  const reachedPhase = context.phase ?? context.r8CaseEvidence?.at(-1)?.case_id ?? "created";
+  const completedCases = Math.max(
+    r8CompletedCaseCountForPhase(reachedPhase),
+    context.phase ? 0 : (context.r8CaseEvidence?.length ?? 0),
+  );
+  const reachedApiVerifier = context.apiVerifierBefore && [
+    "api_ready", "fake_starting", "fake_ready", "desktop_starting", "desktop_spawned",
+    "desktop_ready", "host_ready", "runtime_ready", ...S10BO1_CASES.slice(0, -1),
+  ].includes(reachedPhase);
+  if (reachedApiVerifier) names.add("api-verifier-before.v1.json");
+  const currentGeneration = context.fakeSpec?.generation ?? Number.MAX_SAFE_INTEGER;
+  const finalCount = context.r8Business && completedCases === 10
+    ? context.r8FakeAuthorities?.length ?? 0
+    : Math.min(
+      context.r8FakeAuthorities?.length ?? 0,
+      Math.max(0, currentGeneration - 1),
+    );
   for (let generation = 1; generation <= finalCount; generation += 1) {
     names.add(`r8-fake-${generation}-before.v1.json`);
     names.add(`r8-fake-${generation}-final.v1.json`);
@@ -1974,14 +2033,30 @@ export function r8NoLogRequiredEvidenceNames(context) {
     context.fakeSpec && context.fakeAuthorityBefore &&
     context.fakeAuthorityBefore.generation === context.fakeSpec.generation
   ) names.add(`r8-fake-${context.fakeSpec.generation}-before.v1.json`);
-  for (let ordinal = 1; ordinal <= (context.r8CaseEvidence?.length ?? 0); ordinal += 1) {
+  const caseCount = Math.min(context.r8CaseEvidence?.length ?? 0, completedCases);
+  for (let ordinal = 1; ordinal <= caseCount; ordinal += 1) {
     names.add(`r8-case-${String(ordinal).padStart(2, "0")}.v1.json`);
   }
-  if (context.r8Business) {
+  if (context.r8Business && reachedPhase === "s10b_011" && caseCount === 10) {
     names.add("r8-api-verifier-after.v1.json");
     names.add("r8-business-boundary.v1.json");
   }
   return Object.freeze([...names].sort(asciiCompare));
+}
+
+export function r8OwnershipStoppedEvidenceRequired(context, lifecycle) {
+  if (!context.r8) return true;
+  return Boolean((context.ownershipHistory ?? []).find((ownership) =>
+    ownership.hostEvidenceName === `r8-lifecycle-${lifecycle}-host-evidence.v1.json`,
+  )?.hostStoppedEvidence);
+}
+
+export function r8PersistedStoppedEvidenceRequired(context, lifecycle) {
+  if (!context?.r8) return true;
+  return Boolean(context.requireCompleteR8Evidence || (lifecycle === 1 && [
+    "s10b_005_planned_restart", "s10b_006", "s10b_007", "s10b_008", "s10b_009",
+    "s10b_010", "s10b_011",
+  ].includes(context.phase)));
 }
 
 export function sameProcessIdentity(record, current) {
@@ -3466,13 +3541,26 @@ export async function spawnOwnedProcess({
   return provisional;
 }
 
-function childExit(child, role) {
+function childExit(child, role, signal = null) {
   if (child.exitCode !== null || child.signalCode !== null) {
     return Promise.reject(new S10BO1OrchestratorError(`orchestrator_${role}_exited_early`));
   }
   return new Promise((_, reject) => {
-    child.once("exit", () => reject(new S10BO1OrchestratorError(`orchestrator_${role}_exited_early`)));
-    child.once("error", () => reject(new S10BO1OrchestratorError(`orchestrator_${role}_process_failed`)));
+    const cleanup = () => {
+      child.removeListener("exit", onExit);
+      child.removeListener("error", onError);
+    };
+    const onExit = () => {
+      cleanup();
+      reject(new S10BO1OrchestratorError(`orchestrator_${role}_exited_early`));
+    };
+    const onError = () => {
+      cleanup();
+      reject(new S10BO1OrchestratorError(`orchestrator_${role}_process_failed`));
+    };
+    child.once("exit", onExit);
+    child.once("error", onError);
+    signal?.addEventListener("abort", cleanup, { once: true });
   });
 }
 
@@ -4205,27 +4293,37 @@ async function startDesktop(context, specification = {}) {
 export async function readDesktopFrame(context, expectedKind, expectedCaseId = null) {
   const controlFrame = expectedKind === "component_ready" && context.pendingDesktopFrame
     ? context.pendingDesktopFrame
-    : context.controlReader.next(expectedKind, expectedCaseId);
+    : context.r8
+      ? context.controlReader.next(expectedKind, expectedCaseId)
+      : context.controlReader.next(expectedKind);
   if (expectedKind === "component_ready") context.pendingDesktopFrame = null;
   const settle = (kind, promise) => promise.then(
     (value) => Object.freeze({ kind, value }),
     (error) => Object.freeze({ error, kind }),
   );
+  const observation = new AbortController();
   const controlOutcome = settle("control", controlFrame);
   const readers = [
     controlOutcome,
-    settle("api_exit", childExit(context.processes.api.child, "api")),
-    settle("fake_exit", childExit(context.processes.fake.child, "fake")),
-    settle("desktop_exit", childExit(context.processes.desktop.child, "desktop")),
+    settle("api_exit", childExit(context.processes.api.child, "api", observation.signal)),
+    settle("fake_exit", childExit(context.processes.fake.child, "fake", observation.signal)),
+    settle("desktop_exit", childExit(context.processes.desktop.child, "desktop", observation.signal)),
   ];
+  const isDesktopFailureLeaf = (outcome) => outcome?.error instanceof S10BO1OrchestratorError && [
+    ...DESKTOP_STARTUP_FAILURE_CLASSES,
+    ...DESKTOP_POST_READY_FAILURE_CLASSES,
+  ].includes(outcome.error.code);
   try {
     let outcome = await Promise.race(readers);
-    if (outcome.kind === "desktop_exit") {
+    if (outcome.kind.endsWith("_exit")) {
       const queuedControl = await Promise.race([
         controlOutcome,
-        new Promise((resolveQueued) => setImmediate(() => resolveQueued(null))),
+        new Promise((resolveQueued) => setTimeout(
+          () => resolveQueued(null),
+          DESKTOP_EXIT_DRAIN_TIMEOUT_MS,
+        )),
       ]);
-      if (queuedControl !== null) outcome = queuedControl;
+      if (isDesktopFailureLeaf(queuedControl)) outcome = queuedControl;
     }
     if (outcome.error) throw outcome.error;
     if (outcome.kind !== "control") fail("orchestrator_internal_failure");
@@ -4240,6 +4338,8 @@ export async function readDesktopFrame(context, expectedKind, expectedCaseId = n
       DESKTOP_STARTUP_FAILURE_CLASSES.includes(error.code)
     ) context.phase = "desktop_starting";
     throw error;
+  } finally {
+    observation.abort();
   }
 }
 
@@ -5694,11 +5794,15 @@ export async function scanNoLog(context) {
   for (const ownership of context.ownershipHistory ?? []) {
     for (const name of [
       ownership.hostEvidenceName,
-      ownership.hostStoppedEvidenceName,
       ownership.runtimeEvidenceName,
       ownership.hostProcessName,
       ownership.runtimeProcessName,
     ]) requiredFiles.add(resolve(context.evidenceRoot, name));
+    const lifecycleMatch = /r8-lifecycle-(\d+)-/.exec(ownership.hostEvidenceName ?? "");
+    const lifecycle = lifecycleMatch ? Number(lifecycleMatch[1]) : 1;
+    if (r8OwnershipStoppedEvidenceRequired(context, lifecycle)) {
+      requiredFiles.add(resolve(context.evidenceRoot, ownership.hostStoppedEvidenceName));
+    }
     const hostInstance = resolve(context.runRoot, "host", ownership.hostEvidence.instanceNonce);
     for (const name of ["process.json", "stderr.log", "stdout.log"]) {
       requiredFiles.add(resolve(hostInstance, name));
@@ -6228,9 +6332,6 @@ function createLiveOperations(authority, attempt, parentGuard = createParentIden
       await sendR8ControlFrame(context, "mode_transition", caseId);
       const result = await Promise.race([
         readDesktopFrame(context, "case_result", caseId),
-        childExit(context.processes.api.child, "api"),
-        childExit(context.processes.fake.child, "fake"),
-        childExit(context.processes.desktop.child, "desktop"),
         parentDeath,
       ]);
       const evidence = validateR8CaseEvidence({
@@ -6856,12 +6957,7 @@ async function loadR8PersistedOwnershipEvidence(context, records) {
         },
       );
     } catch (error) {
-      const lifecycleOneStopped = lifecycle === 1 && [
-        "s10b_005_planned_restart", "s10b_006", "s10b_007", "s10b_008", "s10b_009",
-        "s10b_010", "s10b_011",
-      ].includes(context.phase);
-      const lifecycleTwoStopped = lifecycle === 2 && context.phase === "s10b_011";
-      if (context.requireCompleteR8Evidence || lifecycleOneStopped || lifecycleTwoStopped) throw error;
+      if (r8PersistedStoppedEvidenceRequired(context, lifecycle)) throw error;
     }
     context.ownershipHistory.push({
       hostEvidence,

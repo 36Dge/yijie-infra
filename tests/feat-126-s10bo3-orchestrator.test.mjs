@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 import {
   chmod,
   link,
@@ -15,6 +16,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
+import { PassThrough, Readable } from "node:stream";
 import test from "node:test";
 
 import { FEAT_126_S10_API_RUNTIME_AUTHORITY } from "../scripts/feat-126-s10-api-runtime-profile.mjs";
@@ -40,7 +42,11 @@ import {
   readAttemptFailure,
   readAttemptPreclaimFailure,
   readAttemptReconcile,
+  readDesktopFrame,
   requirePreOwnershipDescendantsAbsent,
+  r8NoLogRequiredEvidenceNames,
+  r8OwnershipStoppedEvidenceRequired,
+  r8PersistedStoppedEvidenceRequired,
   runStartupAbortFlow,
   scanNoLog,
   shouldRunComposeCleanup,
@@ -55,6 +61,8 @@ import {
   validateExistingProcessRecordSet,
   validateFreshResourceInventory,
   validateNoLogResult,
+  createControlFrameReader,
+  createR8ControlFrameReader,
   validatePreflightFailureBinding,
   validateReconcileFailureProcessState,
   validateRuntimeLogScan,
@@ -82,6 +90,235 @@ const identity = Object.freeze({
   binary_sha256: "b".repeat(64),
 });
 const scriptSha256 = "c".repeat(64);
+
+test("S10BO3 corrective preserves a content-free post-ready failure leaf", async () => {
+  const nonce = "12600000-0000-4000-8000-000000000071";
+  const control = Readable.from(`${JSON.stringify({
+    schema_version: 1,
+    run_id: runId,
+    nonce,
+    sequence: 1,
+    kind: "component_ready",
+  })}\n${JSON.stringify({
+    schema_version: 1,
+    run_id: runId,
+    nonce,
+    sequence: 2,
+    kind: "component_failed",
+    failure_class: "driver_case_failed",
+  })}\n`);
+  const reader = createR8ControlFrameReader(control, { runId, nonce });
+  assert.equal((await reader.next("component_ready")).kind, "component_ready");
+  await assert.rejects(reader.next("case_result", "s10b_002"),
+    (error) => error?.code === "driver_case_failed");
+});
+
+test("S10BO3 corrective accepts a post-ready leaf in startup-abort mode", async () => {
+  const nonce = "12600000-0000-4000-8000-000000000075";
+  const control = Readable.from(`${JSON.stringify({
+    schema_version: 1,
+    run_id: runId,
+    nonce,
+    sequence: 1,
+    kind: "component_ready",
+  })}\n${JSON.stringify({
+    schema_version: 1,
+    run_id: runId,
+    nonce,
+    sequence: 2,
+    kind: "component_failed",
+    failure_class: "driver_control_projection_invalid",
+  })}\n`);
+  const reader = createControlFrameReader(control, { runId, nonce });
+  assert.equal((await reader.next("component_ready")).kind, "component_ready");
+  await assert.rejects(reader.next("abort_complete"),
+    (error) => error?.code === "driver_control_projection_invalid");
+});
+
+test("S10BO3 corrective drains a post-ready failure frame before projecting child exit", async () => {
+  const nonce = "12600000-0000-4000-8000-000000000072";
+  const stream = new PassThrough();
+  const controlReader = createR8ControlFrameReader(stream, { runId, nonce });
+  stream.write(`${JSON.stringify({
+    schema_version: 1,
+    run_id: runId,
+    nonce,
+    sequence: 1,
+    kind: "component_ready",
+  })}\n`);
+  await controlReader.next("component_ready");
+  const child = () => Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
+  const context = {
+    r8: true,
+    controlReader,
+    pendingDesktopFrame: null,
+    phase: "runtime_ready",
+    processes: {
+      api: { child: child() },
+      fake: { child: child() },
+      desktop: { child: child() },
+    },
+  };
+  const result = readDesktopFrame(context, "case_result", "s10b_002");
+  context.processes.desktop.child.emit("exit", 1, null);
+  setImmediate(() => stream.end(`${JSON.stringify({
+    schema_version: 1,
+    run_id: runId,
+    nonce,
+    sequence: 2,
+    kind: "component_failed",
+    failure_class: "driver_case_failed",
+  })}\n`));
+  await assert.rejects(result, (error) => error?.code === "driver_case_failed");
+  for (const process_ of Object.values(context.processes)) {
+    assert.equal(process_.child.listenerCount("exit"), 0);
+    assert.equal(process_.child.listenerCount("error"), 0);
+  }
+});
+
+test("S10BO3 corrective prefers a post-ready failure frame over an API exit", async () => {
+  const nonce = "12600000-0000-4000-8000-000000000073";
+  const stream = new PassThrough();
+  const controlReader = createR8ControlFrameReader(stream, { runId, nonce });
+  stream.write(`${JSON.stringify({
+    schema_version: 1,
+    run_id: runId,
+    nonce,
+    sequence: 1,
+    kind: "component_ready",
+  })}\n`);
+  await controlReader.next("component_ready");
+  const child = () => Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
+  const context = {
+    r8: true,
+    controlReader,
+    pendingDesktopFrame: null,
+    phase: "runtime_ready",
+    processes: {
+      api: { child: child() },
+      fake: { child: child() },
+      desktop: { child: child() },
+    },
+  };
+  const result = readDesktopFrame(context, "case_result", "s10b_002");
+  context.processes.api.child.emit("exit", 1, null);
+  setImmediate(() => stream.end(`${JSON.stringify({
+    schema_version: 1,
+    run_id: runId,
+    nonce,
+    sequence: 2,
+    kind: "component_failed",
+    failure_class: "driver_case_failed",
+  })}\n`));
+  await assert.rejects(result, (error) => error?.code === "driver_case_failed");
+});
+
+test("S10BO3 corrective does not let a successful frame hide an API exit", async () => {
+  const nonce = "12600000-0000-4000-8000-000000000074";
+  const stream = new PassThrough();
+  const controlReader = createR8ControlFrameReader(stream, { runId, nonce });
+  stream.write(`${JSON.stringify({
+    schema_version: 1,
+    run_id: runId,
+    nonce,
+    sequence: 1,
+    kind: "component_ready",
+  })}\n`);
+  await controlReader.next("component_ready");
+  const child = () => Object.assign(new EventEmitter(), { exitCode: null, signalCode: null });
+  const context = {
+    r8: true,
+    controlReader,
+    pendingDesktopFrame: null,
+    phase: "runtime_ready",
+    processes: {
+      api: { child: child() },
+      fake: { child: child() },
+      desktop: { child: child() },
+    },
+  };
+  const result = readDesktopFrame(context, "case_result", "s10b_002");
+  context.processes.api.child.emit("exit", 1, null);
+  setImmediate(() => stream.write(`${JSON.stringify({
+    schema_version: 1,
+    run_id: runId,
+    nonce,
+    sequence: 2,
+    kind: "case_result",
+    assertion_count: 1,
+    assertion_set_sha256: "a".repeat(64),
+    case_id: "s10b_002",
+    status: "passed",
+  })}\n`));
+  await assert.rejects(result, (error) => error?.code === "orchestrator_api_exited_early");
+});
+
+test("S10BO3 corrective derives no-log requirements from the reached R8 phase", () => {
+  const projection = { status: "passed" };
+  const generation = { generation: 1 };
+  const runtimeReady = {
+    r8: true,
+    phase: "runtime_ready",
+    apiVerifierBefore: projection,
+    fakeSpec: generation,
+    fakeAuthorityBefore: generation,
+    r8FakeAuthorities: [],
+    r8CaseEvidence: [],
+  };
+  assert.deepEqual(r8NoLogRequiredEvidenceNames(runtimeReady), [
+    "api-verifier-before.v1.json",
+    "r8-fake-1-before.v1.json",
+  ]);
+  assert.equal(r8OwnershipStoppedEvidenceRequired(runtimeReady, 1), false);
+  const lifecycleOneStopped = {
+    ...runtimeReady,
+    phase: "s10b_005_planned_restart",
+    ownershipHistory: [{
+      hostEvidenceName: "r8-lifecycle-1-host-evidence.v1.json",
+      hostStoppedEvidence: { state: "stopped" },
+    }],
+  };
+  assert.equal(r8OwnershipStoppedEvidenceRequired(lifecycleOneStopped, 1), true);
+  assert.equal(r8OwnershipStoppedEvidenceRequired(lifecycleOneStopped, 2), false);
+  assert.equal(r8OwnershipStoppedEvidenceRequired({
+    ...lifecycleOneStopped,
+    phase: "s10b_011",
+    ownershipHistory: [
+      ...lifecycleOneStopped.ownershipHistory,
+      {
+        hostEvidenceName: "r8-lifecycle-2-host-evidence.v1.json",
+        hostStoppedEvidence: null,
+      },
+    ],
+  }, 2), false);
+  assert.equal(r8OwnershipStoppedEvidenceRequired({
+    ...lifecycleOneStopped,
+    phase: "s10b_011",
+    ownershipHistory: [
+      ...lifecycleOneStopped.ownershipHistory,
+      {
+        hostEvidenceName: "r8-lifecycle-2-host-evidence.v1.json",
+        hostStoppedEvidence: { state: "stopped" },
+      },
+    ],
+  }, 2), true);
+  assert.equal(r8PersistedStoppedEvidenceRequired({
+    r8: true,
+    phase: "s10b_011",
+    requireCompleteR8Evidence: false,
+  }, 1), true);
+  assert.equal(r8PersistedStoppedEvidenceRequired({
+    r8: true,
+    phase: "s10b_011",
+    requireCompleteR8Evidence: false,
+  }, 2), false);
+  assert.equal(r8PersistedStoppedEvidenceRequired({
+    r8: true,
+    phase: "s10b_011",
+    requireCompleteR8Evidence: true,
+  }, 2), true);
+});
+
 const completed = Object.freeze([
   "authority", "ports", "secret_init", "compose", "images", "dependencies",
   "tls_oidc", "identity", "migration", "bootstrap", "api_binary", "host_binary",
@@ -1268,6 +1505,14 @@ test("S10BO3-013 accepts only known pre-ownership Desktop failures with incomple
       assert.equal(validateReconcileFailureProcessState(knownFailure), true);
     }
   }
+
+  const postReadyFailure = {
+    ...desktopStartupLeaf,
+    phase: "s10b_002",
+    failure_class: "driver_case_failed",
+    process_roles: ["api", "desktop", "fake", "host", "runtime"],
+  };
+  assert.equal(validateAttemptFailure(postReadyFailure, authority).phase, "s10b_002");
   const unknownDesktopStartup = {
     ...desktopStartupLeaf,
     failure_class: "orchestrator_internal_failure",
