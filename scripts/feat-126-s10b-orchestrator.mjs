@@ -4055,6 +4055,26 @@ function approvedContextFieldValue(key, value) {
   if (key === "request" || key === "headers" || key.endsWith("_headers")) {
     return value !== null && typeof value === "object";
   }
+  if (key === "msg") {
+    return value === "starting yijie-api" || value === "starting yijie-agent-host";
+  }
+  if (key === "jwks_url") {
+    return value === "https://localhost:8443/realms/yijie-local/protocol/openid-connect/certs";
+  }
+  if (key === "retained_volume_keys") {
+    return Array.isArray(value) &&
+      JSON.stringify(value) === JSON.stringify(S10_NAMED_VOLUME_KEYS);
+  }
+  if (key === "final_authorization_revision") {
+    return value === 3;
+  }
+  if (key === "secret_descriptor_sha256") {
+    return DIGEST_PATTERN.test(value ?? "");
+  }
+  if (key === "secret_roles") {
+    return Array.isArray(value) &&
+      JSON.stringify(value) === JSON.stringify(["chat_sqlcipher", "receipt_hmac", "native_auth"]);
+  }
   return key === "payload" &&
     value !== null && typeof value === "object" && !Array.isArray(value) &&
     exactKeys(value, ["status"]) && value.status === "ready";
@@ -4436,7 +4456,7 @@ function structuredNoLogHits(value, origin = null) {
       const key = normalizedStructuredField(rawKey);
       const sensitiveField = sensitiveStructuredField(key);
       const approvedContext = approvedContextFieldValue(key, entry);
-      if (sensitiveField && !emptyStructuredValue(entry)) {
+      if (sensitiveField && !emptyStructuredValue(entry) && !approvedContext) {
         addHit("sensitive_value_field", "structured_sensitive", "sensitive_nonempty_value");
       }
       if (

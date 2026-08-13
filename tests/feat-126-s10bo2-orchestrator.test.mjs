@@ -1249,8 +1249,38 @@ test("S10BO2-013 scans all evidence roots and fails closed when a root is missin
     secrets: new Map([["credential", "secret-value-never-log"]]),
     runtimeLogScan,
   };
+  const safeAuthorityFixture = resolve(evidenceRoot, "safe-authority-fields.json");
+  await writeFile(
+    safeAuthorityFixture,
+    `${JSON.stringify({
+      attempt_failure: {
+        retained_volume_keys: [
+          "feat126_s10_api_postgres_data",
+          "feat126_s10_keycloak_postgres_data",
+          "feat126_s10_caddy_data",
+          "feat126_s10_caddy_config",
+        ],
+      },
+      bootstrap_execution_summary: { final_authorization_revision: 3 },
+      secure_storage_manifest: {
+        secret_descriptor_sha256: "a".repeat(64),
+        secret_roles: ["chat_sqlcipher", "receipt_hmac", "native_auth"],
+      },
+      preflight_summary: {
+        api_runtime_authority: {
+          jwks_url: "https://localhost:8443/realms/yijie-local/protocol/openid-connect/certs",
+        },
+      },
+      process_logs: [
+        { msg: "starting yijie-api" },
+        { msg: "starting yijie-agent-host" },
+      ],
+    })}\n`,
+    { mode: 0o600 },
+  );
+  await chmod(safeAuthorityFixture, 0o600);
   const clean = await scanNoLog(context);
-  assert.equal(clean.file_count, 8);
+  assert.equal(clean.file_count, 9);
   assert.equal(clean.hit_count, 0);
   assert.equal(
     (await scanNoLog({
@@ -1259,6 +1289,49 @@ test("S10BO2-013 scans all evidence roots and fails closed when a root is missin
     })).pattern_set_sha256,
     clean.pattern_set_sha256,
   );
+  await writeFile(
+    safeAuthorityFixture,
+    `${JSON.stringify({ secret_descriptor_sha256: "not-a-digest" })}\n`,
+    { mode: 0o600 },
+  );
+  await chmod(safeAuthorityFixture, 0o600);
+  assert.equal((await scanNoLog(context)).hit_count > 0, true);
+  await writeFile(
+    safeAuthorityFixture,
+    `${JSON.stringify({ msg: "unexpected startup detail" })}\n`,
+    { mode: 0o600 },
+  );
+  await chmod(safeAuthorityFixture, 0o600);
+  assert.equal((await scanNoLog(context)).hit_count > 0, true);
+  await writeFile(
+    safeAuthorityFixture,
+    `${JSON.stringify({ jwks_url: "https://attacker.invalid/keys" })}\n`,
+    { mode: 0o600 },
+  );
+  await chmod(safeAuthorityFixture, 0o600);
+  assert.equal((await scanNoLog(context)).hit_count > 0, true);
+  await writeFile(
+    safeAuthorityFixture,
+    `${JSON.stringify({ final_authorization_revision: 4 })}\n`,
+    { mode: 0o600 },
+  );
+  await chmod(safeAuthorityFixture, 0o600);
+  assert.equal((await scanNoLog(context)).hit_count > 0, true);
+  await writeFile(
+    safeAuthorityFixture,
+    `${JSON.stringify({
+      retained_volume_keys: [
+        "feat126_s10_caddy_config",
+        "feat126_s10_caddy_data",
+        "feat126_s10_keycloak_postgres_data",
+        "feat126_s10_api_postgres_data",
+      ],
+    })}\n`,
+    { mode: 0o600 },
+  );
+  await chmod(safeAuthorityFixture, 0o600);
+  assert.equal((await scanNoLog(context)).hit_count > 0, true);
+  await unlink(safeAuthorityFixture);
   const processContext = {
     ...context,
     processes: {
