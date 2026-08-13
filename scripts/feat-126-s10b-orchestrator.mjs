@@ -5780,7 +5780,7 @@ export async function scanNoLog(context) {
   for (const role of Object.keys(context.descendantProcesses ?? {})) {
     if (!context.r8) requiredFiles.add(resolve(context.evidenceRoot, `${role}-process.v1.json`));
   }
-  if (context.hostEvidence) {
+  if (context.hostEvidence && !context.r8) {
     for (const name of [
       "host-evidence.v1.json",
       "host-stopped-evidence.v1.json",

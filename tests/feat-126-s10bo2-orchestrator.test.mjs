@@ -1534,6 +1534,7 @@ test("S10BO2-014 source uses direct feature Desktop with FD3/FD4 and keeps busin
     source,
     /cargo[\s\S]*--features[\s\S]*desktopProductionBuildFeatures\(\)/,
   );
+  assert.match(source, /if \(context\.hostEvidence && !context\.r8\)/);
   assert.match(source, /extraStdio:\s*\["pipe", "pipe"\]/);
   assert.match(source, /child\.stdio\[3\]/);
   assert.match(source, /child\.stdio\[4\]/);
