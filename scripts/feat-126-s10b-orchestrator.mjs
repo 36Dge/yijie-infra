@@ -52,9 +52,13 @@ const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-
 const FULL_SHA_PATTERN = /^[0-9a-f]{40}$/;
 const DIGEST_PATTERN = /^[0-9a-f]{64}$/;
 const CONTROL_KEYS = Object.freeze(["kind", "nonce", "run_id", "schema_version", "sequence"]);
+const R8_CASE_RESULT_KEYS = Object.freeze([
+  ...CONTROL_KEYS, "assertion_count", "assertion_set_sha256", "case_id", "status",
+]);
 const STARTUP_FAILURE_CONTROL_KEYS = Object.freeze([...CONTROL_KEYS, "failure_class"]);
 const CONTROL_MAX_BYTES = 1024;
 const CONTROL_TIMEOUT_MS = 60_000;
+const R8_CASE_TIMEOUT_MS = 120_000;
 const GUARDED_CONTROL_WRITERS = new WeakSet();
 const PROCESS_STOP_TIMEOUT_MS = 8_000;
 const CHILD_OUTPUT_MAX_BYTES = 1024 * 1024;
@@ -213,6 +217,52 @@ const BUSINESS_BOUNDARY_KEYS = Object.freeze([
   "schema_version",
   "scope",
   "status",
+]);
+const R8_CASE_EVIDENCE_KEYS = Object.freeze([
+  "assertion_count",
+  "assertion_set_sha256",
+  "case_id",
+  "frame_sequence",
+  "ordinal",
+  "run_id",
+  "schema_version",
+  "status",
+]);
+const R8_ASSERTIONS = Object.freeze({
+  s10b_002: Object.freeze(["opaque_project", "single_session", "single_turn", "completed_terminal"]),
+  s10b_003: Object.freeze(["assistant_plaintext", "reasoning_complete", "reasoning_ordered", "terminal_exact"]),
+  s10b_004: Object.freeze(["interrupt_terminal", "incomplete_answer", "incomplete_reasoning", "terminal_once"]),
+  s10b_005_planned_restart: Object.freeze(["history_page_20", "history_page_50", "restart_closed", "resync_same_session", "cursor_monotonic"]),
+  s10b_006: Object.freeze(["fallback_title", "user_rename_wins", "session_pin", "project_pin", "stable_sort"]),
+  s10b_007: Object.freeze(["gap_recovery", "reconnect", "race_closed", "no_late_commit", "cursor_resync"]),
+  s10b_008: Object.freeze(["desktop_delete", "host_delete", "runtime_delete", "receipt_closed", "restart_unreadable"]),
+  s10b_009: Object.freeze(["public_task_content_free", "audit_content_free", "counts_bound", "path_absent", "title_absent"]),
+  s10b_010: Object.freeze(["log_content_free", "bbolt_content_free", "audit_content_free", "telemetry_content_free", "process_output_content_free"]),
+  s10b_011: Object.freeze(["metadata_p95_200ms", "history_p95_300ms", "reducer_10000", "db_1m_messages", "idempotency_10000"]),
+});
+const FROZEN_R8_CANARY_PATTERNS = Object.freeze([
+  { name: "canary:prompt", value: "请为合成任务000整理订单风险并给出只读检查清单。" },
+  { name: "canary:assistant_title", value: "订单风险检查 000" },
+  { name: "canary:raw", value: "Synthetic reasoning 000: constraints checked before conclusion." },
+  { name: "canary:project", value: "<run_root>/project" },
+]);
+const R8_BUSINESS_EVIDENCE_KEYS = Object.freeze([
+  "api_after_sha256",
+  "api_before_sha256",
+  "audit_count_delta",
+  "business_cases",
+  "case_count",
+  "case_order_sha256",
+  "fake_accepted_calls",
+  "fake_authority_set_sha256",
+  "fake_generation_count",
+  "fake_rejected_calls",
+  "idempotency_count_delta",
+  "run_id",
+  "s10b_r8_executed",
+  "schema_version",
+  "status",
+  "tasks_count_delta",
 ]);
 const SUMMARY_KEYS = Object.freeze([
   "api_binary_sha256",
@@ -492,6 +542,29 @@ export const S10BO2_STATES = Object.freeze([
   "closed_pass",
 ]);
 
+export const S10B_R8_STATES = Object.freeze([
+  "created",
+  "preflight_running",
+  "preflight_passed",
+  "desktop_built",
+  "dependencies_ready",
+  "api_ready",
+  "fake_ready",
+  "desktop_ready",
+  "host_ready",
+  "runtime_ready",
+  ...S10BO1_CASES.slice(0, -1),
+  "cleanup_passed",
+  "closed_pass",
+]);
+
+export const S10B_R8_FAKE_GENERATIONS = Object.freeze([
+  Object.freeze({ generation: 1, mode: "complete", callCap: 2, firstCase: "s10b_002" }),
+  Object.freeze({ generation: 2, mode: "incomplete", callCap: 1, firstCase: "s10b_004" }),
+  Object.freeze({ generation: 3, mode: "disconnect", callCap: 1, firstCase: "s10b_006" }),
+  Object.freeze({ generation: 4, mode: "oversize", callCap: 1, firstCase: "s10b_011" }),
+]);
+
 const ATTEMPT_PHASES = new Set([
   "preflight_not_started",
   "preflight_running",
@@ -503,10 +576,12 @@ const ATTEMPT_PHASES = new Set([
   "fake_starting",
   "desktop_starting",
   ...S10BO2_STATES,
+  ...S10B_R8_STATES,
 ]);
 
 const S10BO1_STATE_INDEX = new Map(S10BO1_STATES.map((state, index) => [state, index]));
 const S10BO2_STATE_INDEX = new Map(S10BO2_STATES.map((state, index) => [state, index]));
+const S10B_R8_STATE_INDEX = new Map(S10B_R8_STATES.map((state, index) => [state, index]));
 
 export class S10BO1OrchestratorError extends Error {
   constructor(code, closure = undefined) {
@@ -822,6 +897,11 @@ export function validateOrchestratorInput(runId, environment = process.env, argu
   return Object.freeze({ runId, repositories });
 }
 
+export function validateR8OrchestratorInput(runId, environment = process.env, arguments_ = []) {
+  const authority = validateOrchestratorInput(runId, environment, arguments_);
+  return Object.freeze({ ...authority, r8: true });
+}
+
 export function validateRepositorySummary(summary, runId, repositories) {
   if (
     summary === null || Array.isArray(summary) || typeof summary !== "object" ||
@@ -881,6 +961,10 @@ export function createStateMachine() {
 
 export function createStartupAbortStateMachine() {
   return createOrderedStateMachine(S10BO2_STATES, S10BO2_STATE_INDEX);
+}
+
+export function createR8StateMachine() {
+  return createOrderedStateMachine(S10B_R8_STATES, S10B_R8_STATE_INDEX);
 }
 
 export function validateControlFrame(
@@ -989,6 +1073,22 @@ export function encodeControlFrame(frame, authority) {
   return encoded;
 }
 
+export function encodeR8ControlFrame(frame, authority) {
+  const caseFrame = frame?.kind === "mode_transition";
+  if (
+    frame === null || Array.isArray(frame) || typeof frame !== "object" ||
+    !exactKeys(frame, caseFrame ? [...CONTROL_KEYS, "case_id"] : CONTROL_KEYS) ||
+    frame.schema_version !== 1 || frame.run_id !== authority?.runId ||
+    frame.nonce !== authority?.nonce || frame.sequence !== authority?.previousSequence + 1 ||
+    (caseFrame
+      ? !S10BO1_CASES.slice(0, -1).includes(frame.case_id)
+      : !["planned_restart", "abort"].includes(frame.kind))
+  ) fail("orchestrator_control_frame_invalid");
+  const encoded = Buffer.from(`${JSON.stringify(frame)}\n`, "utf8");
+  if (encoded.length > CONTROL_MAX_BYTES) fail("orchestrator_control_frame_oversize");
+  return encoded;
+}
+
 export function createControlFrameReader(stream, authority) {
   const iterator = stream[Symbol.asyncIterator]();
   let buffered = Buffer.alloc(0);
@@ -1053,6 +1153,62 @@ export function createControlFrameReader(stream, authority) {
       closed = true;
       stream.destroy();
     },
+  });
+}
+
+export function createR8ControlFrameReader(stream, authority) {
+  const iterator = stream[Symbol.asyncIterator]();
+  let buffered = Buffer.alloc(0);
+  let previousSequence = 0;
+  let closed = false;
+  return Object.freeze({
+    get sequence() { return previousSequence; },
+    async next(
+      expectedKind,
+      expectedCaseId = null,
+      timeoutMs = expectedKind === "case_result" ? R8_CASE_TIMEOUT_MS : CONTROL_TIMEOUT_MS,
+    ) {
+      if (closed) fail("orchestrator_control_eof");
+      while (buffered.indexOf(0x0a) === -1) {
+        const result = await withTimeout(iterator.next(), timeoutMs, "orchestrator_control_timeout");
+        if (result.done) { closed = true; fail("orchestrator_control_eof"); }
+        buffered = Buffer.concat([buffered, Buffer.from(result.value)]);
+        if (buffered.indexOf(0x0a) === -1 && buffered.length > CONTROL_MAX_BYTES) {
+          fail("orchestrator_control_frame_oversize");
+        }
+      }
+      const newline = buffered.indexOf(0x0a);
+      if (newline + 1 > CONTROL_MAX_BYTES) fail("orchestrator_control_frame_oversize");
+      const bytes = buffered.subarray(0, newline + 1);
+      buffered = buffered.subarray(newline + 1);
+      let frame;
+      try {
+        frame = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes).trimEnd());
+      } catch { fail("orchestrator_control_frame_invalid"); }
+      previousSequence += 1;
+      const caseResult = expectedKind === "case_result";
+      if (
+        frame === null || Array.isArray(frame) || typeof frame !== "object" ||
+        !exactKeys(frame, caseResult ? R8_CASE_RESULT_KEYS : CONTROL_KEYS) ||
+        frame.schema_version !== 1 || frame.run_id !== authority.runId ||
+        frame.nonce !== authority.nonce || frame.sequence !== previousSequence ||
+        frame.kind !== expectedKind ||
+        (caseResult && (frame.case_id !== expectedCaseId || frame.status !== "passed" ||
+          !Number.isSafeInteger(frame.assertion_count) || frame.assertion_count <= 0 ||
+          !DIGEST_PATTERN.test(frame.assertion_set_sha256 ?? "")))
+      ) fail("orchestrator_control_frame_invalid");
+      return Object.freeze({ ...frame });
+    },
+    async expectEof(timeoutMs = CONTROL_TIMEOUT_MS) {
+      if (buffered.length !== 0) fail("orchestrator_control_trailing_frame");
+      const result = await withTimeout(iterator.next(), timeoutMs, "orchestrator_control_timeout");
+      if (!result.done || Buffer.from(result.value ?? "").length !== 0) {
+        fail("orchestrator_control_trailing_frame");
+      }
+      closed = true;
+      return true;
+    },
+    destroy() { closed = true; stream.destroy(); },
   });
 }
 
@@ -1125,9 +1281,9 @@ export function validateClosedFakeAuthorityProjection(value, context, requireZer
   ) fail("orchestrator_fake_authority_invalid");
   validateFakeAuthority(value, {
     runId: context.runId,
-    mode: "complete",
-    generation: 1,
-    callCap: 1,
+    mode: context.fakeSpec?.mode ?? "complete",
+    generation: context.fakeSpec?.generation ?? 1,
+    callCap: context.fakeSpec?.callCap ?? 1,
   });
   return Object.freeze({ ...value });
 }
@@ -1437,9 +1593,124 @@ export function buildOrchestratorPlan(input) {
     ownership: Object.freeze({ infra: ["api", "fake", "desktop"], desktop: ["host"], host: ["runtime"] }),
     states: S10BO2_STATES,
     business_cases: "disabled",
-    s10b_r8_executed: false,
+    s10b_r8_executed: expectedR8(authority),
     execution: "separately-authorized-isolated-live-only",
   });
+}
+
+export function buildR8OrchestratorPlan(input) {
+  const authority = validateR8OrchestratorInput(
+    input?.runId,
+    input?.environment ?? {},
+    input?.arguments_ ?? [],
+  );
+  return Object.freeze({
+    schema_version: 1,
+    kind: "feat126-s10b-r8-plan",
+    run_id: authority.runId,
+    repositories: authority.repositories,
+    ownership: Object.freeze({ infra: ["api", "fake", "desktop"], desktop: ["host"], host: ["runtime"] }),
+    states: S10B_R8_STATES,
+    cases: S10BO1_CASES,
+    fake_generations: S10B_R8_FAKE_GENERATIONS,
+    business_cases: "frozen_s10b_002_011",
+    s10b_r8_executed: true,
+    execution: "single-authorized-fresh-r8-only",
+  });
+}
+
+export function validateR8CaseEvidence(value, authority) {
+  const expectedCase = S10BO1_CASES[value?.ordinal - 1];
+  const expectedAssertions = R8_ASSERTIONS[expectedCase];
+  const expectedAssertionDigest = sha256(`${expectedAssertions.join("\n")}\n`);
+  if (
+    value === null || Array.isArray(value) || typeof value !== "object" ||
+    !exactKeys(value, R8_CASE_EVIDENCE_KEYS) || value.schema_version !== 1 ||
+    value.status !== "passed" || value.run_id !== authority?.runId ||
+    !Number.isSafeInteger(value.ordinal) || value.ordinal < 1 || value.ordinal > 10 ||
+    value.case_id !== expectedCase || !Number.isSafeInteger(value.frame_sequence) ||
+    value.frame_sequence < 2 || value.frame_sequence > 8 ||
+    value.assertion_count !== expectedAssertions.length ||
+    value.assertion_set_sha256 !== expectedAssertionDigest
+  ) fail("orchestrator_case_evidence_invalid");
+  return Object.freeze({ ...value });
+}
+
+function countDelta(before, after) {
+  return after.count - before.count;
+}
+
+export function buildR8BusinessEvidence(before, after, fakeAuthorities, caseEvidence, runId) {
+  validateApiVerifierProjection(before, runId);
+  validateApiVerifierProjection(after, runId);
+  if (
+    before.tasks.count !== 0 || before.idempotency.count !== 0 ||
+    before.tasks.enums.length !== 0 || before.idempotency.enums.length !== 0 ||
+    countDelta(before.tasks, after.tasks) !== 2 ||
+    countDelta(before.idempotency, after.idempotency) !== 2 ||
+    countDelta(before.audit, after.audit) !== 2 ||
+    JSON.stringify(after.tasks.enums) !== JSON.stringify(["draft"]) ||
+    JSON.stringify(after.idempotency.enums) !== JSON.stringify(["bound"]) ||
+    JSON.stringify(after.audit.enums) !== JSON.stringify(["success"]) ||
+    !Array.isArray(fakeAuthorities) || fakeAuthorities.length !== S10B_R8_FAKE_GENERATIONS.length ||
+    !Array.isArray(caseEvidence) || caseEvidence.length !== 10
+  ) fail("orchestrator_business_boundary_invalid");
+  const validatedCases = caseEvidence.map((value) => validateR8CaseEvidence(value, { runId }));
+  const fakeTuples = fakeAuthorities.map((value, index) => {
+    const specification = S10B_R8_FAKE_GENERATIONS[index];
+    validateFakeAuthority(value, { runId, ...specification });
+    const expectedCalls = specification.callCap;
+    if (value.accepted_calls !== expectedCalls || value.rejected_calls !== 0) {
+      fail("orchestrator_business_boundary_invalid");
+    }
+    return JSON.stringify([
+      value.generation,
+      value.mode,
+      value.call_cap,
+      value.accepted_calls,
+      value.rejected_calls,
+    ]);
+  });
+  const caseOrder = validatedCases.map(({ case_id: caseId }) => caseId);
+  if (JSON.stringify(caseOrder) !== JSON.stringify(S10BO1_CASES.slice(0, -1))) {
+    fail("orchestrator_business_boundary_invalid");
+  }
+  return validateR8BusinessEvidence({
+    schema_version: 1,
+    status: "passed",
+    run_id: runId,
+    business_cases: "frozen_s10b_002_011",
+    api_before_sha256: before.canonical_hash,
+    api_after_sha256: after.canonical_hash,
+    tasks_count_delta: 2,
+    audit_count_delta: 2,
+    idempotency_count_delta: 2,
+    fake_generation_count: fakeAuthorities.length,
+    fake_accepted_calls: fakeAuthorities.reduce((sum, value) => sum + value.accepted_calls, 0),
+    fake_rejected_calls: fakeAuthorities.reduce((sum, value) => sum + value.rejected_calls, 0),
+    fake_authority_set_sha256: sha256(fakeTuples.sort(asciiCompare).join("\n")),
+    case_count: validatedCases.length,
+    case_order_sha256: sha256(caseOrder.join("\n")),
+    s10b_r8_executed: true,
+  }, runId);
+}
+
+export function validateR8BusinessEvidence(value, runId) {
+  if (
+    value === null || Array.isArray(value) || typeof value !== "object" ||
+    !exactKeys(value, R8_BUSINESS_EVIDENCE_KEYS) || value.schema_version !== 1 ||
+    value.status !== "passed" || value.run_id !== runId ||
+    value.business_cases !== "frozen_s10b_002_011" || value.s10b_r8_executed !== true ||
+    !DIGEST_PATTERN.test(value.api_before_sha256 ?? "") ||
+    !DIGEST_PATTERN.test(value.api_after_sha256 ?? "") ||
+    value.api_after_sha256 === value.api_before_sha256 ||
+    value.tasks_count_delta !== 2 || value.audit_count_delta !== 2 ||
+    value.idempotency_count_delta !== 2 || value.fake_generation_count !== 4 ||
+    value.fake_accepted_calls !== 5 || value.fake_rejected_calls !== 0 ||
+    !DIGEST_PATTERN.test(value.fake_authority_set_sha256 ?? "") || value.case_count !== 10 ||
+    value.case_order_sha256 !== sha256(S10BO1_CASES.slice(0, -1).join("\n"))
+  ) fail("orchestrator_business_boundary_invalid");
+  return Object.freeze({ ...value });
 }
 
 export function validateProcessRecord(record, runId, role) {
@@ -1558,6 +1829,159 @@ export function validateExistingProcessRecordSet(records, expectedRoles = EXISTI
     fail("orchestrator_existing_evidence_incomplete");
   }
   return true;
+}
+
+function r8ProcessEvidenceNames() {
+  return Object.freeze([
+    "api-process.v1.json",
+    ...S10B_R8_FAKE_GENERATIONS.map(({ generation }) =>
+      `r8-fake-${generation}-process.v1.json`,
+    ),
+    "r8-desktop-1-process.v1.json",
+    "r8-desktop-2-process.v1.json",
+    ...[1, 2].flatMap((lifecycle) => [
+      `r8-lifecycle-${lifecycle}-host-process.v1.json`,
+      `r8-lifecycle-${lifecycle}-runtime-process.v1.json`,
+    ]),
+  ].sort(asciiCompare));
+}
+
+export function r8ProcessEvidenceNamesForPhase(phase) {
+  const names = [];
+  const apiStarted = ["api_starting", "api_ready", "fake_starting", "fake_ready", "desktop_starting",
+    "desktop_spawned", "desktop_ready", "host_ready", "runtime_ready", ...S10BO1_CASES.slice(0, -1)]
+    .includes(phase);
+  if (!apiStarted) return Object.freeze(names);
+  names.push("api-process.v1.json");
+  const fakeStarted = ["fake_starting", "fake_ready", "desktop_starting", "desktop_spawned", "desktop_ready",
+    "host_ready", "runtime_ready", ...S10BO1_CASES.slice(0, -1)].includes(phase);
+  if (!fakeStarted) return Object.freeze(names);
+  const lifecycleCount = ["s10b_005_planned_restart", "s10b_006", "s10b_007", "s10b_008", "s10b_009", "s10b_010", "s10b_011"].includes(phase) ? 2 : 1;
+  const fakeCount = phase === "s10b_003" || phase === "s10b_004" ? 2
+    : ["s10b_005_planned_restart", "s10b_006", "s10b_007", "s10b_008", "s10b_009"].includes(phase) ? 3
+      : ["s10b_010", "s10b_011"].includes(phase) ? 4 : 1;
+  names.push(...Array.from({ length: fakeCount }, (_, index) => `r8-fake-${index + 1}-process.v1.json`));
+  const desktopStarted = ["desktop_starting", "desktop_spawned", "desktop_ready", "host_ready", "runtime_ready",
+    "s10b_002", "s10b_003", "s10b_004", "s10b_005_planned_restart", "s10b_006", "s10b_007",
+    "s10b_008", "s10b_009", "s10b_010", "s10b_011"].includes(phase);
+  if (!desktopStarted) return Object.freeze(names.sort(asciiCompare));
+  names.push(...Array.from({ length: lifecycleCount }, (_, index) => `r8-desktop-${index + 1}-process.v1.json`));
+  const ownershipStarted = ["host_ready", "runtime_ready", "s10b_002", "s10b_003", "s10b_004",
+    "s10b_005_planned_restart", "s10b_006", "s10b_007", "s10b_008", "s10b_009", "s10b_010", "s10b_011"].includes(phase);
+  if (!ownershipStarted) return Object.freeze(names.sort(asciiCompare));
+  const ownershipCount = lifecycleCount;
+  names.push(...Array.from({ length: ownershipCount }, (_, index) => [
+    `r8-lifecycle-${index + 1}-host-process.v1.json`,
+    `r8-lifecycle-${index + 1}-runtime-process.v1.json`,
+  ]).flat());
+  return Object.freeze(names.sort(asciiCompare));
+}
+
+export function validateR8ProcessRecordSet(
+  records,
+  evidenceNames,
+  { phase = "s10b_011", complete = false } = {},
+) {
+  if (!Array.isArray(records) || !Array.isArray(evidenceNames) ||
+    records.length !== evidenceNames.length || new Set(evidenceNames).size !== evidenceNames.length ||
+    new Set(records.map((record) => record.pid)).size !== records.length) {
+    fail("orchestrator_existing_evidence_incomplete");
+  }
+  const allowedNames = r8ProcessEvidenceNamesForPhase(phase);
+  if (evidenceNames.some((name) => !allowedNames.includes(name))) {
+    fail("orchestrator_existing_evidence_incomplete");
+  }
+  const roleForName = (name) => name === "api-process.v1.json" ? "api"
+    : /^r8-fake-\d+-process\.v1\.json$/.test(name) ? "fake"
+      : /^r8-desktop-\d+-process\.v1\.json$/.test(name) ? "desktop"
+        : /^r8-lifecycle-\d+-host-process\.v1\.json$/.test(name) ? "host"
+          : /^r8-lifecycle-\d+-runtime-process\.v1\.json$/.test(name) ? "runtime"
+            : null;
+  if (evidenceNames.some((name, index) => roleForName(name) !== records[index]?.role)) {
+    fail("orchestrator_existing_evidence_incomplete");
+  }
+  const roleCounts = new Map();
+  for (const record of records) {
+    const count = roleCounts.get(record.role) ?? 0;
+    roleCounts.set(record.role, count + 1);
+  }
+  if ((roleCounts.get("api") ?? 0) > 1 || (roleCounts.get("fake") ?? 0) > 4 ||
+    (roleCounts.get("desktop") ?? 0) > 2 || (roleCounts.get("host") ?? 0) > 2 ||
+    (roleCounts.get("runtime") ?? 0) > 2 || (complete && (
+      roleCounts.get("api") !== 1 || roleCounts.get("fake") !== 4 ||
+      roleCounts.get("desktop") !== 2 || roleCounts.get("host") !== 2 || roleCounts.get("runtime") !== 2
+    ))) {
+    fail("orchestrator_existing_evidence_incomplete");
+  }
+  const byName = new Map(evidenceNames.map((name, index) => [name, records[index]]));
+  const numberedNames = (pattern) => evidenceNames.flatMap((name) => {
+    const match = pattern.exec(name);
+    return match ? [Number(match[1])] : [];
+  });
+  const requireContiguous = (numbers) => {
+    const ordered = [...numbers].sort((left, right) => left - right);
+    if (ordered.some((number, index) => number !== index + 1)) {
+      fail("orchestrator_existing_evidence_incomplete");
+    }
+  };
+  const fakeGenerations = numberedNames(/^r8-fake-(\d+)-process\.v1\.json$/);
+  const desktopLifecycles = numberedNames(/^r8-desktop-(\d+)-process\.v1\.json$/);
+  const hostLifecycles = numberedNames(/^r8-lifecycle-(\d+)-host-process\.v1\.json$/);
+  const runtimeLifecycles = numberedNames(/^r8-lifecycle-(\d+)-runtime-process\.v1\.json$/);
+  for (const numbers of [fakeGenerations, desktopLifecycles, hostLifecycles, runtimeLifecycles]) {
+    requireContiguous(numbers);
+  }
+  if (
+    hostLifecycles.length !== runtimeLifecycles.length ||
+    hostLifecycles.some((lifecycle, index) => runtimeLifecycles[index] !== lifecycle)
+  ) fail("orchestrator_existing_evidence_incomplete");
+  const api = byName.get("api-process.v1.json");
+  if ((!api && records.length !== 0) || (api && ![...byName.entries()]
+    .filter(([name]) => /^r8-(?:fake|desktop)-/.test(name))
+    .every(([, record]) => record.ppid === api.ppid))) {
+    fail("orchestrator_existing_evidence_incomplete");
+  }
+  for (const lifecycle of hostLifecycles) {
+    const desktop = byName.get(`r8-desktop-${lifecycle}-process.v1.json`);
+    const host = byName.get(`r8-lifecycle-${lifecycle}-host-process.v1.json`);
+    const runtime = byName.get(`r8-lifecycle-${lifecycle}-runtime-process.v1.json`);
+    if (!desktop || !host || !runtime || host.ppid !== desktop.pid || runtime.ppid !== host.pid) {
+      fail("orchestrator_existing_evidence_incomplete");
+    }
+  }
+  if (complete && JSON.stringify([...evidenceNames].sort(asciiCompare)) !==
+    JSON.stringify(r8ProcessEvidenceNames())) {
+    fail("orchestrator_existing_evidence_incomplete");
+  }
+  return true;
+}
+
+function r8CompletedCaseCountForPhase(phase) {
+  const index = S10BO1_CASES.slice(0, -1).indexOf(phase);
+  return index < 0 ? 0 : index + 1;
+}
+
+export function r8NoLogRequiredEvidenceNames(context) {
+  if (!context?.r8) return Object.freeze([]);
+  const names = new Set();
+  if (context.apiVerifierBefore) names.add("api-verifier-before.v1.json");
+  const finalCount = context.r8FakeAuthorities?.length ?? 0;
+  for (let generation = 1; generation <= finalCount; generation += 1) {
+    names.add(`r8-fake-${generation}-before.v1.json`);
+    names.add(`r8-fake-${generation}-final.v1.json`);
+  }
+  if (
+    context.fakeSpec && context.fakeAuthorityBefore &&
+    context.fakeAuthorityBefore.generation === context.fakeSpec.generation
+  ) names.add(`r8-fake-${context.fakeSpec.generation}-before.v1.json`);
+  for (let ordinal = 1; ordinal <= (context.r8CaseEvidence?.length ?? 0); ordinal += 1) {
+    names.add(`r8-case-${String(ordinal).padStart(2, "0")}.v1.json`);
+  }
+  if (context.r8Business) {
+    names.add("r8-api-verifier-after.v1.json");
+    names.add("r8-business-boundary.v1.json");
+  }
+  return Object.freeze([...names].sort(asciiCompare));
 }
 
 export function sameProcessIdentity(record, current) {
@@ -1767,6 +2191,9 @@ export async function runStartupAbortFlow(authority, operations) {
       : new S10BO1OrchestratorError("orchestrator_no_log_invalid");
     retainFirstSecondary(noLogFailure);
   }
+  if (primaryFailure && businessFailure) {
+    businessFailure = null;
+  }
 
   if (!failureRecorded && noLogFailure && typeof operations.recordFailure === "function") {
     try {
@@ -1861,7 +2288,180 @@ export async function runStartupAbortFlow(authority, operations) {
     state: machine.state,
     cleanup,
     no_log: noLog,
-    s10b_r8_executed: false,
+    s10b_r8_executed: expectedR8(authority),
+  });
+}
+
+export async function runR8Flow(authority, operations) {
+  if (!expectedR8(authority)) fail("orchestrator_r8_authority_invalid");
+  const machine = createR8StateMachine();
+  let primaryFailure;
+  let evidenceFailure;
+  let cleanup;
+  let cleanupFailure;
+  let noLog;
+  let noLogFailure;
+  let business;
+  let businessFailure;
+  let parentFailure;
+  let failureRecorded = false;
+  const failAs = (error, fallback) => error instanceof S10BO1OrchestratorError
+    ? error
+    : new S10BO1OrchestratorError(fallback);
+  try {
+    machine.transition("preflight_running");
+    const summary = await operations.runPreflight();
+    validateRepositorySummary(summary, authority.runId, authority.repositories);
+    machine.transition("preflight_passed");
+    await operations.buildDesktop();
+    machine.transition("desktop_built");
+    await operations.startDependencies();
+    machine.transition("dependencies_ready");
+    await operations.startApi();
+    machine.transition("api_ready");
+    await operations.startFakeGeneration(S10B_R8_FAKE_GENERATIONS[0]);
+    machine.transition("fake_ready");
+    await operations.startDesktopLifecycle(1, "before_restart");
+    machine.transition("desktop_ready");
+    await operations.readLifecycleOwnership(1);
+    machine.transition("host_ready");
+    machine.transition("runtime_ready");
+    for (const caseId of ["s10b_002", "s10b_003"]) {
+      await operations.executeCase(caseId);
+      machine.transition(caseId);
+    }
+    await operations.startFakeGeneration(S10B_R8_FAKE_GENERATIONS[1]);
+    for (const caseId of ["s10b_004"]) {
+      await operations.executeCase(caseId);
+      machine.transition(caseId);
+    }
+    await operations.completePlannedRestart();
+    await operations.startFakeGeneration(S10B_R8_FAKE_GENERATIONS[2]);
+    await operations.startDesktopLifecycle(2, "after_restart");
+    await operations.readLifecycleOwnership(2);
+    for (const caseId of [
+      "s10b_005_planned_restart", "s10b_006", "s10b_007", "s10b_008", "s10b_009", "s10b_010",
+    ]) {
+      await operations.executeCase(caseId);
+      machine.transition(caseId);
+    }
+    await operations.startFakeGeneration(S10B_R8_FAKE_GENERATIONS[3]);
+    await operations.executeCase("s10b_011");
+    machine.transition("s10b_011");
+    await operations.completeAbort();
+  } catch (error) {
+    primaryFailure = failAs(error, "orchestrator_internal_failure");
+    try { machine.abort(); } catch { /* Preserve the first leaf. */ }
+    try { await operations.captureNoLogAuthority(); } catch { /* Final scan fails closed. */ }
+    try {
+      await operations.recordFailure({
+        failureClass: primaryFailure.code,
+        businessFailureClass: null,
+        cleanupFailureClass: null,
+        parentFailureClass: null,
+      });
+      failureRecorded = true;
+    } catch (error_) {
+      evidenceFailure = failAs(error_, "orchestrator_evidence_write_failed");
+    }
+    try { await operations.initiateDesktopAbort?.(); } catch { /* Cleanup remains mandatory. */ }
+  }
+  if (!primaryFailure) {
+    try {
+      business = await operations.verifyR8Business();
+      validateR8BusinessEvidence(business, authority.runId);
+    } catch (error) {
+      businessFailure = failAs(error, "orchestrator_business_boundary_unknown");
+    }
+  }
+  try {
+    cleanup = await operations.cleanup();
+    validateCleanupClosure(cleanup);
+  } catch (error) {
+    cleanupFailure = failAs(error, "orchestrator_cleanup_unknown");
+  }
+  try {
+    operations.assertParentAlive?.();
+  } catch (error) {
+    parentFailure = failAs(error, "orchestrator_parent_death");
+  }
+  const preScanFailure = primaryFailure ?? businessFailure ?? cleanupFailure ?? parentFailure ?? evidenceFailure;
+  if (!failureRecorded && preScanFailure) {
+    try {
+      await operations.recordFailure({
+        failureClass: preScanFailure.code,
+        businessFailureClass: businessFailure?.code ?? null,
+        cleanupFailureClass: cleanupFailure?.code ?? null,
+        parentFailureClass: parentFailure?.code ?? null,
+      });
+      failureRecorded = true;
+    } catch (error) {
+      evidenceFailure ??= failAs(error, "orchestrator_evidence_write_failed");
+    }
+  }
+  try {
+    noLog = await operations.scanNoLog();
+    validateNoLogResult(noLog);
+  } catch (error) {
+    noLogFailure = failAs(error, "orchestrator_no_log_invalid");
+  }
+  let failure = primaryFailure ?? businessFailure ?? cleanupFailure ?? parentFailure ??
+    evidenceFailure ?? noLogFailure;
+  if (!failureRecorded && failure) {
+    try {
+      await operations.recordFailure({
+        failureClass: failure.code,
+        businessFailureClass: businessFailure?.code ?? null,
+        cleanupFailureClass: cleanupFailure?.code ?? null,
+        parentFailureClass: parentFailure?.code ?? null,
+      });
+      failureRecorded = true;
+    } catch (error) {
+      evidenceFailure ??= failAs(error, "orchestrator_evidence_write_failed");
+      failure = failure ?? evidenceFailure;
+    }
+  }
+  const businessStatus = business ? "passed" : businessFailure ? "failed"
+    : primaryFailure ? "not_applicable" : "unknown";
+  try {
+    await operations.recordClosure({
+      status: failure ? "failed" : "passed",
+      failureClass: failure?.code ?? null,
+      businessFailureClass: businessFailure?.code ?? null,
+      businessStatus,
+      cleanupFailureClass: cleanupFailure?.code ?? null,
+      cleanupScope: cleanup?.scope ?? null,
+      evidenceFailureClass: evidenceFailure?.code ?? null,
+      noLogFailureClass: noLogFailure?.code ?? null,
+      noLogScope: noLog?.scope ?? null,
+      parentFailureClass: parentFailure?.code ?? null,
+    });
+  } catch (error) {
+    evidenceFailure ??= failAs(error, "orchestrator_evidence_write_failed");
+    failure ??= evidenceFailure;
+  }
+  if (failure) {
+    try { machine.closeFailure(Boolean(cleanup && !cleanupFailure)); } catch { /* First leaf wins. */ }
+    throw new S10BO1OrchestratorError(failure.code, {
+      business_failure_class: businessFailure?.code ?? null,
+      cleanup_failure_class: cleanupFailure?.code ?? null,
+      evidence_failure_class: evidenceFailure?.code ?? null,
+      no_log_failure_class: noLogFailure?.code ?? null,
+      parent_failure_class: parentFailure?.code ?? null,
+    });
+  }
+  machine.transition("cleanup_passed");
+  machine.transition("closed_pass");
+  return Object.freeze({
+    schema_version: 1,
+    status: "passed",
+    scope: "LIA-126-048-fresh-r8",
+    run_id: authority.runId,
+    state: machine.state,
+    business,
+    cleanup,
+    no_log: noLog,
+    s10b_r8_executed: true,
   });
 }
 
@@ -1944,12 +2544,17 @@ function validateAttemptRepositories(repositories, expected) {
   );
 }
 
+function expectedR8(authority) {
+  return authority?.r8 === true;
+}
+
 export function validateAttemptPreclaim(value, authority) {
   if (
     value === null || Array.isArray(value) || typeof value !== "object" ||
     !exactKeys(value, ATTEMPT_PRECLAIM_KEYS) || value.schema_version !== 1 ||
-    value.kind !== "feat126-s10b-preclaim" || value.status !== "reserved" ||
-    value.run_id !== authority?.runId || value.s10b_r8_executed !== false ||
+    value.kind !== (expectedR8(authority) ? "feat126-s10b-r8-preclaim" : "feat126-s10b-preclaim") ||
+    value.status !== "reserved" || value.run_id !== authority?.runId ||
+    value.s10b_r8_executed !== expectedR8(authority) ||
     !validateAttemptRepositories(value.repositories, authority?.repositories ?? {}) ||
     !Number.isSafeInteger(value.pid) || value.pid <= 1 ||
     !Number.isSafeInteger(value.ppid) || value.ppid <= 0
@@ -1964,7 +2569,7 @@ export function validateAttemptPreclaimFailure(value, authority) {
     value === null || Array.isArray(value) || typeof value !== "object" ||
     !exactKeys(value, ATTEMPT_PRECLAIM_FAILURE_KEYS) || value.schema_version !== 1 ||
     value.status !== "failed" || value.run_id !== authority?.runId ||
-    value.s10b_r8_executed !== false || !DIGEST_PATTERN.test(value.preclaim_sha256 ?? "") ||
+    value.s10b_r8_executed !== expectedR8(authority) || !DIGEST_PATTERN.test(value.preclaim_sha256 ?? "") ||
     !/^[a-z][a-z0-9_]{0,127}$/.test(value.failure_class ?? "")
   ) {
     fail("orchestrator_attempt_evidence_invalid");
@@ -2001,6 +2606,13 @@ const ATTEMPT_PHASE_PROCESS_RULES = Object.freeze({
   desktop_exited: Object.freeze({ required: EXISTING_PROCESS_ROLES, allowed: EXISTING_PROCESS_ROLES }),
   cleanup_passed: Object.freeze({ required: EXISTING_PROCESS_ROLES, allowed: EXISTING_PROCESS_ROLES }),
   closed_pass: Object.freeze({ required: EXISTING_PROCESS_ROLES, allowed: EXISTING_PROCESS_ROLES }),
+  desktop_ready: Object.freeze({ required: EXISTING_PROCESS_ROLES, allowed: EXISTING_PROCESS_ROLES }),
+  host_ready: Object.freeze({ required: EXISTING_PROCESS_ROLES, allowed: EXISTING_PROCESS_ROLES }),
+  runtime_ready: Object.freeze({ required: EXISTING_PROCESS_ROLES, allowed: EXISTING_PROCESS_ROLES }),
+  ...Object.fromEntries(S10BO1_CASES.slice(0, -1).map((phase) => [
+    phase,
+    Object.freeze({ required: EXISTING_PROCESS_ROLES, allowed: EXISTING_PROCESS_ROLES }),
+  ])),
 });
 
 const PRE_OWNERSHIP_DESKTOP_FAILURE_CLASSES = Object.freeze([
@@ -2025,6 +2637,18 @@ function isKnownPreOwnershipDesktopFailure(value) {
     JSON.stringify(value.process_roles) === JSON.stringify(["api", "desktop", "fake"]);
 }
 
+function isKnownR8OwnershipFailure(value) {
+  return value?.s10b_r8_executed === true && value.phase === "desktop_ready" &&
+    [
+      "orchestrator_artifact_invalid",
+      "orchestrator_host_evidence_invalid",
+      "orchestrator_ownership_invalid",
+      "orchestrator_process_identity_unknown",
+      "orchestrator_runtime_evidence_invalid",
+    ].includes(value.failure_class) &&
+    JSON.stringify(value.process_roles) === JSON.stringify(["api", "desktop", "fake"]);
+}
+
 function requiresCompleteDescendantProcessRoles(value) {
   return (value.phase === "desktop_starting" && value.process_roles.includes("desktop")) || [
     "desktop_spawned",
@@ -2032,6 +2656,10 @@ function requiresCompleteDescendantProcessRoles(value) {
     "abort_sent",
     "abort_complete",
     "desktop_exited",
+    "desktop_ready",
+    "host_ready",
+    "runtime_ready",
+    ...S10BO1_CASES.slice(0, -1),
   ].includes(value.phase);
 }
 
@@ -2039,7 +2667,7 @@ export function validateReconcileFailureProcessState(failure) {
   if (
     failure && requiresCompleteDescendantProcessRoles(failure) &&
     failure.process_roles.length !== EXISTING_PROCESS_ROLES.length &&
-    !isKnownPreOwnershipDesktopFailure(failure)
+    !isKnownPreOwnershipDesktopFailure(failure) && !isKnownR8OwnershipFailure(failure)
   ) fail("orchestrator_cleanup_unknown");
   return true;
 }
@@ -2052,7 +2680,8 @@ function validateAttemptPhaseState(value) {
     !rule || !Array.isArray(roles) || new Set(roles).size !== roles.length ||
     JSON.stringify(roles) !== JSON.stringify(EXISTING_PROCESS_ROLES.filter((role) => roles.includes(role))) ||
     roles.some((role) => !rule.allowed.includes(role)) ||
-    rule.required.some((role) => !roles.includes(role)) ||
+    (rule.required.some((role) => !roles.includes(role)) &&
+      !isKnownR8OwnershipFailure(value)) ||
     !Array.isArray(retainedVolumeKeys) || new Set(retainedVolumeKeys).size !== retainedVolumeKeys.length ||
     JSON.stringify(retainedVolumeKeys) !== JSON.stringify(
       S10_NAMED_VOLUME_KEYS.filter((key) => retainedVolumeKeys.includes(key)),
@@ -2078,7 +2707,7 @@ function validateAttemptPhaseState(value) {
   if (
     requiresCompleteDescendantProcessRoles(value) &&
     roles.length !== EXISTING_PROCESS_ROLES.length && value.cleanup_failure_class === null &&
-    !isKnownPreOwnershipDesktopFailure(value)
+    !isKnownPreOwnershipDesktopFailure(value) && !isKnownR8OwnershipFailure(value)
   ) return false;
   return true;
 }
@@ -2087,8 +2716,9 @@ export function validateAttemptMarker(value, authority) {
   if (
     value === null || Array.isArray(value) || typeof value !== "object" ||
     !exactKeys(value, ATTEMPT_MARKER_KEYS) || value.schema_version !== 1 ||
-    value.kind !== "feat126-s10bo2-attempt" || value.status !== "claimed" ||
-    value.run_id !== authority?.runId || value.s10b_r8_executed !== false ||
+    value.kind !== (expectedR8(authority) ? "feat126-s10b-r8-attempt" : "feat126-s10bo2-attempt") ||
+    value.status !== "claimed" || value.run_id !== authority?.runId ||
+    value.s10b_r8_executed !== expectedR8(authority) ||
     !validateAttemptRepositories(value.repositories, authority?.repositories ?? {}) ||
     !Number.isSafeInteger(value.pid) || value.pid <= 1 ||
     !Number.isSafeInteger(value.ppid) || value.ppid <= 0 ||
@@ -2106,7 +2736,7 @@ export function validateAttemptFailure(value, authority) {
     value === null || Array.isArray(value) || typeof value !== "object" ||
     !exactKeys(value, ATTEMPT_FAILURE_KEYS) || value.schema_version !== 1 ||
     value.status !== "failed" || value.run_id !== authority?.runId ||
-    value.s10b_r8_executed !== false || !ATTEMPT_PHASES.has(value.phase) ||
+    value.s10b_r8_executed !== expectedR8(authority) || !ATTEMPT_PHASES.has(value.phase) ||
     !DIGEST_PATTERN.test(value.attempt_marker_sha256 ?? "") ||
     typeof value.compose_attempted !== "boolean" ||
     typeof value.compose_cleanup_required !== "boolean" ||
@@ -2133,7 +2763,7 @@ export function validateAttemptClosure(value, authority) {
     value === null || Array.isArray(value) || typeof value !== "object" ||
     !exactKeys(value, ATTEMPT_CLOSURE_KEYS) || value.schema_version !== 1 ||
     (!passed && !failed) || value.run_id !== authority?.runId ||
-    value.s10b_r8_executed !== false || !DIGEST_PATTERN.test(value.attempt_marker_sha256 ?? "") ||
+    value.s10b_r8_executed !== expectedR8(authority) || !DIGEST_PATTERN.test(value.attempt_marker_sha256 ?? "") ||
     value.closure_kind !== (passed ? "success" : "failure") ||
     (passed ? value.failure_class !== null :
       !/^[a-z][a-z0-9_]{0,127}$/.test(value.failure_class ?? "")) ||
@@ -2170,7 +2800,7 @@ export function validateAttemptReconcile(value, authority) {
     value === null || Array.isArray(value) || typeof value !== "object" ||
     !exactKeys(value, ATTEMPT_RECONCILE_KEYS) || value.schema_version !== 1 ||
     value.status !== "reconciled" || value.run_id !== authority?.runId ||
-    value.s10b_r8_executed !== false || !DIGEST_PATTERN.test(value.attempt_marker_sha256 ?? "") ||
+    value.s10b_r8_executed !== expectedR8(authority) || !DIGEST_PATTERN.test(value.attempt_marker_sha256 ?? "") ||
     !/^[a-z][a-z0-9_]{0,127}$/.test(value.failure_class ?? "") ||
     !["passed", "not_applicable", "unknown", "failed"].includes(value.business_status) ||
     ![null, "pre_run_absence", "preflight_artifacts", "run_artifacts"].includes(
@@ -2197,7 +2827,7 @@ export function buildAttemptReconcileEvidence(attempt, authority, failure, outco
     cleanup_failure_class: outcome?.cleanupFailure?.code ?? null,
     no_log_scope: outcome?.noLog?.scope ?? null,
     no_log_failure_class: outcome?.noLogFailure?.code ?? null,
-    s10b_r8_executed: false,
+    s10b_r8_executed: expectedR8(authority),
   }, authority);
 }
 
@@ -2345,7 +2975,7 @@ async function persistAttemptPreclaimFailure(preclaim, authority, error) {
     run_id: authority.runId,
     preclaim_sha256: preclaim.preclaimSha256,
     failure_class: primary.code,
-    s10b_r8_executed: false,
+    s10b_r8_executed: expectedR8(authority),
   }, authority);
   try {
     await writeSecureJson(preclaim.preclaimFailurePath, failure);
@@ -2439,13 +3069,13 @@ export async function claimAttemptLedger(authority, options = {}) {
 
   const preclaimValue = validateAttemptPreclaim({
     schema_version: 1,
-    kind: "feat126-s10b-preclaim",
+    kind: expectedR8(authority) ? "feat126-s10b-r8-preclaim" : "feat126-s10b-preclaim",
     status: "reserved",
     run_id: authority.runId,
     repositories: authority.repositories,
     pid: process.pid,
     ppid: Math.max(process.ppid, 1),
-    s10b_r8_executed: false,
+    s10b_r8_executed: expectedR8(authority),
   }, authority);
   const preclaimFresh = await createAttemptPreclaim(preclaim.preclaimPath, preclaimValue);
   if (!preclaimFresh) {
@@ -2499,7 +3129,7 @@ export async function claimAttemptLedger(authority, options = {}) {
     await requireAbsentAttemptArtifact(preclaim.preclaimFailurePath);
     marker = validateAttemptMarker({
       schema_version: 1,
-      kind: "feat126-s10bo2-attempt",
+      kind: expectedR8(authority) ? "feat126-s10b-r8-attempt" : "feat126-s10bo2-attempt",
       status: "claimed",
       run_id: authority.runId,
       repositories: authority.repositories,
@@ -2508,7 +3138,7 @@ export async function claimAttemptLedger(authority, options = {}) {
       start_identity: identity.start_identity,
       binary_sha256: identity.binary_sha256,
       script_sha256: scriptSha256,
-      s10b_r8_executed: false,
+      s10b_r8_executed: expectedR8(authority),
     }, authority);
   } catch (error) {
     await persistAttemptPreclaimFailure(preclaimBinding, authority, error);
@@ -2748,6 +3378,7 @@ export async function spawnOwnedProcess({
   inspect = inspectProcessIdentity,
   onSpawn,
   deferIdentityOnExit = false,
+  evidenceBasename = role,
 }, context) {
   let binarySha256;
   try {
@@ -2771,12 +3402,15 @@ export async function spawnOwnedProcess({
   }
   const provisional = {
     child,
+    evidenceBasename,
     record: null,
     logPath,
     role,
     provisional: true,
   };
   context.processes[role] = provisional;
+  context.processHistory ??= [];
+  context.processHistory.push(provisional);
   child.on("error", () => {
     context.cleanupUnknown = true;
     provisional.processError = true;
@@ -2828,7 +3462,7 @@ export async function spawnOwnedProcess({
   }, context.runId, role);
   provisional.record = record;
   provisional.provisional = false;
-  await writeSecureJson(resolve(context.evidenceRoot, `${role}-process.v1.json`), record);
+  await writeSecureJson(resolve(context.evidenceRoot, `${evidenceBasename}-process.v1.json`), record);
   return provisional;
 }
 
@@ -3057,6 +3691,11 @@ async function loadRunContext(authority, attempt) {
     composeLogsRequired: false,
     cleanupUnknown: false,
     processes: {},
+    processHistory: [],
+    descendantProcessHistory: [],
+    ownershipHistory: [],
+    r8CaseEvidence: [],
+    r8FakeAuthorities: [],
   };
 }
 
@@ -3201,9 +3840,13 @@ async function buildDesktop(context) {
     },
   );
   context.apiVerifierBinarySha256 = await hashFile(context.apiVerifierBinary);
+  const frontendEnvironment = {
+    VITE_FEAT126_S10_DRIVER: "true",
+    ...(expectedR8(context) ? { VITE_FEAT126_S10_R8: "true" } : {}),
+  };
   await runCommand("desktop_frontend_typecheck", "pnpm", ["exec", "vue-tsc", "--noEmit"], {
     cwd: DESKTOP_ROOT,
-    env: commandEnvironment({ VITE_FEAT126_S10_DRIVER: "true" }),
+    env: commandEnvironment(frontendEnvironment),
     signal: context.parentSignal,
   });
   await runCommand("desktop_frontend_build", "pnpm", [
@@ -3215,7 +3858,7 @@ async function buildDesktop(context) {
     "--emptyOutDir",
   ], {
     cwd: DESKTOP_ROOT,
-    env: commandEnvironment({ VITE_FEAT126_S10_DRIVER: "true" }),
+    env: commandEnvironment(frontendEnvironment),
     signal: context.parentSignal,
   });
   const tauriConfig = JSON.stringify({ build: { frontendDist: context.frontendDistRoot } });
@@ -3338,7 +3981,10 @@ async function startApi(context) {
   );
 }
 
-async function startFake(context) {
+async function startFake(context, specification = {}) {
+  const mode = specification.mode ?? "complete";
+  const generation = specification.generation ?? 1;
+  const callCap = specification.callCap ?? 1;
   const binary = resolve(context.binRoot, "feat126-fake-responses");
   context.processes.fake = await spawnOwnedProcess({
     role: "fake",
@@ -3347,12 +3993,14 @@ async function startFake(context) {
     environment: commandEnvironment({
       YIJIE_FEAT126_S10_TEST_PROFILE_ENABLED: "true",
       YIJIE_FEAT126_S10_RUN_ID: context.runId,
-      YIJIE_FEAT126_FAKE_RESPONSES_MODE: "complete",
-      YIJIE_FEAT126_S10_FAKE_GENERATION: "1",
-      YIJIE_FEAT126_FAKE_RESPONSES_MAX_CALLS: "1",
+      YIJIE_FEAT126_FAKE_RESPONSES_MODE: mode,
+      YIJIE_FEAT126_S10_FAKE_GENERATION: String(generation),
+      YIJIE_FEAT126_FAKE_RESPONSES_MAX_CALLS: String(callCap),
     }),
-    logPath: resolve(context.logRoot, "fake-orchestrator.log"),
+    logPath: resolve(context.logRoot, specification.logName ?? "fake-orchestrator.log"),
+    evidenceBasename: specification.evidenceBasename ?? "fake",
   }, context);
+  context.fakeSpec = Object.freeze({ mode, generation, callCap });
   for (let attempt = 0; attempt < 40; attempt += 1) {
     if (context.processes.fake.child.exitCode !== null) fail("orchestrator_fake_exited_early");
     const result = spawnSync(resolve(context.binRoot, "feat126-fake-readiness"), [], {
@@ -3378,7 +4026,7 @@ async function startFake(context) {
       }
       context.fakeAuthorityBefore = await probeClosedFakeAuthority(context);
       await writeSecureJson(
-        resolve(context.evidenceRoot, "fake-authority-before.v1.json"),
+        resolve(context.evidenceRoot, specification.authorityBeforeName ?? "fake-authority-before.v1.json"),
         context.fakeAuthorityBefore,
       );
       return;
@@ -3488,6 +4136,10 @@ async function verifyBusinessBoundary(context) {
 export function desktopEnvironment(context) {
   const issuer = "https://localhost:8443/realms/yijie-local";
   const oidc = `${issuer}/protocol/openid-connect`;
+  const r8 = context.r8Phase ? {
+    YIJIE_FEAT126_S10_R8_ENABLED: "true",
+    YIJIE_FEAT126_S10_R8_PHASE: context.r8Phase,
+  } : {};
   return commandEnvironment({
     YIJIE_ENV: "local",
     YIJIE_FEAT126_S10_TEST_PROFILE_ENABLED: "true",
@@ -3521,33 +4173,39 @@ export function desktopEnvironment(context) {
     YIJIE_DESKTOP_API_ORIGIN: "https://localhost:9443/",
     YIJIE_DESKTOP_LOCAL_CA_PEM_PATH: context.caPath,
     YIJIE_DESKTOP_LOCAL_CA_SHA256: context.caSha256,
+    ...r8,
   });
 }
 
-async function startDesktop(context) {
+async function startDesktop(context, specification = {}) {
+  context.nonce = specification.nonce ?? context.nonce;
+  context.r8Phase = specification.r8Phase;
   context.processes.desktop = await spawnOwnedProcess({
     role: "desktop",
     binary: context.desktopBinary,
     cwd: DESKTOP_ROOT,
     environment: desktopEnvironment(context),
-    logPath: resolve(context.logRoot, "desktop-orchestrator.log"),
+    logPath: resolve(context.logRoot, specification.logName ?? "desktop-orchestrator.log"),
+    evidenceBasename: specification.evidenceBasename ?? "desktop",
     extraStdio: ["pipe", "pipe"],
     deferIdentityOnExit: true,
     onSpawn(provisional) {
       context.controlWriter = provisional.child.stdio[3];
       guardControlWriter(context.controlWriter);
       context.controlWriter.on("error", () => { context.cleanupUnknown = true; });
-      context.controlReader = createControlFrameReader(provisional.child.stdio[4], context);
+      context.controlReader = specification.r8Phase
+        ? createR8ControlFrameReader(provisional.child.stdio[4], context)
+        : createControlFrameReader(provisional.child.stdio[4], context);
       context.pendingDesktopFrame = context.controlReader.next("component_ready");
       context.pendingDesktopFrame.catch(() => {});
     },
   }, context);
 }
 
-export async function readDesktopFrame(context, expectedKind) {
+export async function readDesktopFrame(context, expectedKind, expectedCaseId = null) {
   const controlFrame = expectedKind === "component_ready" && context.pendingDesktopFrame
     ? context.pendingDesktopFrame
-    : context.controlReader.next(expectedKind);
+    : context.controlReader.next(expectedKind, expectedCaseId);
   if (expectedKind === "component_ready") context.pendingDesktopFrame = null;
   const settle = (kind, promise) => promise.then(
     (value) => Object.freeze({ kind, value }),
@@ -3602,6 +4260,28 @@ export async function sendAbort(context) {
   await closeControlWriter(context.controlWriter);
 }
 
+export async function sendR8ControlFrame(context, kind, caseId = null) {
+  const previousSequence = context.r8ControlSequence ?? 0;
+  const frame = {
+    schema_version: 1,
+    run_id: context.runId,
+    nonce: context.nonce,
+    sequence: previousSequence + 1,
+    kind,
+    ...(caseId === null ? {} : { case_id: caseId }),
+  };
+  await writeFrame(context.controlWriter, encodeR8ControlFrame(frame, {
+    runId: context.runId,
+    nonce: context.nonce,
+    previousSequence,
+  }));
+  context.r8ControlSequence = frame.sequence;
+  if (["planned_restart", "abort"].includes(kind)) {
+    await closeControlWriter(context.controlWriter);
+  }
+  return Object.freeze(frame);
+}
+
 async function readHostProcessEvidence(context, expectedState, previousEvidence) {
   const hostRoot = resolve(context.runRoot, "host");
   await requireOwnerDirectory(hostRoot);
@@ -3611,35 +4291,58 @@ async function readHostProcessEvidence(context, expectedState, previousEvidence)
   } catch {
     fail("orchestrator_host_evidence_invalid");
   }
-  if (entries.length !== 1 || !entries[0].isDirectory() || entries[0].isSymbolicLink()) {
+  if (entries.length < 1 || entries.some((entry) => !entry.isDirectory() || entry.isSymbolicLink())) {
     fail("orchestrator_host_evidence_invalid");
   }
-  const evidenceDirectory = resolve(hostRoot, entries[0].name);
-  await requireOwnerDirectory(evidenceDirectory);
-  const bytes = await readSecureFile(resolve(evidenceDirectory, "process.json"), 16 * 1024);
-  let value;
-  try {
-    value = JSON.parse(bytes.toString("utf8"));
-  } catch {
+  const knownNonces = new Set((context.ownershipHistory ?? []).map(
+    (entry) => entry.hostEvidence?.instanceNonce,
+  ).filter(Boolean));
+  const unknownEntries = entries.filter((entry) => !knownNonces.has(entry.name));
+  if (previousEvidence) {
+    if (unknownEntries.length !== 0 || entries.filter(
+      (entry) => entry.name === previousEvidence.instanceNonce,
+    ).length !== 1) fail("orchestrator_host_evidence_invalid");
+  } else if (knownNonces.size === 0) {
+    if (entries.length !== 1) fail("orchestrator_host_evidence_invalid");
+  } else if (unknownEntries.length !== 1) {
     fail("orchestrator_host_evidence_invalid");
   }
-  let binarySha256;
-  try {
-    binarySha256 = await hashFile(resolve(context.binRoot, "yijie-agent-host"));
-  } catch {
-    fail("orchestrator_host_evidence_invalid");
+  const candidates = previousEvidence
+    ? entries.filter((entry) => entry.name === previousEvidence.instanceNonce)
+    : knownNonces.size === 0 ? entries : unknownEntries;
+  if (candidates.length < 1) fail("orchestrator_host_evidence_invalid");
+  let accepted;
+  let duplicate = false;
+  for (const entry of candidates) {
+    const evidenceDirectory = resolve(hostRoot, entry.name);
+    try {
+      await requireOwnerDirectory(evidenceDirectory);
+      const bytes = await readSecureFile(resolve(evidenceDirectory, "process.json"), 16 * 1024);
+      const value = JSON.parse(bytes.toString("utf8"));
+      let binarySha256;
+      try {
+        binarySha256 = await hashFile(resolve(context.binRoot, "yijie-agent-host"));
+      } catch {
+        fail("orchestrator_host_evidence_invalid");
+      }
+      const evidence = validateHostProcessEvidence(value, {
+        runId: context.runId,
+        desktopPid: previousEvidence?.ppid ?? context.processes.desktop.record.pid,
+        binarySha256,
+        expectedState,
+        expectedPid: previousEvidence?.pid,
+        expectedNonce: previousEvidence?.instanceNonce,
+        expectedStartedAtUnixMs: previousEvidence?.startedAtUnixMs,
+      });
+      if (entry.name !== evidence.instanceNonce) fail("orchestrator_host_evidence_invalid");
+      if (accepted) duplicate = true;
+      else accepted = evidence;
+    } catch (error) {
+      if (previousEvidence) throw error;
+    }
   }
-  const evidence = validateHostProcessEvidence(value, {
-    runId: context.runId,
-    desktopPid: context.processes.desktop.record.pid,
-    binarySha256,
-    expectedState,
-    expectedPid: previousEvidence?.pid,
-    expectedNonce: previousEvidence?.instanceNonce,
-    expectedStartedAtUnixMs: previousEvidence?.startedAtUnixMs,
-  });
-  if (entries[0].name !== evidence.instanceNonce) fail("orchestrator_host_evidence_invalid");
-  return evidence;
+  if (!accepted || duplicate) fail("orchestrator_host_evidence_invalid");
+  return accepted;
 }
 
 async function requestRuntimeEvidence(context, hostEvidence) {
@@ -3695,7 +4398,7 @@ async function requestRuntimeEvidence(context, hostEvidence) {
   });
 }
 
-async function readOwnershipEvidence(context) {
+async function readOwnershipEvidence(context, specification = {}) {
   const hostEvidence = await readHostProcessEvidence(context, "ready");
   const runtimeEvidence = await requestRuntimeEvidence(context, hostEvidence);
   const hostIdentity = await inspectProcessIdentity(hostEvidence.pid);
@@ -3726,13 +4429,25 @@ async function readOwnershipEvidence(context) {
     binary_sha256: runtimeEvidence.binary_sha256,
     start_identity: runtimeIdentity.start_identity,
   }, context.runId, "runtime");
-  await writeSecureJson(resolve(context.evidenceRoot, "host-evidence.v1.json"), hostEvidence);
-  await writeSecureJson(resolve(context.evidenceRoot, "runtime-evidence.v1.json"), runtimeEvidence);
-  await writeSecureJson(resolve(context.evidenceRoot, "host-process.v1.json"), hostRecord);
-  await writeSecureJson(resolve(context.evidenceRoot, "runtime-process.v1.json"), runtimeRecord);
+  await writeSecureJson(resolve(context.evidenceRoot, specification.hostEvidenceName ?? "host-evidence.v1.json"), hostEvidence);
+  await writeSecureJson(resolve(context.evidenceRoot, specification.runtimeEvidenceName ?? "runtime-evidence.v1.json"), runtimeEvidence);
+  await writeSecureJson(resolve(context.evidenceRoot, specification.hostProcessName ?? "host-process.v1.json"), hostRecord);
+  await writeSecureJson(resolve(context.evidenceRoot, specification.runtimeProcessName ?? "runtime-process.v1.json"), runtimeRecord);
   context.hostEvidence = hostEvidence;
   context.runtimeEvidence = runtimeEvidence;
   context.descendantProcesses = { host: hostRecord, runtime: runtimeRecord };
+  context.descendantProcessHistory ??= [];
+  context.descendantProcessHistory.push(hostRecord, runtimeRecord);
+  context.ownershipHistory ??= [];
+  context.ownershipHistory.push({
+    hostEvidence,
+    runtimeEvidence,
+    hostEvidenceName: specification.hostEvidenceName ?? "host-evidence.v1.json",
+    runtimeEvidenceName: specification.runtimeEvidenceName ?? "runtime-evidence.v1.json",
+    hostProcessName: specification.hostProcessName ?? "host-process.v1.json",
+    runtimeProcessName: specification.runtimeProcessName ?? "runtime-process.v1.json",
+    hostStoppedEvidenceName: specification.hostStoppedEvidenceName ?? "host-stopped-evidence.v1.json",
+  });
   const infraChildren = ["api", "fake", "desktop"].filter((role) => context.processes[role]);
   return {
     infra: { children: infraChildren },
@@ -3948,10 +4663,17 @@ async function runScopedSecretPatterns(context) {
 export async function captureRunScopedNoLogAuthority(context) {
   try {
     const patterns = await runScopedSecretPatterns(context);
-    context.runScopedSecretPatterns = Object.freeze(patterns.map((pattern) => Object.freeze({
-      name: pattern.name,
-      value: pattern.value,
-    })));
+    const merged = new Map((context.runScopedSecretPatterns ?? []).map((pattern) => [
+      JSON.stringify([pattern.name, pattern.value]),
+      pattern,
+    ]));
+    for (const pattern of patterns) {
+      merged.set(JSON.stringify([pattern.name, pattern.value]), Object.freeze({
+        name: pattern.name,
+        value: pattern.value,
+      }));
+    }
+    context.runScopedSecretPatterns = Object.freeze([...merged.values()]);
     context.noLogAuthorityCaptureFailed = false;
   } catch (error) {
     context.noLogAuthorityCaptureFailed = true;
@@ -3984,6 +4706,8 @@ async function noLogPatternSet(context) {
     { name: "synthetic_owner", value: SYNTHETIC_OWNER_ID },
     { name: "synthetic_tenant", value: SYNTHETIC_TENANT_ID },
     { name: "run_root", value: context.runRoot },
+    ...FROZEN_R8_CANARY_PATTERNS.filter(({ name }) => name !== "canary:project"),
+    { name: "canary:project", value: resolve(context.runRoot, "project") },
     { name: "workspace_root", value: WORKSPACE_ROOT },
   ].filter(({ value }) => typeof value === "string" && value.length > 0);
   const forbiddenPatterns = Object.freeze([
@@ -4940,10 +5664,21 @@ export async function scanNoLog(context) {
   }
   for (const [role, process_] of Object.entries(context.processes ?? {})) {
     if (process_.logPath) requiredFiles.add(process_.logPath);
-    if (process_.record) requiredFiles.add(resolve(context.evidenceRoot, `${role}-process.v1.json`));
+    if (process_.record && (!context.r8 || role === "api")) {
+      requiredFiles.add(resolve(context.evidenceRoot, `${role}-process.v1.json`));
+    }
+  }
+  for (const process_ of context.processHistory ?? []) {
+    if (process_.logPath) requiredFiles.add(process_.logPath);
+    if (process_.record) {
+      requiredFiles.add(resolve(
+        context.evidenceRoot,
+        `${process_.evidenceBasename ?? process_.role}-process.v1.json`,
+      ));
+    }
   }
   for (const role of Object.keys(context.descendantProcesses ?? {})) {
-    requiredFiles.add(resolve(context.evidenceRoot, `${role}-process.v1.json`));
+    if (!context.r8) requiredFiles.add(resolve(context.evidenceRoot, `${role}-process.v1.json`));
   }
   if (context.hostEvidence) {
     for (const name of [
@@ -4952,6 +5687,19 @@ export async function scanNoLog(context) {
       "runtime-evidence.v1.json",
     ]) requiredFiles.add(resolve(context.evidenceRoot, name));
     const hostInstance = resolve(context.runRoot, "host", context.hostEvidence.instanceNonce);
+    for (const name of ["process.json", "stderr.log", "stdout.log"]) {
+      requiredFiles.add(resolve(hostInstance, name));
+    }
+  }
+  for (const ownership of context.ownershipHistory ?? []) {
+    for (const name of [
+      ownership.hostEvidenceName,
+      ownership.hostStoppedEvidenceName,
+      ownership.runtimeEvidenceName,
+      ownership.hostProcessName,
+      ownership.runtimeProcessName,
+    ]) requiredFiles.add(resolve(context.evidenceRoot, name));
+    const hostInstance = resolve(context.runRoot, "host", ownership.hostEvidence.instanceNonce);
     for (const name of ["process.json", "stderr.log", "stdout.log"]) {
       requiredFiles.add(resolve(hostInstance, name));
     }
@@ -4973,15 +5721,15 @@ export async function scanNoLog(context) {
   }
   if (!preflightOnly) requiredFiles.add(resolve(context.evidenceRoot, "runtime-log-scan.v1.json"));
   if (context.apiVerifierBefore) {
-    for (const name of [
+    const names = context.r8 ? r8NoLogRequiredEvidenceNames(context) : [
       "api-verifier-before.v1.json",
       "api-verifier-after.v1.json",
       "business-boundary.v1.json",
-    ]) requiredFiles.add(resolve(context.evidenceRoot, name));
-    if (context.fakeAuthorityBefore) {
-      requiredFiles.add(resolve(context.evidenceRoot, "fake-authority-before.v1.json"));
-      requiredFiles.add(resolve(context.evidenceRoot, "fake-authority-after.v1.json"));
-    }
+      ...(context.fakeAuthorityBefore
+        ? ["fake-authority-before.v1.json", "fake-authority-after.v1.json"]
+        : []),
+    ];
+    for (const name of names) requiredFiles.add(resolve(context.evidenceRoot, name));
   }
   if ([...requiredFiles].some((path) => !files.includes(path))) {
     fail("orchestrator_no_log_invalid");
@@ -5066,10 +5814,12 @@ async function cleanupLiveContext(context) {
   }
   context.controlReader?.destroy();
   const outcomes = [];
-  for (const role of ["desktop", "fake", "api"]) {
-    if (!context.processes[role]) continue;
+  const ownedProcesses = context.processHistory?.length > 0
+    ? [...context.processHistory].reverse()
+    : ["desktop", "fake", "api"].map((role) => context.processes[role]).filter(Boolean);
+  for (const process_ of ownedProcesses) {
     try {
-      outcomes.push(await stopOwnedProcess(context.processes[role]));
+      outcomes.push(await stopOwnedProcess(process_));
     } catch {
       outcomes.push("unknown");
     }
@@ -5087,18 +5837,25 @@ async function cleanupLiveContext(context) {
       cleanupUnknown = true;
     }
   }
-  if (context.hostEvidence) {
+  if (context.hostEvidence && !(context.ownershipHistory ?? []).some(
+    (entry) => entry.hostEvidence.instanceNonce === context.hostEvidence.instanceNonce &&
+      entry.hostStoppedEvidence,
+  )) {
     try {
+      const ownership = (context.ownershipHistory ?? []).find(
+        (entry) => entry.hostEvidence.instanceNonce === context.hostEvidence.instanceNonce,
+      );
       const stoppedHostEvidence = await readHostProcessEvidence(
         context,
         "stopped",
         context.hostEvidence,
       );
       await writeSecureJson(
-        resolve(context.evidenceRoot, "host-stopped-evidence.v1.json"),
+        resolve(context.evidenceRoot, ownership?.hostStoppedEvidenceName ?? "host-stopped-evidence.v1.json"),
         stoppedHostEvidence,
       );
       context.hostStoppedEvidence = stoppedHostEvidence;
+      if (ownership) ownership.hostStoppedEvidence = stoppedHostEvidence;
     } catch {
       cleanupUnknown = true;
     }
@@ -5119,12 +5876,20 @@ async function cleanupLiveContext(context) {
     }
   }
 
+  const ownedProcessEntries = context.processHistory?.length > 0
+    ? context.processHistory
+    : Object.values(context.processes);
   const processRecords = [
-    ...Object.values(context.processes).map((process_) => process_.record).filter(Boolean),
-    ...Object.values(context.descendantProcesses ?? {}),
+    ...ownedProcessEntries.map((process_) => process_.record).filter(Boolean),
+    ...(context.descendantProcessHistory?.length > 0
+      ? context.descendantProcessHistory
+      : Object.values(context.descendantProcesses ?? {})),
   ];
-  if (processRecords.length !== Object.keys(context.processes).length +
-    Object.keys(context.descendantProcesses ?? {}).length) cleanupUnknown = true;
+  const unrecordedLiveChildren = ownedProcessEntries.filter((process_) => (
+    !process_.record && process_.child &&
+    process_.child.exitCode === null && process_.child.signalCode === null
+  ));
+  if (unrecordedLiveChildren.length !== 0) cleanupUnknown = true;
   const processAssessment = await assessProcessCleanup(processRecords, inspectProcessIdentity);
   cleanupUnknown ||= processAssessment.identityUnknown;
 
@@ -5241,6 +6006,11 @@ function createLiveOperations(authority, attempt, parentGuard = createParentIden
     noLogAuthorityCaptureRequired: true,
     noLogAuthorityCaptureFailed: false,
     processes: {},
+    processHistory: [],
+    descendantProcessHistory: [],
+    ownershipHistory: [],
+    r8CaseEvidence: [],
+    r8FakeAuthorities: [],
     parentSignal: parentController.signal,
   };
   let parentDead = false;
@@ -5363,11 +6133,162 @@ function createLiveOperations(authority, attempt, parentGuard = createParentIden
       context.phase = "fake_ready";
       requireParentAlive();
     },
+    async startFakeGeneration(specification) {
+      requireParentAlive();
+      if (!expectedR8(authority) || !S10B_R8_FAKE_GENERATIONS.includes(specification)) {
+        fail("orchestrator_fake_authority_invalid");
+      }
+      if (context.processes.fake) {
+        const finalAuthority = await probeClosedFakeAuthority(context, false);
+        const previous = context.fakeSpec;
+        if (
+          finalAuthority.accepted_calls !== previous.callCap ||
+          finalAuthority.rejected_calls !== 0
+        ) fail("orchestrator_fake_authority_invalid");
+        context.r8FakeAuthorities.push(finalAuthority);
+        await writeSecureJson(
+          resolve(context.evidenceRoot, `r8-fake-${previous.generation}-final.v1.json`),
+          finalAuthority,
+        );
+        const outcome = await stopOwnedProcess(context.processes.fake);
+        if (!["absent", "stopped"].includes(outcome)) fail("orchestrator_cleanup_unknown");
+        for (let attempt_ = 0; attempt_ < 50; attempt_ += 1) {
+          const listener = await inspectListener(18082);
+          if (!listener.listening && !listener.unknown) break;
+          if (attempt_ === 49) fail("orchestrator_fake_authority_invalid");
+          await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+        }
+      }
+      const priorPhase = context.phase;
+      if (specification.generation === 1) context.phase = "fake_starting";
+      await Promise.race([startFake(context, {
+        ...specification,
+        evidenceBasename: `r8-fake-${specification.generation}`,
+        logName: `r8-fake-${specification.generation}.log`,
+        authorityBeforeName: `r8-fake-${specification.generation}-before.v1.json`,
+      }), parentDeath]);
+      context.phase = specification.generation === 1 ? "fake_ready" : priorPhase;
+      requireParentAlive();
+    },
     async startDesktop() {
       requireParentAlive();
       context.phase = "desktop_starting";
       await Promise.race([startDesktop(context), parentDeath]);
       context.phase = "desktop_spawned";
+      requireParentAlive();
+    },
+    async startDesktopLifecycle(lifecycle, r8Phase) {
+      requireParentAlive();
+      if (!expectedR8(authority) || ![1, 2].includes(lifecycle) ||
+        (lifecycle === 1 ? r8Phase !== "before_restart" : r8Phase !== "after_restart")) {
+        fail("orchestrator_r8_authority_invalid");
+      }
+      const priorPhase = context.phase;
+      context.nonce = randomUUID();
+      context.r8ControlSequence = 0;
+      if (lifecycle === 1) context.phase = "desktop_starting";
+      await Promise.race([startDesktop(context, {
+        r8Phase,
+        nonce: context.nonce,
+        evidenceBasename: `r8-desktop-${lifecycle}`,
+        logName: `r8-desktop-${lifecycle}.log`,
+      }), parentDeath]);
+      const ready = await Promise.race([
+        readDesktopFrame(context, "component_ready"),
+        childExit(context.processes.api.child, "api"),
+        childExit(context.processes.fake.child, "fake"),
+        parentDeath,
+      ]);
+      if (ready.kind !== "component_ready" || ready.sequence !== 1) {
+        fail("orchestrator_control_order_invalid");
+      }
+      context.phase = lifecycle === 1 ? "desktop_ready" : priorPhase;
+      requireParentAlive();
+    },
+    async readLifecycleOwnership(lifecycle) {
+      requireParentAlive();
+      const priorPhase = context.phase;
+      const suffix = `r8-lifecycle-${lifecycle}`;
+      const ownership = await readOwnershipEvidence(context, {
+        hostEvidenceName: `${suffix}-host-evidence.v1.json`,
+        runtimeEvidenceName: `${suffix}-runtime-evidence.v1.json`,
+        hostProcessName: `${suffix}-host-process.v1.json`,
+        runtimeProcessName: `${suffix}-runtime-process.v1.json`,
+        hostStoppedEvidenceName: `${suffix}-host-stopped-evidence.v1.json`,
+      });
+      validateOwnership(ownership);
+      context.phase = lifecycle === 1 ? "runtime_ready" : priorPhase;
+      requireParentAlive();
+      return ownership;
+    },
+    async executeCase(caseId) {
+      requireParentAlive();
+      const ordinal = S10BO1_CASES.slice(0, -1).indexOf(caseId) + 1;
+      if (ordinal !== context.r8CaseEvidence.length + 1) fail("orchestrator_control_order_invalid");
+      await sendR8ControlFrame(context, "mode_transition", caseId);
+      const result = await Promise.race([
+        readDesktopFrame(context, "case_result", caseId),
+        childExit(context.processes.api.child, "api"),
+        childExit(context.processes.fake.child, "fake"),
+        childExit(context.processes.desktop.child, "desktop"),
+        parentDeath,
+      ]);
+      const evidence = validateR8CaseEvidence({
+        schema_version: 1,
+        status: "passed",
+        run_id: context.runId,
+        ordinal,
+        case_id: caseId,
+        frame_sequence: result.sequence,
+        assertion_count: result.assertion_count,
+        assertion_set_sha256: result.assertion_set_sha256,
+      }, context);
+      await writeSecureJson(
+        resolve(context.evidenceRoot, `r8-case-${String(ordinal).padStart(2, "0")}.v1.json`),
+        evidence,
+      );
+      context.r8CaseEvidence.push(evidence);
+      context.phase = caseId;
+      requireParentAlive();
+    },
+    async completePlannedRestart() {
+      requireParentAlive();
+      await captureRunScopedNoLogAuthority(context);
+      await sendR8ControlFrame(context, "planned_restart");
+      const terminal = await Promise.race([
+        context.controlReader.next("planned_restart"),
+        childExit(context.processes.api.child, "api"),
+        childExit(context.processes.fake.child, "fake"),
+        parentDeath,
+      ]);
+      if (terminal.sequence !== 5) fail("orchestrator_control_order_invalid");
+      await context.controlReader.expectEof();
+      await waitForDesktopExit(context);
+      const ownership = context.ownershipHistory.at(-1);
+      const stopped = await readHostProcessEvidence(context, "stopped", ownership.hostEvidence);
+      await writeSecureJson(resolve(context.evidenceRoot, ownership.hostStoppedEvidenceName), stopped);
+      ownership.hostStoppedEvidence = stopped;
+      context.phase = "s10b_005_planned_restart";
+      requireParentAlive();
+    },
+    async completeAbort() {
+      requireParentAlive();
+      await captureRunScopedNoLogAuthority(context);
+      await sendR8ControlFrame(context, "abort");
+      const complete = await Promise.race([
+        context.controlReader.next("abort_complete"),
+        childExit(context.processes.api.child, "api"),
+        childExit(context.processes.fake.child, "fake"),
+        parentDeath,
+      ]);
+      if (complete.sequence !== 9) fail("orchestrator_control_order_invalid");
+      await context.controlReader.expectEof();
+      await waitForDesktopExit(context);
+      const ownership = context.ownershipHistory.at(-1);
+      const stopped = await readHostProcessEvidence(context, "stopped", ownership.hostEvidence);
+      await writeSecureJson(resolve(context.evidenceRoot, ownership.hostStoppedEvidenceName), stopped);
+      ownership.hostStoppedEvidence = stopped;
+      context.phase = "s10b_011";
       requireParentAlive();
     },
     async readDesktopFrame(expectedKind) {
@@ -5427,6 +6348,38 @@ function createLiveOperations(authority, attempt, parentGuard = createParentIden
     async verifyBusinessBoundary() {
       return await verifyBusinessBoundary(context);
     },
+    async verifyR8Business() {
+      if (!expectedR8(authority) || !context.apiVerifierBefore) {
+        fail("orchestrator_business_boundary_unknown");
+      }
+      if (context.processes.fake && context.r8FakeAuthorities.length < 4) {
+        const finalAuthority = await probeClosedFakeAuthority(context, false);
+        const specification = context.fakeSpec;
+        if (
+          finalAuthority.accepted_calls !== specification.callCap ||
+          finalAuthority.rejected_calls !== 0
+        ) fail("orchestrator_fake_authority_invalid");
+        context.r8FakeAuthorities.push(finalAuthority);
+        await writeSecureJson(
+          resolve(context.evidenceRoot, `r8-fake-${specification.generation}-final.v1.json`),
+          finalAuthority,
+        );
+      }
+      const after = await runApiVerifierProjection(context);
+      await writeSecureJson(resolve(context.evidenceRoot, "r8-api-verifier-after.v1.json"), after);
+      context.r8Business = buildR8BusinessEvidence(
+        context.apiVerifierBefore,
+        after,
+        context.r8FakeAuthorities,
+        context.r8CaseEvidence,
+        context.runId,
+      );
+      await writeSecureJson(
+        resolve(context.evidenceRoot, "r8-business-boundary.v1.json"),
+        context.r8Business,
+      );
+      return context.r8Business;
+    },
     async cleanup() {
       if (!context) fail("orchestrator_cleanup_unknown");
       const result = await cleanupLiveContext(context);
@@ -5439,9 +6392,16 @@ function createLiveOperations(authority, attempt, parentGuard = createParentIden
       cleanupFailureClass,
       parentFailureClass,
     }) {
-      const processRoles = EXISTING_PROCESS_ROLES.filter((role) => (
-        Boolean(context.processes?.[role]) || Boolean(context.descendantProcesses?.[role])
-      ));
+      const observedRoles = new Set([
+        ...Object.values(context.processes ?? {}).filter((process_) => process_?.record)
+          .map((process_) => process_.role),
+        ...Object.values(context.descendantProcesses ?? {}).filter(Boolean)
+          .map((process_) => process_.role),
+        ...(context.processHistory ?? []).filter((process_) => process_?.record)
+          .map((process_) => process_.role),
+        ...(context.descendantProcessHistory ?? []).map((process_) => process_.role),
+      ]);
+      const processRoles = EXISTING_PROCESS_ROLES.filter((role) => observedRoles.has(role));
       const value = await writeAttemptFailure(attempt, authority, {
         schema_version: 1,
         status: "failed",
@@ -5458,7 +6418,7 @@ function createLiveOperations(authority, attempt, parentGuard = createParentIden
         process_roles: processRoles,
         retained_volume_keys: retainedVolumeKeys(authority.runId, context.retainedVolumeNames),
         no_log_required: true,
-        s10b_r8_executed: false,
+        s10b_r8_executed: expectedR8(authority),
       });
       context.attemptFailure = value;
       return value;
@@ -5490,7 +6450,7 @@ function createLiveOperations(authority, attempt, parentGuard = createParentIden
         no_log_failure_class: noLogFailureClass,
         no_log_scope: noLogScope,
         parent_failure_class: parentFailureClass,
-        s10b_r8_executed: false,
+        s10b_r8_executed: expectedR8(authority),
       });
       context.attemptClosure = value;
       return value;
@@ -5514,6 +6474,7 @@ export async function loadExistingProcessRecords(
   runRoot,
   runId,
   expectedRoles = EXISTING_PROCESS_ROLES,
+  options = {},
 ) {
   const evidenceRoot = resolve(runRoot, "orchestrator-evidence");
   try {
@@ -5529,17 +6490,31 @@ export async function loadExistingProcessRecords(
   } catch {
     fail("orchestrator_existing_evidence_incomplete");
   }
-  const expectedNames = expectedRoles.map((role) => `${role}-process.v1.json`).sort();
+  const r8 = options.r8 === true;
+  const expectedNames = r8
+    ? r8ProcessEvidenceNamesForPhase(options.phase ?? "s10b_011")
+    : expectedRoles.map((role) => `${role}-process.v1.json`).sort();
   const observedNames = entries
     .filter((entry) => entry.name.endsWith("-process.v1.json"))
     .map((entry) => entry.name)
     .sort();
-  if (JSON.stringify(observedNames) !== JSON.stringify(expectedNames)) {
+  if (r8
+    ? observedNames.some((name) => !expectedNames.includes(name))
+    : JSON.stringify(observedNames) !== JSON.stringify(expectedNames)) {
     fail("orchestrator_existing_evidence_incomplete");
   }
   const records = [];
-  for (const role of expectedRoles) {
-    const path = resolve(evidenceRoot, `${role}-process.v1.json`);
+  for (const name of observedNames) {
+    const role = r8
+      ? name === "api-process.v1.json" ? "api"
+        : name.includes("-desktop-") ? "desktop"
+          : name.includes("-fake-") ? "fake"
+            : name.includes("-host-process.") ? "host"
+              : name.includes("-runtime-process.") ? "runtime"
+                : null
+      : name.slice(0, -"-process.v1.json".length);
+    if (!role) fail("orchestrator_existing_evidence_incomplete");
+    const path = resolve(evidenceRoot, name);
     try {
       const bytes = await readSecureFile(path, 4096);
       const value = JSON.parse(bytes.toString("utf8"));
@@ -5551,7 +6526,19 @@ export async function loadExistingProcessRecords(
       fail("orchestrator_process_record_invalid");
     }
   }
-  validateExistingProcessRecordSet(records, expectedRoles);
+  if (r8) {
+    const roles = EXISTING_PROCESS_ROLES.filter((role) => records.some((record) => record.role === role));
+    if (JSON.stringify(roles) !== JSON.stringify(expectedRoles)) {
+      fail("orchestrator_existing_evidence_incomplete");
+    }
+    validateR8ProcessRecordSet(records, observedNames, options.requireComplete === true);
+  } else {
+    validateExistingProcessRecordSet(records, expectedRoles);
+  }
+  Object.defineProperty(records, "evidenceNames", {
+    enumerable: false,
+    value: Object.freeze([...observedNames]),
+  });
   return Object.freeze(records);
 }
 
@@ -5579,10 +6566,17 @@ async function reconcileExistingRun(authority, runRoot, options = {}) {
   let unknown = false;
   const expectedRoles = options.expectedRoles ?? EXISTING_PROCESS_ROLES;
   const retainedVolumeNames = options.retainedVolumeNames ?? await projectVolumeNames(authority.runId);
-  const records = await loadExistingProcessRecords(runRoot, authority.runId, expectedRoles);
+  const records = await loadExistingProcessRecords(runRoot, authority.runId, expectedRoles, {
+    r8: expectedR8(authority),
+    phase: options.phase,
+    requireComplete: options.requireComplete === true,
+  });
   await validateExistingBinaryAuthority(records, runRoot);
-  const byRole = new Map(records.map((record) => [record.role, record]));
-  const currentByRole = new Map();
+  const byRole = new Map(EXISTING_PROCESS_ROLES.map((role) => [
+    role,
+    records.filter((record) => record.role === role),
+  ]));
+  const currentByPid = new Map();
   for (const record of records) {
     let current;
     try {
@@ -5591,19 +6585,20 @@ async function reconcileExistingRun(authority, runRoot, options = {}) {
       unknown = true;
       continue;
     }
-    currentByRole.set(record.role, current);
+    currentByPid.set(record.pid, current);
     if (current !== null && !sameProcessIdentity(record, current)) unknown = true;
   }
-  if (
-    (currentByRole.has("host") && currentByRole.get("host") !== null &&
-      (!currentByRole.has("desktop") || currentByRole.get("desktop") === null)) ||
-    (currentByRole.has("runtime") && currentByRole.get("runtime") !== null &&
-      (!currentByRole.has("host") || currentByRole.get("host") === null))
-  ) unknown = true;
+  for (const record of records) {
+    const current = currentByPid.get(record.pid);
+    if (current === null || !["host", "runtime"].includes(record.role)) continue;
+    const parent = records.find((candidate) => candidate.pid === record.ppid);
+    if (!parent || currentByPid.get(parent.pid) === null) unknown = true;
+  }
   if (!unknown) {
-    for (const role of ["desktop", "fake", "api"]) {
-      const record = byRole.get(role);
-      if (!record) continue;
+    const infraOwnedRecords = records.filter((record) =>
+      ["api", "desktop", "fake"].includes(record.role),
+    ).reverse();
+    for (const record of infraOwnedRecords) {
       const outcome = await reconcileProcess(record, {
         inspect: inspectProcessIdentity,
         async stop(value) {
@@ -5798,6 +6793,100 @@ async function loadPersistedOwnershipEvidence(context, byRole) {
   context.hostStoppedEvidence = hostStoppedEvidence;
 }
 
+async function loadR8PersistedOwnershipEvidence(context, records) {
+  const byName = new Map(records.evidenceNames.map((name, index) => [name, records[index]]));
+  let hostBinarySha256;
+  let runtimeBinarySha256;
+  let manifestSha256;
+  try {
+    hostBinarySha256 = await hashFile(resolve(context.binRoot, "yijie-agent-host"));
+    runtimeBinarySha256 = await hashFile(
+      resolve(RUNTIME_ROOT, ".yijie/build/macos/aarch64-apple-darwin/codex"),
+    );
+    manifestSha256 = await hashFile(
+      resolve(RUNTIME_ROOT, ".yijie/build/macos/aarch64-apple-darwin/runtime-manifest.json"),
+    );
+  } catch {
+    fail("orchestrator_existing_evidence_incomplete");
+  }
+  context.ownershipHistory = [];
+  context.descendantProcessHistory = [];
+  const lifecycles = [1, 2].filter((lifecycle) => records.evidenceNames.includes(
+    `r8-lifecycle-${lifecycle}-host-process.v1.json`,
+  ));
+  for (const lifecycle of lifecycles) {
+    const desktopRecord = byName.get(`r8-desktop-${lifecycle}-process.v1.json`);
+    const hostRecord = byName.get(`r8-lifecycle-${lifecycle}-host-process.v1.json`);
+    const runtimeRecord = byName.get(`r8-lifecycle-${lifecycle}-runtime-process.v1.json`);
+    if (!desktopRecord || !hostRecord || !runtimeRecord) fail("orchestrator_existing_evidence_incomplete");
+    const prefix = `r8-lifecycle-${lifecycle}`;
+    const hostEvidence = validateHostProcessEvidence(
+      await readSecureJson(resolve(context.evidenceRoot, `${prefix}-host-evidence.v1.json`)),
+      {
+        runId: context.runId,
+        desktopPid: desktopRecord.pid,
+        binarySha256: hostBinarySha256,
+        expectedState: "ready",
+        expectedPid: hostRecord.pid,
+      },
+    );
+    const runtimeEvidence = validateRuntimeProcessEvidence(
+      await readSecureJson(resolve(context.evidenceRoot, `${prefix}-runtime-evidence.v1.json`)),
+      {
+        runId: context.runId,
+        hostPid: hostRecord.pid,
+        binarySha256: runtimeBinarySha256,
+        manifestSha256,
+        nonce: hostEvidence.instanceNonce,
+        profile: "feat-126-s10-local-lab",
+      },
+    );
+    let hostStoppedEvidence = null;
+    try {
+      hostStoppedEvidence = validateHostProcessEvidence(
+        await readSecureJson(resolve(context.evidenceRoot, `${prefix}-host-stopped-evidence.v1.json`)),
+        {
+          runId: context.runId,
+          desktopPid: desktopRecord.pid,
+          binarySha256: hostBinarySha256,
+          expectedState: "stopped",
+          expectedPid: hostRecord.pid,
+          expectedNonce: hostEvidence.instanceNonce,
+          expectedStartedAtUnixMs: hostEvidence.startedAtUnixMs,
+        },
+      );
+    } catch (error) {
+      const lifecycleOneStopped = lifecycle === 1 && [
+        "s10b_005_planned_restart", "s10b_006", "s10b_007", "s10b_008", "s10b_009",
+        "s10b_010", "s10b_011",
+      ].includes(context.phase);
+      const lifecycleTwoStopped = lifecycle === 2 && context.phase === "s10b_011";
+      if (context.requireCompleteR8Evidence || lifecycleOneStopped || lifecycleTwoStopped) throw error;
+    }
+    context.ownershipHistory.push({
+      hostEvidence,
+      runtimeEvidence,
+      hostStoppedEvidence,
+      hostEvidenceName: `${prefix}-host-evidence.v1.json`,
+      runtimeEvidenceName: `${prefix}-runtime-evidence.v1.json`,
+      hostStoppedEvidenceName: `${prefix}-host-stopped-evidence.v1.json`,
+      hostProcessName: `${prefix}-host-process.v1.json`,
+      runtimeProcessName: `${prefix}-runtime-process.v1.json`,
+    });
+    context.descendantProcessHistory.push(hostRecord, runtimeRecord);
+  }
+  const final = context.ownershipHistory.at(-1);
+  if (!final) return;
+  context.hostEvidence = final.hostEvidence;
+  context.runtimeEvidence = final.runtimeEvidence;
+  context.hostStoppedEvidence = final.hostStoppedEvidence;
+  const finalLifecycle = context.ownershipHistory.length;
+  context.descendantProcesses = {
+    host: byName.get(`r8-lifecycle-${finalLifecycle}-host-process.v1.json`),
+    runtime: byName.get(`r8-lifecycle-${finalLifecycle}-runtime-process.v1.json`),
+  };
+}
+
 async function loadReconcileNoLogContext(authority, attempt, failure, closure, records) {
   const runRoot = resolve(GENERATED_ROOT, authority.runId);
   const logRoot = resolve(runRoot, "logs");
@@ -5821,15 +6910,37 @@ async function loadReconcileNoLogContext(authority, attempt, failure, closure, r
       fail("orchestrator_existing_evidence_incomplete");
     }
   }
+  const r8 = expectedR8(authority);
   const byRole = new Map(records.map((record) => [record.role, record]));
   const processes = {};
+  const processHistory = [];
+  if (r8) {
+    const apiRecord = records[records.evidenceNames.indexOf("api-process.v1.json")];
+    if (apiRecord) {
+      processes.api = { record: apiRecord, logPath: resolve(logRoot, "api-orchestrator.log") };
+      processHistory.push({ role: "api", record: apiRecord, evidenceBasename: "api" });
+    }
+  }
   for (const [role, logName] of [
     ["api", "api-orchestrator.log"],
     ["fake", "fake-orchestrator.log"],
     ["desktop", "desktop-orchestrator.log"],
   ]) {
     const record = byRole.get(role);
-    if (record) processes[role] = { record, logPath: resolve(logRoot, logName) };
+    if (record && !r8) processes[role] = { record, logPath: resolve(logRoot, logName) };
+  }
+  if (r8) {
+    for (const name of records.evidenceNames) {
+      if (!/^r8-(?:fake|desktop)-[0-9]+-process\.v1\.json$/.test(name)) continue;
+      const record = records[records.evidenceNames.indexOf(name)];
+      const match = name.match(/^r8-(fake|desktop)-([0-9]+)-process\.v1\.json$/);
+      processHistory.push({
+        role: match[1],
+        record,
+        evidenceBasename: name.slice(0, -"-process.v1.json".length),
+        logPath: resolve(logRoot, `r8-${match[1]}-${match[2]}.log`),
+      });
+    }
   }
   const descendantProcesses = Object.fromEntries(
     ["host", "runtime"].filter((role) => byRole.has(role)).map((role) => [role, byRole.get(role)]),
@@ -5850,8 +6961,20 @@ async function loadReconcileNoLogContext(authority, attempt, failure, closure, r
     phase: failure?.phase ?? "desktop_exited",
     processes,
     descendantProcesses,
+    processHistory,
+    fakeSpec: r8 ? S10B_R8_FAKE_GENERATIONS[
+      Math.max(0, Math.max(...records.evidenceNames
+        .map((name) => /^r8-fake-(\d+)-process\.v1\.json$/.exec(name)?.[1] ?? "0")
+        .map(Number), 1) - 1)
+    ] : undefined,
   };
-  await loadPersistedOwnershipEvidence(context, byRole);
+  const hasR8Ownership = r8 && records.evidenceNames.some((name) =>
+    /^r8-lifecycle-[12]-host-process\.v1\.json$/.test(name));
+  context.requireCompleteR8Evidence = Boolean(
+    r8 && closure?.status === "passed",
+  );
+  if (hasR8Ownership) await loadR8PersistedOwnershipEvidence(context, records);
+  else if (!r8) await loadPersistedOwnershipEvidence(context, byRole);
   try {
     const apiVerifierBefore = await readSecureJson(
       resolve(evidenceRoot, "api-verifier-before.v1.json"),
@@ -5863,7 +6986,7 @@ async function loadReconcileNoLogContext(authority, attempt, failure, closure, r
       fail("orchestrator_existing_evidence_incomplete");
     }
   }
-  if (byRole.has("fake")) {
+  if (byRole.has("fake") && !r8) {
     try {
       context.fakeAuthorityBefore = validateClosedFakeAuthorityProjection(await readSecureJson(
         resolve(evidenceRoot, "fake-authority-before.v1.json"),
@@ -5872,6 +6995,99 @@ async function loadReconcileNoLogContext(authority, attempt, failure, closure, r
       if (context.phase !== "fake_starting") fail("orchestrator_existing_evidence_incomplete");
     }
   }
+  if (r8) {
+    let evidenceNames;
+    try {
+      evidenceNames = new Set((await readdir(evidenceRoot, { withFileTypes: true }))
+        .filter((entry) => entry.isFile() && !entry.isSymbolicLink())
+        .map((entry) => entry.name));
+    } catch {
+      fail("orchestrator_existing_evidence_incomplete");
+    }
+    const completedCaseCount = context.requireCompleteR8Evidence
+      ? S10BO1_CASES.length - 1
+      : r8CompletedCaseCountForPhase(context.phase);
+    const expectedCaseNames = Array.from({ length: completedCaseCount }, (_, index) =>
+      `r8-case-${String(index + 1).padStart(2, "0")}.v1.json`);
+    const observedCaseNames = [...evidenceNames].filter((name) => /^r8-case-\d{2}\.v1\.json$/.test(name))
+      .sort(asciiCompare);
+    if (JSON.stringify(observedCaseNames) !== JSON.stringify(expectedCaseNames)) {
+      fail("orchestrator_existing_evidence_incomplete");
+    }
+    context.r8CaseEvidence = [];
+    for (const [index, caseId] of S10BO1_CASES.slice(0, completedCaseCount).entries()) {
+      const evidence = validateR8CaseEvidence(
+        await readSecureJson(resolve(evidenceRoot, expectedCaseNames[index])),
+        authority,
+      );
+      if (evidence.case_id !== caseId) fail("orchestrator_existing_evidence_incomplete");
+      context.r8CaseEvidence.push(evidence);
+    }
+    const fakeProcessCount = records.evidenceNames.filter((name) =>
+      /^r8-fake-\d+-process\.v1\.json$/.test(name)).length;
+    context.r8FakeAuthorities = [];
+    for (const specification of S10B_R8_FAKE_GENERATIONS.slice(0, fakeProcessCount)) {
+      context.fakeSpec = specification;
+      const beforeName = `r8-fake-${specification.generation}-before.v1.json`;
+      const finalName = `r8-fake-${specification.generation}-final.v1.json`;
+      const firstCaseOrdinal = S10BO1_CASES.indexOf(specification.firstCase) + 1;
+      const beforeRequired = context.requireCompleteR8Evidence ||
+        specification.generation < fakeProcessCount || completedCaseCount >= firstCaseOrdinal;
+      const finalRequired = context.requireCompleteR8Evidence || specification.generation < fakeProcessCount;
+      if (beforeRequired && !evidenceNames.has(beforeName)) fail("orchestrator_existing_evidence_incomplete");
+      if (finalRequired && !evidenceNames.has(finalName)) fail("orchestrator_existing_evidence_incomplete");
+      if (evidenceNames.has(beforeName)) {
+        const before = validateClosedFakeAuthorityProjection(
+          await readSecureJson(resolve(evidenceRoot, beforeName)),
+          context,
+        );
+        context.fakeAuthorityBefore = before;
+      }
+      if (evidenceNames.has(finalName)) {
+        const final = validateClosedFakeAuthorityProjection(
+          await readSecureJson(resolve(evidenceRoot, finalName)),
+          context,
+          false,
+        );
+        if (final.accepted_calls !== specification.callCap || final.rejected_calls !== 0) {
+          fail("orchestrator_existing_evidence_incomplete");
+        }
+        context.r8FakeAuthorities.push(final);
+      }
+    }
+    const hasAfter = evidenceNames.has("r8-api-verifier-after.v1.json");
+    const hasBusiness = evidenceNames.has("r8-business-boundary.v1.json");
+    if (hasBusiness && !hasAfter) fail("orchestrator_existing_evidence_incomplete");
+    if (hasAfter) {
+      context.r8ApiVerifierAfter = validateApiVerifierProjection(
+        await readSecureJson(resolve(evidenceRoot, "r8-api-verifier-after.v1.json")),
+        authority.runId,
+      );
+    }
+    if (hasBusiness) {
+      context.r8Business = validateR8BusinessEvidence(
+        await readSecureJson(resolve(evidenceRoot, "r8-business-boundary.v1.json")),
+        authority.runId,
+      );
+    }
+    if (context.requireCompleteR8Evidence && (!hasAfter || !hasBusiness ||
+      context.r8FakeAuthorities.length !== S10B_R8_FAKE_GENERATIONS.length)) {
+      fail("orchestrator_existing_evidence_incomplete");
+    }
+    if (context.requireCompleteR8Evidence) {
+      const reconstructed = buildR8BusinessEvidence(
+        context.apiVerifierBefore,
+        context.r8ApiVerifierAfter,
+        context.r8FakeAuthorities,
+        context.r8CaseEvidence,
+        authority.runId,
+      );
+      if (JSON.stringify(reconstructed) !== JSON.stringify(context.r8Business)) {
+        fail("orchestrator_existing_evidence_incomplete");
+      }
+    }
+  }
+  context.r8CompleteEvidence = Boolean(context.r8Business && context.requireCompleteR8Evidence);
   return context;
 }
 
@@ -5895,9 +7111,12 @@ async function reconcileClaimedAttempt(authority, attempt) {
       (closure.status === "passed" && failure !== null) ||
       (closure.status === "failed" && (
         !failure || closure.failure_class !== failure.failure_class ||
-        closure.business_failure_class !== failure.business_failure_class ||
-        closure.cleanup_failure_class !== failure.cleanup_failure_class ||
-        closure.parent_failure_class !== failure.parent_failure_class
+        (failure.business_failure_class !== null &&
+          closure.business_failure_class !== failure.business_failure_class) ||
+        (failure.cleanup_failure_class !== null &&
+          closure.cleanup_failure_class !== failure.cleanup_failure_class) ||
+        (failure.parent_failure_class !== null &&
+          closure.parent_failure_class !== failure.parent_failure_class)
       ))
     )
   ) fail("orchestrator_attempt_evidence_invalid");
@@ -6008,6 +7227,8 @@ async function reconcileClaimedAttempt(authority, attempt) {
   try {
     reconciled = await reconcileExistingRun(authority, runRoot, {
       expectedRoles,
+      phase: failure?.phase,
+      requireComplete: Boolean(failure?.phase === "s10b_011" || closure?.status === "passed"),
       composeCleanupRequired: failure?.compose_cleanup_required ?? true,
       retainedVolumeNames: baselineVolumeNames,
       scope: failure && ["preflight_failed", "preflight_context_invalid"].includes(failure.phase)
@@ -6096,7 +7317,9 @@ async function executeOrchestrator(authority) {
   parentWatchdog.unref();
   try {
     operations.pollParentAlive();
-    return await runStartupAbortFlow(authority, operations);
+    return await (expectedR8(authority)
+      ? runR8Flow(authority, operations)
+      : runStartupAbortFlow(authority, operations));
   } finally {
     clearInterval(parentWatchdog);
     for (const [signal, handler] of handlers) process.off(signal, handler);
@@ -6104,8 +7327,12 @@ async function executeOrchestrator(authority) {
 }
 
 async function main() {
-  if (process.argv.length !== 3) fail("orchestrator_arguments_invalid");
-  const authority = validateOrchestratorInput(process.argv[2], process.env, []);
+  const r8 = process.argv[2] === "--r8";
+  const runId = process.argv[r8 ? 3 : 2];
+  if (process.argv.length !== (r8 ? 4 : 3)) fail("orchestrator_arguments_invalid");
+  const authority = r8
+    ? validateR8OrchestratorInput(runId, process.env, [])
+    : validateOrchestratorInput(runId, process.env, []);
   const result = await executeOrchestrator(authority);
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }

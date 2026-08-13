@@ -1338,6 +1338,7 @@ test("S10BO3-016 binds parsed preflight failure to disk evidence", () => {
 test("S10BO3-017 captures Compose logs before cleanup and marks leaks failed", async () => {
   const context = {
     runId,
+    runRoot: resolve(tmpdir(), `feat126-s10bo3-log-${runId}`),
     composeLogsRequired: true,
     secrets: new Map([["ephemeral", "never-log-secret"]]),
   };
