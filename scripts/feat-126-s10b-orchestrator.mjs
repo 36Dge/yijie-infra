@@ -4601,7 +4601,8 @@ async function readOwnershipEvidence(context, specification = {}) {
     ppid: hostEvidence.pid,
     binarySha256: runtimeEvidence.binary_sha256,
   });
-  if (hostIdentity === null || runtimeIdentity === null) fail("orchestrator_ownership_invalid");
+  if (hostIdentity === null) fail("orchestrator_host_evidence_invalid");
+  if (runtimeIdentity === null) fail("orchestrator_runtime_evidence_invalid");
   const hostRecord = validateProcessRecord({
     schema_version: 1,
     run_id: context.runId,
