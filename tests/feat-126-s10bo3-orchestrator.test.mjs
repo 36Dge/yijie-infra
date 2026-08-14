@@ -380,6 +380,27 @@ test("S10BO3 corrective derives no-log requirements from the reached R8 phase", 
     "api-verifier-before.v1.json",
     "r8-fake-1-before.v1.json",
   ]);
+  const thirdGenerationPreCallFailure = {
+    ...runtimeReady,
+    phase: "s10b_006",
+    fakeSpec: { generation: 3 },
+    fakeAuthorityBefore: { generation: 3 },
+    r8FakeAuthorities: [{ generation: 1 }, { generation: 2 }],
+    r8CaseEvidence: Array.from({ length: 5 }, () => ({ status: "passed" })),
+  };
+  assert.deepEqual(r8NoLogRequiredEvidenceNames(thirdGenerationPreCallFailure), [
+    "api-verifier-before.v1.json",
+    "r8-case-01.v1.json",
+    "r8-case-02.v1.json",
+    "r8-case-03.v1.json",
+    "r8-case-04.v1.json",
+    "r8-case-05.v1.json",
+    "r8-fake-1-before.v1.json",
+    "r8-fake-1-final.v1.json",
+    "r8-fake-2-before.v1.json",
+    "r8-fake-2-final.v1.json",
+    "r8-fake-3-before.v1.json",
+  ]);
   assert.equal(r8OwnershipStoppedEvidenceRequired(runtimeReady, 1), false);
   const lifecycleOneStopped = {
     ...runtimeReady,

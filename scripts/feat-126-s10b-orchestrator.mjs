@@ -5570,9 +5570,11 @@ async function scanRuntimeLogDatabase(path, literalPatterns, forbiddenPatterns, 
     const tables = database.prepare(
       "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name ASC",
     ).all().map(({ name }) => name);
-    if (JSON.stringify(tables) !== JSON.stringify([
-      "_sqlx_migrations", "logs", "sqlite_sequence",
-    ])) fail("orchestrator_no_log_invalid");
+    const tableProjection = JSON.stringify(tables);
+    if (
+      tableProjection !== JSON.stringify(["_sqlx_migrations", "logs"]) &&
+      tableProjection !== JSON.stringify(["_sqlx_migrations", "logs", "sqlite_sequence"])
+    ) fail("orchestrator_no_log_invalid");
     const columns = database.prepare("PRAGMA table_info(logs)").all().map((column) => ({
       cid: column.cid,
       name: column.name,

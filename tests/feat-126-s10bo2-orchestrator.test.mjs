@@ -141,7 +141,7 @@ function noLogResult(overrides = {}) {
   };
 }
 
-function createRuntimeLogDatabase(path) {
+function createRuntimeLogDatabase(path, { autoIncrement = true } = {}) {
   const database = new DatabaseSync(path);
   database.exec(`
     CREATE TABLE _sqlx_migrations (
@@ -153,7 +153,7 @@ function createRuntimeLogDatabase(path) {
       execution_time BIGINT NOT NULL
     );
     CREATE TABLE logs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id INTEGER PRIMARY KEY${autoIncrement ? " AUTOINCREMENT" : ""},
       ts INTEGER NOT NULL,
       ts_nanos INTEGER NOT NULL,
       level TEXT NOT NULL,
@@ -1366,6 +1366,22 @@ test("S10BO2-013 scans all evidence roots and fails closed when a root is missin
   const clean = await scanNoLog(context);
   assert.equal(clean.file_count, 9);
   assert.equal(clean.hit_count, 0);
+  await unlink(runtimeLogDatabase);
+  createRuntimeLogDatabase(runtimeLogDatabase, { autoIncrement: false });
+  await chmod(runtimeLogDatabase, 0o644);
+  assert.equal((await scanNoLog(context)).hit_count, 0);
+  {
+    const unexpected = new DatabaseSync(runtimeLogDatabase);
+    unexpected.exec("CREATE TABLE unexpected_business_rows (id INTEGER PRIMARY KEY)");
+    unexpected.close();
+  }
+  await assert.rejects(
+    scanNoLog(context),
+    (error) => errorCode(error) === "orchestrator_no_log_invalid",
+  );
+  await unlink(runtimeLogDatabase);
+  createRuntimeLogDatabase(runtimeLogDatabase, { autoIncrement: false });
+  await chmod(runtimeLogDatabase, 0o644);
   assert.equal(
     (await scanNoLog({
       ...context,
