@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
 
@@ -14,6 +17,7 @@ import {
   createR8ControlFrameReader,
   createR8StateMachine,
   encodeR8ControlFrame,
+  persistR8FakeFinalAuthority,
   r8NoLogRequiredEvidenceNames,
   r8ProcessEvidenceNamesForPhase,
   runR8Flow,
@@ -140,6 +144,16 @@ function fakeAuthority(specification) {
     call_cap: specification.callCap,
     accepted_calls: specification.callCap,
     rejected_calls: 0,
+  };
+}
+
+function closedFakeAuthority(specification, overrides = {}) {
+  return {
+    ...fakeAuthority(specification),
+    dataset_id: "feat126-title-raw-v1",
+    fixture_case_id: "normal-000",
+    dataset_sha256: "b".repeat(64),
+    ...overrides,
   };
 }
 
@@ -330,6 +344,47 @@ test("S10BR8-006 fails closed on case order, fake calls, or API aggregates", () 
     reordered,
     runId,
   ));
+});
+
+test("S10BR8-006A persists the closed fake authority before enforcing exact call counts", async (t) => {
+  const evidenceRoot = await mkdtemp(join(tmpdir(), "feat126-r8-fake-final-"));
+  t.after(() => rm(evidenceRoot, { recursive: true, force: true }));
+  const specification = S10B_R8_FAKE_GENERATIONS[1];
+  const observed = closedFakeAuthority(specification, { accepted_calls: 0, rejected_calls: 1 });
+  const context = {
+    runId,
+    evidenceRoot,
+    fakeSpec: specification,
+    r8FakeAuthorities: [],
+    summary: summary(),
+  };
+  await assert.rejects(
+    persistR8FakeFinalAuthority(context, specification, observed),
+    (error) => error?.code === "orchestrator_fake_authority_invalid",
+  );
+  const evidencePath = join(evidenceRoot, "r8-fake-2-final.v1.json");
+  assert.deepEqual(JSON.parse(await readFile(evidencePath, "utf8")), observed);
+  assert.equal((await stat(evidencePath)).mode & 0o777, 0o600);
+  assert.deepEqual(context.r8FakeAuthorities, []);
+});
+
+test("S10BR8-006B retains an exact fake authority for aggregate verification", async (t) => {
+  const evidenceRoot = await mkdtemp(join(tmpdir(), "feat126-r8-fake-valid-"));
+  t.after(() => rm(evidenceRoot, { recursive: true, force: true }));
+  const specification = S10B_R8_FAKE_GENERATIONS[1];
+  const observed = closedFakeAuthority(specification);
+  const context = {
+    runId,
+    evidenceRoot,
+    fakeSpec: specification,
+    r8FakeAuthorities: [],
+    summary: summary(),
+  };
+  assert.deepEqual(
+    await persistR8FakeFinalAuthority(context, specification, observed),
+    observed,
+  );
+  assert.deepEqual(context.r8FakeAuthorities, [observed]);
 });
 
 function r8FlowOperations(calls, overrides = {}) {

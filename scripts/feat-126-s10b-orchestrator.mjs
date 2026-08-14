@@ -1357,6 +1357,23 @@ export function validateClosedFakeAuthorityProjection(value, context, requireZer
   return Object.freeze({ ...value });
 }
 
+export async function persistR8FakeFinalAuthority(context, specification, value) {
+  const finalAuthority = validateClosedFakeAuthorityProjection(value, {
+    ...context,
+    fakeSpec: specification,
+  }, false);
+  await writeSecureJson(
+    resolve(context.evidenceRoot, `r8-fake-${specification.generation}-final.v1.json`),
+    finalAuthority,
+  );
+  if (
+    finalAuthority.accepted_calls !== specification.callCap ||
+    finalAuthority.rejected_calls !== 0
+  ) fail("orchestrator_fake_authority_invalid");
+  context.r8FakeAuthorities.push(finalAuthority);
+  return finalAuthority;
+}
+
 export function validateApiVerifierProjection(value, runId) {
   const validCounts = (entry) => entry && Number.isSafeInteger(entry.count) && entry.count >= 0 &&
     Array.isArray(entry.enums) && entry.enums.every((item) => typeof item === "string") &&
@@ -6271,15 +6288,7 @@ function createLiveOperations(authority, attempt, parentGuard = createParentIden
       if (context.processes.fake) {
         const finalAuthority = await probeClosedFakeAuthority(context, false);
         const previous = context.fakeSpec;
-        if (
-          finalAuthority.accepted_calls !== previous.callCap ||
-          finalAuthority.rejected_calls !== 0
-        ) fail("orchestrator_fake_authority_invalid");
-        context.r8FakeAuthorities.push(finalAuthority);
-        await writeSecureJson(
-          resolve(context.evidenceRoot, `r8-fake-${previous.generation}-final.v1.json`),
-          finalAuthority,
-        );
+        await persistR8FakeFinalAuthority(context, previous, finalAuthority);
         const outcome = await stopOwnedProcess(context.processes.fake);
         if (!["absent", "stopped"].includes(outcome)) fail("orchestrator_cleanup_unknown");
         for (let attempt_ = 0; attempt_ < 50; attempt_ += 1) {
@@ -6482,15 +6491,7 @@ function createLiveOperations(authority, attempt, parentGuard = createParentIden
       if (context.processes.fake && context.r8FakeAuthorities.length < 4) {
         const finalAuthority = await probeClosedFakeAuthority(context, false);
         const specification = context.fakeSpec;
-        if (
-          finalAuthority.accepted_calls !== specification.callCap ||
-          finalAuthority.rejected_calls !== 0
-        ) fail("orchestrator_fake_authority_invalid");
-        context.r8FakeAuthorities.push(finalAuthority);
-        await writeSecureJson(
-          resolve(context.evidenceRoot, `r8-fake-${specification.generation}-final.v1.json`),
-          finalAuthority,
-        );
+        await persistR8FakeFinalAuthority(context, specification, finalAuthority);
       }
       const after = await runApiVerifierProjection(context);
       await writeSecureJson(resolve(context.evidenceRoot, "r8-api-verifier-after.v1.json"), after);
