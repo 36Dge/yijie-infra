@@ -49,6 +49,7 @@ import {
   r8PersistedStoppedEvidenceRequired,
   runStartupAbortFlow,
   scanNoLog,
+  scanNoLogBuffer,
   shouldRunComposeCleanup,
   validateAttemptClosure,
   validateAttemptFailure,
@@ -1218,6 +1219,28 @@ test("S10BO3-007 establishes content-free no-log evidence when preflight never c
   await mkdir(runRoot, { mode: 0o700 });
   await chmod(runRoot, 0o700);
   await assert.rejects(scanNoLog(context), codeIs("orchestrator_no_log_invalid"));
+});
+
+test("S10BO3-007 accepts only the fixed content-free Host notification warning", () => {
+  const fixedWarning = scanNoLogBuffer(Buffer.from(`${JSON.stringify({
+    level: "WARN",
+    method: "item/completed",
+    msg: "failed to map Codex notification",
+    time: 1,
+  })}\n`), [], []);
+  assert.equal(fixedWarning.hitCount, 0);
+
+  const unknownWarning = scanNoLogBuffer(Buffer.from(`${JSON.stringify({
+    level: "WARN",
+    method: "item/completed",
+    msg: "unreviewed synthetic host warning",
+    time: 1,
+  })}\n`), [], []);
+  assert.deepEqual(unknownWarning.hits, [{
+    rule: "unclassified_sensitive_field",
+    fieldClass: "structured_unclassified",
+    reasonClass: "unclassified_context_value",
+  }]);
 });
 
 test("S10BO3-008 accepts only phase-declared process record sets and ownership chains", async (t) => {

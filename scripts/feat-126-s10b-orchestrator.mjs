@@ -412,6 +412,11 @@ const STRUCTURED_NO_LOG_RULES = Object.freeze([
   "sensitive_value_field",
   "unclassified_sensitive_field",
 ]);
+const APPROVED_CONTEXT_MESSAGES = Object.freeze([
+  "failed to map Codex notification",
+  "starting yijie-agent-host",
+  "starting yijie-api",
+]);
 const STRUCTURED_NO_LOG_FIELD_CLASSES = Object.freeze([
   "literal_value",
   "local_path",
@@ -4880,7 +4885,7 @@ function approvedContextFieldValue(key, value) {
     return value !== null && typeof value === "object";
   }
   if (key === "msg") {
-    return value === "starting yijie-api" || value === "starting yijie-agent-host";
+    return APPROVED_CONTEXT_MESSAGES.includes(value);
   }
   if (key === "jwks_url") {
     return value === "https://localhost:8443/realms/yijie-local/protocol/openid-connect/certs";
@@ -5307,7 +5312,7 @@ function structuredNoLogHits(value, origin = null) {
   ));
 }
 
-function scanNoLogBuffer(content, literalPatterns, forbiddenPatterns, origin = null) {
+export function scanNoLogBuffer(content, literalPatterns, forbiddenPatterns, origin = null) {
   let value;
   try {
     value = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(content));
@@ -5409,6 +5414,7 @@ function noLogPatternDigest(literalPatterns, forbiddenPatterns, classificationRu
     ...literalPatterns.map(({ name }) => name),
     ...forbiddenPatterns.map(([name]) => name),
     ...classificationRules,
+    ...APPROVED_CONTEXT_MESSAGES.map((value) => `approved_context_msg:${value}`),
     ...STRUCTURED_NO_LOG_FIELD_CLASSES,
     ...STRUCTURED_NO_LOG_REASON_CLASSES,
   ])].sort(asciiCompare).join("\n"));
