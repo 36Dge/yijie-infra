@@ -41,6 +41,7 @@ import {
   inspectProcessIdentity,
   inspectProcessIdentityWithRetry,
   loadExistingProcessRecords,
+  observeRuntimeEvidenceWithRetry,
   parseControlFrame,
   parseDarwinProcessLaunchIdentity,
   readDesktopFrame,
@@ -861,6 +862,24 @@ test("S10BO2-009 resamples transient ownership identity mismatches", async () =>
   });
   assert.equal(attempts, 3);
   assert.equal(mismatch.ppid, 41);
+});
+
+test("S10BO2-009 bounds transient Runtime evidence observation", async () => {
+  let attempts = 0;
+  let waits = 0;
+  assert.deepEqual(await observeRuntimeEvidenceWithRetry(async () => {
+    attempts += 1;
+    if (attempts < 3) throw new Error("transient");
+    return { state: "ready" };
+  }, {
+    async wait(duration) { assert.equal(duration, 50); waits += 1; },
+  }), { state: "ready" });
+  assert.equal(attempts, 3);
+  assert.equal(waits, 2);
+
+  await assert.rejects(observeRuntimeEvidenceWithRetry(async () => {
+    throw new Error("persistent");
+  }, { async wait() {} }), (error) => errorCode(error) === "orchestrator_runtime_evidence_invalid");
 });
 
 test("S10BO2-010 reconciles exact identity once and counts actual survivors", async () => {

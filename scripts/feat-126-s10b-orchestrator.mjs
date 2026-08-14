@@ -4531,7 +4531,7 @@ async function readHostProcessEvidence(context, expectedState, previousEvidence)
 }
 
 async function requestRuntimeEvidence(context, hostEvidence) {
-  const value = await new Promise((resolveEvidence, rejectEvidence) => {
+  const value = await observeRuntimeEvidenceWithRetry(() => new Promise((resolveEvidence, rejectEvidence) => {
     const request = http.get(
       {
         hostname: "127.0.0.1",
@@ -4564,7 +4564,7 @@ async function requestRuntimeEvidence(context, hostEvidence) {
     );
     request.on("timeout", () => request.destroy(new Error("timeout")));
     request.on("error", rejectEvidence);
-  }).catch(() => fail("orchestrator_runtime_evidence_invalid"));
+  }));
   let binarySha256;
   let manifestSha256;
   try {
@@ -4581,6 +4581,22 @@ async function requestRuntimeEvidence(context, hostEvidence) {
     nonce: hostEvidence.instanceNonce,
     profile: "feat-126-s10-local-lab",
   });
+}
+
+export async function observeRuntimeEvidenceWithRetry(observe, options = {}) {
+  const wait = options.wait ?? ((duration) => new Promise((resolveWait) => setTimeout(resolveWait, duration)));
+  const attempts = options.attempts ?? 3;
+  if (typeof observe !== "function" || !Number.isSafeInteger(attempts) || attempts < 1 || attempts > 3) {
+    fail("orchestrator_runtime_evidence_invalid");
+  }
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await observe();
+    } catch {
+      if (attempt + 1 < attempts) await wait(50);
+    }
+  }
+  fail("orchestrator_runtime_evidence_invalid");
 }
 
 async function readOwnershipEvidence(context, specification = {}) {
