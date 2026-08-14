@@ -396,7 +396,10 @@ const DESKTOP_STARTUP_FAILURE_CLASSES = Object.freeze([
 const DESKTOP_POST_READY_FAILURE_CLASSES = Object.freeze([
   "driver_case_create_failed",
   "driver_case_failed",
+  "driver_case_project_pin_failed",
   "driver_case_result_failed",
+  "driver_case_session_pin_failed",
+  "driver_case_session_rename_failed",
   "driver_control_projection_invalid",
   "driver_frontend_startup_invalid",
 ]);

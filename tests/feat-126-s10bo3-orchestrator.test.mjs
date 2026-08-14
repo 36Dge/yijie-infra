@@ -196,6 +196,34 @@ test("S10BO3 corrective preserves a content-free post-ready failure leaf", async
     (error) => error?.code === "driver_case_failed");
 });
 
+test("S10BO3 preserves exact content-free metadata failure leaves", async () => {
+  for (const failureClass of [
+    "driver_case_session_rename_failed",
+    "driver_case_session_pin_failed",
+    "driver_case_project_pin_failed",
+  ]) {
+    const nonce = "12600000-0000-4000-8000-000000000076";
+    const control = Readable.from(`${JSON.stringify({
+      schema_version: 1,
+      run_id: runId,
+      nonce,
+      sequence: 1,
+      kind: "component_ready",
+    })}\n${JSON.stringify({
+      schema_version: 1,
+      run_id: runId,
+      nonce,
+      sequence: 2,
+      kind: "component_failed",
+      failure_class: failureClass,
+    })}\n`);
+    const reader = createR8ControlFrameReader(control, { runId, nonce });
+    assert.equal((await reader.next("component_ready")).kind, "component_ready");
+    await assert.rejects(reader.next("case_result", "s10b_005_planned_restart"),
+      (error) => error?.code === failureClass);
+  }
+});
+
 test("S10BO3 corrective accepts a post-ready leaf in startup-abort mode", async () => {
   const nonce = "12600000-0000-4000-8000-000000000075";
   const control = Readable.from(`${JSON.stringify({
