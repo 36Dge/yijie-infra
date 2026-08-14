@@ -3475,6 +3475,27 @@ export async function inspectProcessIdentityWithRetry(pid, options = {}) {
   throw lastError;
 }
 
+export async function inspectExpectedProcessIdentityWithRetry(pid, expected, options = {}) {
+  const inspect = options.inspect ?? inspectProcessIdentityWithRetry;
+  const wait = options.wait ?? ((duration) => new Promise((resolveWait) => setTimeout(resolveWait, duration)));
+  const attempts = options.attempts ?? 3;
+  if (
+    !Number.isSafeInteger(expected?.ppid) || expected.ppid <= 0 ||
+    !DIGEST_PATTERN.test(expected?.binarySha256 ?? "") ||
+    !Number.isSafeInteger(attempts) || attempts < 1 || attempts > 3
+  ) fail("orchestrator_process_identity_unknown");
+  let identity = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    identity = await inspect(pid);
+    if (
+      identity !== null && identity.ppid === expected.ppid &&
+      identity.binary_sha256 === expected.binarySha256
+    ) return identity;
+    if (attempt + 1 < attempts) await wait(20);
+  }
+  return identity;
+}
+
 async function captureProcessIdentity(child, expectedBinarySha256, inspect = inspectProcessIdentityWithRetry) {
   if (!Number.isSafeInteger(child.pid) || child.pid <= 1) fail("orchestrator_process_spawn_failed");
   for (let attempt = 0; attempt < 50; attempt += 1) {
@@ -4565,23 +4586,29 @@ async function requestRuntimeEvidence(context, hostEvidence) {
 async function readOwnershipEvidence(context, specification = {}) {
   const hostEvidence = await readHostProcessEvidence(context, "ready");
   const runtimeEvidence = await requestRuntimeEvidence(context, hostEvidence);
-  const hostIdentity = await inspectProcessIdentityWithRetry(hostEvidence.pid);
-  const runtimeIdentity = await inspectProcessIdentityWithRetry(runtimeEvidence.pid);
-  if (
-    hostIdentity === null || hostIdentity.ppid !== context.processes.desktop.record.pid ||
-    hostIdentity.binary_sha256 !== hostEvidence.binarySha256 ||
-    runtimeIdentity === null || runtimeIdentity.ppid !== hostEvidence.pid ||
-    runtimeIdentity.binary_sha256 !== runtimeEvidence.binary_sha256
-  ) {
-    fail("orchestrator_ownership_invalid");
-  }
+  const hostEvidenceName = specification.hostEvidenceName ?? "host-evidence.v1.json";
+  const runtimeEvidenceName = specification.runtimeEvidenceName ?? "runtime-evidence.v1.json";
+  const hostProcessName = specification.hostProcessName ?? "host-process.v1.json";
+  const runtimeProcessName = specification.runtimeProcessName ?? "runtime-process.v1.json";
+  const hostStoppedEvidenceName = specification.hostStoppedEvidenceName ?? "host-stopped-evidence.v1.json";
+  await writeSecureJson(resolve(context.evidenceRoot, hostEvidenceName), hostEvidence);
+  await writeSecureJson(resolve(context.evidenceRoot, runtimeEvidenceName), runtimeEvidence);
+  const hostIdentity = await inspectExpectedProcessIdentityWithRetry(hostEvidence.pid, {
+    ppid: context.processes.desktop.record.pid,
+    binarySha256: hostEvidence.binarySha256,
+  });
+  const runtimeIdentity = await inspectExpectedProcessIdentityWithRetry(runtimeEvidence.pid, {
+    ppid: hostEvidence.pid,
+    binarySha256: runtimeEvidence.binary_sha256,
+  });
+  if (hostIdentity === null || runtimeIdentity === null) fail("orchestrator_ownership_invalid");
   const hostRecord = validateProcessRecord({
     schema_version: 1,
     run_id: context.runId,
     role: "host",
     pid: hostEvidence.pid,
-    ppid: hostEvidence.ppid,
-    binary_sha256: hostEvidence.binarySha256,
+    ppid: hostIdentity.ppid,
+    binary_sha256: hostIdentity.binary_sha256,
     start_identity: hostIdentity.start_identity,
   }, context.runId, "host");
   const runtimeRecord = validateProcessRecord({
@@ -4589,14 +4616,12 @@ async function readOwnershipEvidence(context, specification = {}) {
     run_id: context.runId,
     role: "runtime",
     pid: runtimeEvidence.pid,
-    ppid: runtimeEvidence.ppid,
-    binary_sha256: runtimeEvidence.binary_sha256,
+    ppid: runtimeIdentity.ppid,
+    binary_sha256: runtimeIdentity.binary_sha256,
     start_identity: runtimeIdentity.start_identity,
   }, context.runId, "runtime");
-  await writeSecureJson(resolve(context.evidenceRoot, specification.hostEvidenceName ?? "host-evidence.v1.json"), hostEvidence);
-  await writeSecureJson(resolve(context.evidenceRoot, specification.runtimeEvidenceName ?? "runtime-evidence.v1.json"), runtimeEvidence);
-  await writeSecureJson(resolve(context.evidenceRoot, specification.hostProcessName ?? "host-process.v1.json"), hostRecord);
-  await writeSecureJson(resolve(context.evidenceRoot, specification.runtimeProcessName ?? "runtime-process.v1.json"), runtimeRecord);
+  await writeSecureJson(resolve(context.evidenceRoot, hostProcessName), hostRecord);
+  await writeSecureJson(resolve(context.evidenceRoot, runtimeProcessName), runtimeRecord);
   context.hostEvidence = hostEvidence;
   context.runtimeEvidence = runtimeEvidence;
   context.descendantProcesses = { host: hostRecord, runtime: runtimeRecord };
@@ -4606,12 +4631,18 @@ async function readOwnershipEvidence(context, specification = {}) {
   context.ownershipHistory.push({
     hostEvidence,
     runtimeEvidence,
-    hostEvidenceName: specification.hostEvidenceName ?? "host-evidence.v1.json",
-    runtimeEvidenceName: specification.runtimeEvidenceName ?? "runtime-evidence.v1.json",
-    hostProcessName: specification.hostProcessName ?? "host-process.v1.json",
-    runtimeProcessName: specification.runtimeProcessName ?? "runtime-process.v1.json",
-    hostStoppedEvidenceName: specification.hostStoppedEvidenceName ?? "host-stopped-evidence.v1.json",
+    hostEvidenceName,
+    runtimeEvidenceName,
+    hostProcessName,
+    runtimeProcessName,
+    hostStoppedEvidenceName,
   });
+  if (
+    hostIdentity.ppid !== context.processes.desktop.record.pid ||
+    hostIdentity.binary_sha256 !== hostEvidence.binarySha256 ||
+    runtimeIdentity.ppid !== hostEvidence.pid ||
+    runtimeIdentity.binary_sha256 !== runtimeEvidence.binary_sha256
+  ) fail("orchestrator_ownership_invalid");
   const infraChildren = ["api", "fake", "desktop"].filter((role) => context.processes[role]);
   return {
     infra: { children: infraChildren },

@@ -37,6 +37,7 @@ import {
   desktopProductionBuildFeatures,
   desktopEnvironment,
   encodeControlFrame,
+  inspectExpectedProcessIdentityWithRetry,
   inspectProcessIdentity,
   inspectProcessIdentityWithRetry,
   loadExistingProcessRecords,
@@ -834,6 +835,32 @@ test("S10BO2-009 resamples only transient process identity tool failures", async
     async inspect() { throw new S10BO1OrchestratorError("orchestrator_process_binary_invalid"); },
     async wait() { assert.fail("non-transient identity failure must not be retried"); },
   }), (error) => errorCode(error) === "orchestrator_process_binary_invalid");
+});
+
+test("S10BO2-009 resamples transient ownership identity mismatches", async () => {
+  const expected = { ppid: 42, binarySha256: "a".repeat(64) };
+  const samples = [
+    { pid: 7, ppid: 41, binary_sha256: "b".repeat(64), start_identity: "c".repeat(64) },
+    { pid: 7, ppid: 42, binary_sha256: "a".repeat(64), start_identity: "d".repeat(64) },
+  ];
+  let waits = 0;
+  const observed = await inspectExpectedProcessIdentityWithRetry(7, expected, {
+    async inspect() { return samples.shift(); },
+    async wait(duration) { assert.equal(duration, 20); waits += 1; },
+  });
+  assert.equal(observed.start_identity, "d".repeat(64));
+  assert.equal(waits, 1);
+
+  let attempts = 0;
+  const mismatch = await inspectExpectedProcessIdentityWithRetry(7, expected, {
+    async inspect() {
+      attempts += 1;
+      return { pid: 7, ppid: 41, binary_sha256: "b".repeat(64), start_identity: "e".repeat(64) };
+    },
+    async wait() {},
+  });
+  assert.equal(attempts, 3);
+  assert.equal(mismatch.ppid, 41);
 });
 
 test("S10BO2-010 reconciles exact identity once and counts actual survivors", async () => {
