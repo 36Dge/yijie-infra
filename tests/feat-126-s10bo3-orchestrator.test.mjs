@@ -92,6 +92,33 @@ const identity = Object.freeze({
 });
 const scriptSha256 = "c".repeat(64);
 
+test("S10BO3 R8 reader preserves every closed bind startup leaf", async () => {
+  const failureClasses = [
+    "driver_bind_context_denied",
+    "driver_bind_context_invalid",
+    "driver_bind_context_unauthenticated",
+    "driver_bind_context_unavailable",
+    "driver_bind_event_failed",
+    "driver_bind_project_snapshot_failed",
+    "driver_bind_readiness_snapshot_failed",
+    "driver_bind_session_snapshot_failed",
+  ];
+  for (const failureClass of failureClasses) {
+    const nonce = "12600000-0000-4000-8000-000000000080";
+    const control = Readable.from(`${JSON.stringify({
+      schema_version: 1,
+      run_id: runId,
+      nonce,
+      sequence: 1,
+      kind: "startup_failed",
+      failure_class: failureClass,
+    })}\n`);
+    const reader = createR8ControlFrameReader(control, { runId, nonce });
+    await assert.rejects(reader.next("component_ready"),
+      (error) => error?.code === failureClass);
+  }
+});
+
 test("S10BO3 R8 reader preserves a valid pre-ready startup failure leaf", async () => {
   const nonce = "12600000-0000-4000-8000-000000000076";
   const control = Readable.from(`${JSON.stringify({
