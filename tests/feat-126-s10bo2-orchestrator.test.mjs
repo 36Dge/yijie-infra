@@ -38,6 +38,7 @@ import {
   desktopEnvironment,
   encodeControlFrame,
   inspectProcessIdentity,
+  inspectProcessIdentityWithRetry,
   loadExistingProcessRecords,
   parseControlFrame,
   parseDarwinProcessLaunchIdentity,
@@ -796,6 +797,43 @@ test("S10BO2-009 captures executable digest for a real child", async (t) => {
   assert.deepEqual(await inspectProcessIdentity(child.pid), identity);
   child.kill("SIGTERM");
   await once(child, "exit");
+});
+
+test("S10BO2-009 resamples only transient process identity tool failures", async () => {
+  const identity = {
+    pid: 91,
+    ppid: 90,
+    start_identity: "a".repeat(64),
+    binary_sha256: "b".repeat(64),
+  };
+  let calls = 0;
+  let waits = 0;
+  assert.deepEqual(await inspectProcessIdentityWithRetry(91, {
+    attempts: 3,
+    async inspect() {
+      calls += 1;
+      if (calls < 3) throw new S10BO1OrchestratorError("orchestrator_process_identity_unknown");
+      return identity;
+    },
+    async wait(duration) {
+      assert.equal(duration, 20);
+      waits += 1;
+    },
+  }), identity);
+  assert.equal(calls, 3);
+  assert.equal(waits, 2);
+
+  calls = 0;
+  assert.equal(await inspectProcessIdentityWithRetry(91, {
+    async inspect() { calls += 1; return null; },
+    async wait() { assert.fail("absent process must not be retried"); },
+  }), null);
+  assert.equal(calls, 1);
+
+  await assert.rejects(inspectProcessIdentityWithRetry(91, {
+    async inspect() { throw new S10BO1OrchestratorError("orchestrator_process_binary_invalid"); },
+    async wait() { assert.fail("non-transient identity failure must not be retried"); },
+  }), (error) => errorCode(error) === "orchestrator_process_binary_invalid");
 });
 
 test("S10BO2-010 reconciles exact identity once and counts actual survivors", async () => {

@@ -3163,7 +3163,7 @@ export async function claimAttemptLedger(authority, options = {}) {
     authority.runId,
   );
   const preclaim = preclaimPaths(attemptRoot, authority.runId);
-  const inspectIdentity = options.inspectIdentity ?? inspectProcessIdentity;
+  const inspectIdentity = options.inspectIdentity ?? inspectProcessIdentityWithRetry;
   const resolveIdentity = async () => {
     const identity = options.identity ?? await inspectIdentity(process.pid);
     if (!identity || identity.pid !== process.pid) fail("orchestrator_process_identity_unknown");
@@ -3453,7 +3453,29 @@ export async function inspectProcessIdentity(pid) {
   });
 }
 
-async function captureProcessIdentity(child, expectedBinarySha256, inspect = inspectProcessIdentity) {
+export async function inspectProcessIdentityWithRetry(pid, options = {}) {
+  const inspect = options.inspect ?? inspectProcessIdentity;
+  const wait = options.wait ?? ((duration) => new Promise((resolveWait) => setTimeout(resolveWait, duration)));
+  const attempts = options.attempts ?? 3;
+  if (!Number.isSafeInteger(attempts) || attempts < 1 || attempts > 3) {
+    fail("orchestrator_process_identity_unknown");
+  }
+  let lastError;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await inspect(pid);
+    } catch (error) {
+      if (!(error instanceof S10BO1OrchestratorError) || error.code !== "orchestrator_process_identity_unknown") {
+        throw error;
+      }
+      lastError = error;
+      if (attempt + 1 < attempts) await wait(20);
+    }
+  }
+  throw lastError;
+}
+
+async function captureProcessIdentity(child, expectedBinarySha256, inspect = inspectProcessIdentityWithRetry) {
   if (!Number.isSafeInteger(child.pid) || child.pid <= 1) fail("orchestrator_process_spawn_failed");
   for (let attempt = 0; attempt < 50; attempt += 1) {
     if (child.exitCode !== null || child.signalCode !== null) fail("orchestrator_process_exited_early");
@@ -3492,7 +3514,7 @@ export async function spawnOwnedProcess({
   environment,
   logPath,
   extraStdio = [],
-  inspect = inspectProcessIdentity,
+  inspect = inspectProcessIdentityWithRetry,
   onSpawn,
   deferIdentityOnExit = false,
   evidenceBasename = role,
@@ -3701,7 +3723,7 @@ export async function closeControlWriter(stream, timeoutMs = CONTROL_TIMEOUT_MS)
 async function stopOwnedProcess(process_) {
   if (!process_?.child || process_.child.exitCode !== null || process_.child.signalCode !== null) return "absent";
   if (process_.provisional || !process_.record) return "unknown";
-  const current = await inspectProcessIdentity(process_.record.pid);
+  const current = await inspectProcessIdentityWithRetry(process_.record.pid);
   if (current === null) return "absent";
   if (!sameProcessIdentity(process_.record, current)) return "foreign_identity_preserved";
   process_.child.kill("SIGTERM");
@@ -3710,7 +3732,7 @@ async function stopOwnedProcess(process_) {
     new Promise((resolveTimeout) => setTimeout(() => resolveTimeout(false), PROCESS_STOP_TIMEOUT_MS)),
   ]);
   if (stopped) return "stopped";
-  const afterTerm = await inspectProcessIdentity(process_.record.pid);
+  const afterTerm = await inspectProcessIdentityWithRetry(process_.record.pid);
   if (afterTerm === null || !sameProcessIdentity(process_.record, afterTerm)) return "stopped";
   process_.child.kill("SIGKILL");
   const killed = await Promise.race([
@@ -4543,8 +4565,8 @@ async function requestRuntimeEvidence(context, hostEvidence) {
 async function readOwnershipEvidence(context, specification = {}) {
   const hostEvidence = await readHostProcessEvidence(context, "ready");
   const runtimeEvidence = await requestRuntimeEvidence(context, hostEvidence);
-  const hostIdentity = await inspectProcessIdentity(hostEvidence.pid);
-  const runtimeIdentity = await inspectProcessIdentity(runtimeEvidence.pid);
+  const hostIdentity = await inspectProcessIdentityWithRetry(hostEvidence.pid);
+  const runtimeIdentity = await inspectProcessIdentityWithRetry(runtimeEvidence.pid);
   if (
     hostIdentity === null || hostIdentity.ppid !== context.processes.desktop.record.pid ||
     hostIdentity.binary_sha256 !== hostEvidence.binarySha256 ||
@@ -6708,7 +6730,7 @@ async function reconcileExistingRun(authority, runRoot, options = {}) {
   for (const record of records) {
     let current;
     try {
-      current = await inspectProcessIdentity(record.pid);
+      current = await inspectProcessIdentityWithRetry(record.pid);
     } catch {
       unknown = true;
       continue;
@@ -6728,11 +6750,11 @@ async function reconcileExistingRun(authority, runRoot, options = {}) {
     ).reverse();
     for (const record of infraOwnedRecords) {
       const outcome = await reconcileProcess(record, {
-        inspect: inspectProcessIdentity,
+        inspect: inspectProcessIdentityWithRetry,
         async stop(value) {
           process.kill(value.pid, "SIGTERM");
           for (let attempt = 0; attempt < 80; attempt += 1) {
-            const current = await inspectProcessIdentity(value.pid);
+            const current = await inspectProcessIdentityWithRetry(value.pid);
             if (current === null || !sameProcessIdentity(value, current)) return;
             await new Promise((resolveWait) => setTimeout(resolveWait, 100));
           }
@@ -7217,7 +7239,7 @@ async function loadReconcileNoLogContext(authority, attempt, failure, closure, r
 async function reconcileClaimedAttempt(authority, attempt) {
   let ownerIdentity;
   try {
-    ownerIdentity = await inspectProcessIdentity(attempt.marker.pid);
+    ownerIdentity = await inspectProcessIdentityWithRetry(attempt.marker.pid);
   } catch {
     fail("orchestrator_cleanup_unknown");
   }
