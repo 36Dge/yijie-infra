@@ -92,6 +92,61 @@ const identity = Object.freeze({
 });
 const scriptSha256 = "c".repeat(64);
 
+test("S10BO3 R8 reader preserves a valid pre-ready startup failure leaf", async () => {
+  const nonce = "12600000-0000-4000-8000-000000000076";
+  const control = Readable.from(`${JSON.stringify({
+    schema_version: 1,
+    run_id: runId,
+    nonce,
+    sequence: 1,
+    kind: "startup_failed",
+    failure_class: "driver_bind_failed",
+  })}\n`);
+  const reader = createR8ControlFrameReader(control, { runId, nonce });
+  await assert.rejects(reader.next("component_ready"),
+    (error) => error?.code === "driver_bind_failed");
+});
+
+test("S10BO3 R8 reader rejects a startup failure with a noninitial sequence", async () => {
+  const nonce = "12600000-0000-4000-8000-000000000077";
+  const control = Readable.from(`${JSON.stringify({
+    schema_version: 1,
+    run_id: runId,
+    nonce,
+    sequence: 2,
+    kind: "startup_failed",
+    failure_class: "driver_bind_failed",
+  })}\n`);
+  const reader = createR8ControlFrameReader(control, { runId, nonce });
+  await assert.rejects(reader.next("component_ready"),
+    (error) => error?.code === "orchestrator_control_frame_invalid");
+});
+
+test("S10BO3 R8 reader rejects invalid startup failure shape and class", async (t) => {
+  for (const [name, extra] of [
+    ["shape", { unexpected: true }],
+    ["class", { failure_class: "driver_unknown_failure" }],
+  ]) {
+    await t.test(name, async () => {
+      const nonce = name === "shape"
+        ? "12600000-0000-4000-8000-000000000078"
+        : "12600000-0000-4000-8000-000000000079";
+      const control = Readable.from(`${JSON.stringify({
+        schema_version: 1,
+        run_id: runId,
+        nonce,
+        sequence: 1,
+        kind: "startup_failed",
+        failure_class: "driver_bind_failed",
+        ...extra,
+      })}\n`);
+      const reader = createR8ControlFrameReader(control, { runId, nonce });
+      await assert.rejects(reader.next("component_ready"),
+        (error) => error?.code === "orchestrator_control_frame_invalid");
+    });
+  }
+});
+
 test("S10BO3 corrective preserves a content-free post-ready failure leaf", async () => {
   const nonce = "12600000-0000-4000-8000-000000000071";
   const control = Readable.from(`${JSON.stringify({

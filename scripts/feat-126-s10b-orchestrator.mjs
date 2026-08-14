@@ -1228,6 +1228,18 @@ export function createR8ControlFrameReader(stream, authority) {
       try {
         frame = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes).trimEnd());
       } catch { fail("orchestrator_control_frame_invalid"); }
+      const startupFailure = frame?.kind === "startup_failed";
+      if (startupFailure) {
+        const validated = validateStartupFailureControlFrame(frame, {
+          allowedKinds: DESKTOP_CONTROL_KINDS.filter((kind) => kind !== "component_failed"),
+          nonce: authority.nonce,
+          previousSequence,
+          runId: authority.runId,
+        });
+        if (expectedKind !== "component_ready") fail("orchestrator_control_order_invalid");
+        previousSequence = validated.sequence;
+        throw new S10BO1OrchestratorError(validated.failure_class);
+      }
       previousSequence += 1;
       const caseResult = expectedKind === "case_result";
       const postReadyFailure = frame?.kind === "component_failed";
