@@ -33,6 +33,8 @@ import {
   buildPreflightMakeInvocation,
   claimAttemptLedger,
   classifyProjectVolumes,
+  classifyR8LifecycleOwnershipCleanup,
+  closePersistedHostOwnership,
   captureRuntimeLogScan,
   executePreflight,
   loadExistingProcessRecords,
@@ -51,6 +53,7 @@ import {
   r8NoLogRequiredEvidenceNames,
   r8OwnershipStoppedEvidenceRequired,
   r8PersistedStoppedEvidenceRequired,
+  runR8Flow,
   runStartupAbortFlow,
   scanNoLog,
   scanNoLogBuffer,
@@ -464,6 +467,113 @@ test("S10BO3 corrective derives no-log requirements from the reached R8 phase", 
     phase: "s10b_011",
     requireCompleteR8Evidence: true,
   }, 2), true);
+});
+
+test("S10BO3 corrective separates persisted ownership from convergence during cleanup", async () => {
+  const lifecycle = {
+    lifecycle: 1,
+    nonce: "12600000-0000-4000-8000-000000000071",
+    desktopEvidenceName: "r8-desktop-1-process.v1.json",
+    ownershipEvidencePersisted: false,
+    ownershipConverged: false,
+  };
+  assert.equal(classifyR8LifecycleOwnershipCleanup({ r8: false }), "not_applicable");
+  assert.equal(classifyR8LifecycleOwnershipCleanup({
+    r8: true,
+    currentR8Lifecycle: lifecycle,
+  }), "pre_ownership");
+  assert.equal(classifyR8LifecycleOwnershipCleanup({
+    r8: true,
+    currentR8Lifecycle: { ...lifecycle, ownershipEvidencePersisted: true },
+  }), "persisted_unconverged");
+  assert.equal(classifyR8LifecycleOwnershipCleanup({
+    r8: true,
+    currentR8Lifecycle: {
+      ...lifecycle,
+      ownershipEvidencePersisted: true,
+      ownershipConverged: true,
+    },
+  }), "converged");
+  assert.throws(
+    () => classifyR8LifecycleOwnershipCleanup({
+      r8: true,
+      currentR8Lifecycle: { ...lifecycle, ownershipConverged: true },
+    }),
+    codeIs("orchestrator_cleanup_unknown"),
+  );
+
+  const hostReadyEvidence = Object.freeze({
+    schemaVersion: 1,
+    runId,
+    role: "agent_host_child",
+    pid: 52011,
+    ppid: 41011,
+    binarySha256: "a".repeat(64),
+    instanceNonce: lifecycle.nonce,
+    startedAtUnixMs: 1,
+    endedAtUnixMs: null,
+    state: "ready",
+    exitCode: null,
+    stdoutBytes: 0,
+    stderrBytes: 0,
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    logLimitBytes: 256 * 1024,
+  });
+  const hostStoppedEvidence = Object.freeze({
+    ...hostReadyEvidence,
+    endedAtUnixMs: 2,
+    state: "stopped",
+    exitCode: 0,
+  });
+  const ownership = {
+    hostEvidence: hostReadyEvidence,
+    hostStoppedEvidenceName: "r8-lifecycle-1-host-stopped-evidence.v1.json",
+  };
+  const context = {
+    runId,
+    evidenceRoot: resolve(tmpdir(), "feat126-s10bo3-persisted-ownership"),
+    hostEvidence: hostReadyEvidence,
+    ownershipHistory: [ownership],
+  };
+  let reads = 0;
+  let writes = 0;
+  const closedHostEvidence = await closePersistedHostOwnership(context, {
+    async readStoppedEvidence(observedContext, previousEvidence) {
+      reads += 1;
+      assert.equal(observedContext, context);
+      assert.equal(previousEvidence, hostReadyEvidence);
+      return hostStoppedEvidence;
+    },
+    async persistStoppedEvidence(path, value) {
+      writes += 1;
+      assert.equal(
+        path,
+        resolve(context.evidenceRoot, "r8-lifecycle-1-host-stopped-evidence.v1.json"),
+      );
+      assert.deepEqual(value, hostStoppedEvidence);
+    },
+  });
+  assert.deepEqual(closedHostEvidence, hostStoppedEvidence);
+  assert.deepEqual(context.hostStoppedEvidence, hostStoppedEvidence);
+  assert.deepEqual(ownership.hostStoppedEvidence, hostStoppedEvidence);
+  assert.deepEqual(await closePersistedHostOwnership(context, {
+    async readStoppedEvidence() { throw new Error("must not reread closed evidence"); },
+    async persistStoppedEvidence() { throw new Error("must not rewrite closed evidence"); },
+  }), hostStoppedEvidence);
+  assert.equal(reads, 1);
+  assert.equal(writes, 1);
+  await assert.rejects(closePersistedHostOwnership({
+    ...context,
+    hostStoppedEvidence: undefined,
+    ownershipHistory: [{
+      hostEvidence: hostReadyEvidence,
+      hostStoppedEvidenceName: "r8-lifecycle-1-host-stopped-evidence.v1.json",
+    }],
+  }, {
+    async readStoppedEvidence() { return hostReadyEvidence; },
+    async persistStoppedEvidence() { throw new Error("invalid ready evidence must not persist"); },
+  }), codeIs("orchestrator_host_evidence_invalid"));
 });
 
 const completed = Object.freeze([
@@ -928,6 +1038,77 @@ test("S10BO3-003 retains the primary failure and reports all closure failures as
   });
 });
 
+test("S10BO3 R8 preserves ownership convergence as primary after cleanup closes", async () => {
+  const recordedFailures = [];
+  const recordedClosures = [];
+  const calls = [];
+  await assert.rejects(
+    runR8Flow({ ...authority, r8: true }, {
+      async runPreflight() { calls.push("preflight"); return summary(); },
+      async buildDesktop() { calls.push("build_desktop"); },
+      async startDependencies() { calls.push("dependencies"); },
+      async startApi() { calls.push("api"); },
+      async startFakeGeneration() { calls.push("fake"); },
+      async startDesktopLifecycle() { calls.push("desktop"); },
+      async readLifecycleOwnership() {
+        calls.push("ownership");
+        throw new S10BO1OrchestratorError("orchestrator_ownership_invalid");
+      },
+      async captureNoLogAuthority() { calls.push("capture_no_log"); },
+      async initiateDesktopAbort() { calls.push("abort"); },
+      async recordFailure(value) { recordedFailures.push(value); },
+      async cleanup() {
+        calls.push("cleanup");
+        return cleanupResult({
+          scope: "run_artifacts",
+          named_volume_baseline_count: 4,
+          named_volume_after_count: 4,
+        });
+      },
+      async scanNoLog() {
+        calls.push("no_log");
+        return noLogResult({
+          scope: "run_artifacts",
+          coverage: "all_run_log_and_evidence_sources",
+          file_count: 3,
+          external_source_count: 4,
+          external_row_count: 4,
+          external_source_set_sha256: "e".repeat(64),
+        });
+      },
+      async recordClosure(value) { recordedClosures.push(value); },
+    }),
+    (error) => {
+      assert.equal(error.code, "orchestrator_ownership_invalid");
+      assert.equal(error.closure.cleanup_failure_class, null);
+      return true;
+    },
+  );
+  assert.deepEqual(recordedFailures, [{
+    failureClass: "orchestrator_ownership_invalid",
+    businessFailureClass: null,
+    cleanupFailureClass: null,
+    parentFailureClass: null,
+  }]);
+  assert.equal(recordedClosures.length, 1);
+  assert.equal(recordedClosures[0].failureClass, "orchestrator_ownership_invalid");
+  assert.equal(recordedClosures[0].cleanupFailureClass, null);
+  assert.equal(recordedClosures[0].cleanupScope, "run_artifacts");
+  assert.ok(calls.indexOf("abort") < calls.indexOf("cleanup"));
+  assert.equal(calls.includes("no_log"), true);
+
+  const source = await readFile("scripts/feat-126-s10b-orchestrator.mjs", "utf8");
+  const abortStart = source.indexOf("async initiateDesktopAbort()");
+  const abortEnd = source.indexOf("async verifyBusinessBoundary()", abortStart);
+  const abortSource = source.slice(abortStart, abortEnd);
+  assert.ok(abortStart >= 0 && abortEnd > abortStart);
+  assert.ok(
+    abortSource.indexOf("closeControlWriter(context?.controlWriter)") <
+      abortSource.indexOf('child.once("exit", resolveExit)'),
+  );
+  assert.match(abortSource, /setTimeout\(resolveTimeout, PROCESS_STOP_TIMEOUT_MS\)/);
+});
+
 test("S10BO3 corrective attempts immutable primary failure persistence exactly once", async () => {
   let persistenceAttempts = 0;
   let recordedClosure;
@@ -1155,6 +1336,16 @@ test("S10BO3 corrective persists every closed Desktop login leaf without continu
 
 test("S10BO3 corrective fails closed on unbound pre-ownership sidecar artifacts", async (t) => {
   const runRoot = await canonicalTemporaryRoot(t, "feat126-s10bo3-descendant-absence-");
+  assert.equal(classifyR8LifecycleOwnershipCleanup({
+    r8: true,
+    currentR8Lifecycle: {
+      lifecycle: 1,
+      nonce: "12600000-0000-4000-8000-000000000071",
+      desktopEvidenceName: "r8-desktop-1-process.v1.json",
+      ownershipEvidencePersisted: false,
+      ownershipConverged: false,
+    },
+  }), "pre_ownership");
   assert.equal(await requirePreOwnershipDescendantsAbsent(runRoot), true);
 
   const hostRoot = resolve(runRoot, "host");

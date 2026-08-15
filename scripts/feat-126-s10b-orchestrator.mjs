@@ -4939,7 +4939,7 @@ async function readOwnershipEvidence(context, specification = {}) {
   context.descendantProcessHistory ??= [];
   context.descendantProcessHistory.push(hostRecord, runtimeRecord);
   context.ownershipHistory ??= [];
-  context.ownershipHistory.push({
+  const ownershipEvidence = {
     hostEvidence,
     runtimeEvidence,
     hostEvidenceName,
@@ -4947,7 +4947,11 @@ async function readOwnershipEvidence(context, specification = {}) {
     hostProcessName,
     runtimeProcessName,
     hostStoppedEvidenceName,
-  });
+  };
+  context.ownershipHistory.push(ownershipEvidence);
+  if (context.currentR8Lifecycle) {
+    context.currentR8Lifecycle.ownershipEvidencePersisted = true;
+  }
   if (
     hostIdentity.ppid !== context.processes.desktop.record.pid ||
     hostIdentity.binary_sha256 !== hostEvidence.binarySha256 ||
@@ -6338,6 +6342,18 @@ function preOwnershipDescendantAbsenceRequired(roles) {
   return roles.includes("desktop") && !["host", "runtime"].every((role) => roles.includes(role));
 }
 
+export function classifyR8LifecycleOwnershipCleanup(context) {
+  if (!expectedR8(context) || !context.currentR8Lifecycle) return "not_applicable";
+  const { ownershipConverged, ownershipEvidencePersisted } = context.currentR8Lifecycle;
+  if (
+    typeof ownershipConverged !== "boolean" ||
+    typeof ownershipEvidencePersisted !== "boolean" ||
+    (ownershipConverged && !ownershipEvidencePersisted)
+  ) fail("orchestrator_cleanup_unknown");
+  if (ownershipConverged) return "converged";
+  return ownershipEvidencePersisted ? "persisted_unconverged" : "pre_ownership";
+}
+
 export function r8PreOwnershipLifecycleFromEvidenceNames(evidenceNames) {
   if (!Array.isArray(evidenceNames) || evidenceNames.some((name) => typeof name !== "string")) {
     fail("orchestrator_cleanup_unknown");
@@ -6684,6 +6700,42 @@ export async function requirePreOwnershipTerminalHostEvidence(runRoot, options =
   }
 }
 
+export async function closePersistedHostOwnership(context, operations = {}) {
+  if (!context.hostEvidence) return null;
+  const ownership = (context.ownershipHistory ?? []).find(
+    (entry) => entry.hostEvidence?.instanceNonce === context.hostEvidence.instanceNonce,
+  );
+  if (!ownership || typeof ownership.hostStoppedEvidenceName !== "string") {
+    fail("orchestrator_cleanup_unknown");
+  }
+  if (ownership.hostStoppedEvidence) return ownership.hostStoppedEvidence;
+  const readStoppedEvidence = operations.readStoppedEvidence ?? (
+    (value, previousEvidence) => readHostProcessEvidence(value, "stopped", previousEvidence)
+  );
+  const persistStoppedEvidence = operations.persistStoppedEvidence ?? (
+    (path, value) => writeSecureJson(path, value)
+  );
+  const stoppedHostEvidence = validateHostProcessEvidence(
+    await readStoppedEvidence(context, context.hostEvidence),
+    {
+      runId: context.runId,
+      desktopPid: context.hostEvidence.ppid,
+      binarySha256: context.hostEvidence.binarySha256,
+      expectedState: "stopped",
+      expectedPid: context.hostEvidence.pid,
+      expectedNonce: context.hostEvidence.instanceNonce,
+      expectedStartedAtUnixMs: context.hostEvidence.startedAtUnixMs,
+    },
+  );
+  await persistStoppedEvidence(
+    resolve(context.evidenceRoot, ownership.hostStoppedEvidenceName),
+    stoppedHostEvidence,
+  );
+  context.hostStoppedEvidence = stoppedHostEvidence;
+  ownership.hostStoppedEvidence = stoppedHostEvidence;
+  return stoppedHostEvidence;
+}
+
 async function cleanupLiveContext(context) {
   let cleanupUnknown = context.cleanupUnknown;
   if (context.composeLogsRequired) {
@@ -6717,8 +6769,13 @@ async function cleanupLiveContext(context) {
   }
   cleanupUnknown ||= outcomes.includes("unknown") || outcomes.includes("foreign_identity_preserved");
 
-  const currentR8Lifecycle = expectedR8(context) &&
-    context.currentR8Lifecycle?.ownershipObserved === false
+  let r8OwnershipCleanupState = "not_applicable";
+  try {
+    r8OwnershipCleanupState = classifyR8LifecycleOwnershipCleanup(context);
+  } catch {
+    cleanupUnknown = true;
+  }
+  const currentR8Lifecycle = r8OwnershipCleanupState === "pre_ownership"
     ? context.currentR8Lifecycle
     : null;
   const observedRoles = [
@@ -6740,25 +6797,9 @@ async function cleanupLiveContext(context) {
       cleanupUnknown = true;
     }
   }
-  if (context.hostEvidence && !(context.ownershipHistory ?? []).some(
-    (entry) => entry.hostEvidence.instanceNonce === context.hostEvidence.instanceNonce &&
-      entry.hostStoppedEvidence,
-  )) {
+  if (context.hostEvidence) {
     try {
-      const ownership = (context.ownershipHistory ?? []).find(
-        (entry) => entry.hostEvidence.instanceNonce === context.hostEvidence.instanceNonce,
-      );
-      const stoppedHostEvidence = await readHostProcessEvidence(
-        context,
-        "stopped",
-        context.hostEvidence,
-      );
-      await writeSecureJson(
-        resolve(context.evidenceRoot, ownership?.hostStoppedEvidenceName ?? "host-stopped-evidence.v1.json"),
-        stoppedHostEvidence,
-      );
-      context.hostStoppedEvidence = stoppedHostEvidence;
-      if (ownership) ownership.hostStoppedEvidence = stoppedHostEvidence;
+      await closePersistedHostOwnership(context);
     } catch {
       cleanupUnknown = true;
     }
@@ -7088,7 +7129,8 @@ function createLiveOperations(authority, attempt, parentGuard = createParentIden
         lifecycle,
         nonce: context.nonce,
         desktopEvidenceName: `r8-desktop-${lifecycle}-process.v1.json`,
-        ownershipObserved: false,
+        ownershipEvidencePersisted: false,
+        ownershipConverged: false,
       };
       context.r8ControlSequence = 0;
       if (lifecycle === 1) context.phase = "desktop_starting";
@@ -7127,7 +7169,7 @@ function createLiveOperations(authority, attempt, parentGuard = createParentIden
         context.currentR8Lifecycle.nonce !== context.nonce ||
         context.ownershipHistory.at(-1)?.hostEvidence?.instanceNonce !== context.nonce
       ) fail("orchestrator_ownership_invalid");
-      context.currentR8Lifecycle.ownershipObserved = true;
+      context.currentR8Lifecycle.ownershipConverged = true;
       context.phase = lifecycle === 1 ? "runtime_ready" : priorPhase;
       requireParentAlive();
       return ownership;
