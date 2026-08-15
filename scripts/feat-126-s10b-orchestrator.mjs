@@ -356,6 +356,17 @@ const PROCESS_RECORD_KEYS = Object.freeze([
   "schema_version",
   "start_identity",
 ]);
+const R8_DESKTOP_SPAWN_CLAIM_KEYS = Object.freeze([
+  "attempt_marker_sha256",
+  "binary_sha256",
+  "lifecycle",
+  "nonce",
+  "parent_pid",
+  "role",
+  "run_id",
+  "schema_version",
+  "status",
+]);
 const HOST_PROCESS_EVIDENCE_KEYS = Object.freeze([
   "binarySha256",
   "endedAtUnixMs",
@@ -475,6 +486,7 @@ const APPROVED_CONTEXT_MESSAGES = Object.freeze([
   "failed to map Codex notification",
   "starting yijie-agent-host",
   "starting yijie-api",
+  "yijie-agent-host stopped",
 ]);
 const STRUCTURED_NO_LOG_FIELD_CLASSES = Object.freeze([
   "literal_value",
@@ -1919,6 +1931,24 @@ export function validateProcessRecord(record, runId, role) {
     fail("orchestrator_process_record_invalid");
   }
   return Object.freeze({ ...record });
+}
+
+export function validateR8DesktopSpawnClaim(value, authority) {
+  if (
+    value === null || Array.isArray(value) || typeof value !== "object" ||
+    !exactKeys(value, R8_DESKTOP_SPAWN_CLAIM_KEYS) || value.schema_version !== 1 ||
+    value.status !== "claimed" || value.role !== "desktop" ||
+    value.run_id !== authority?.runId || value.lifecycle !== authority?.lifecycle ||
+    value.nonce !== authority?.nonce || value.binary_sha256 !== authority?.binarySha256 ||
+    value.parent_pid !== authority?.parentPid ||
+    value.attempt_marker_sha256 !== authority?.attemptMarkerSha256 ||
+    ![1, 2].includes(value.lifecycle) ||
+    !RUN_ID_PATTERN.test(value.run_id ?? "") || !RUN_ID_PATTERN.test(value.nonce ?? "") ||
+    !DIGEST_PATTERN.test(value.binary_sha256 ?? "") ||
+    !DIGEST_PATTERN.test(value.attempt_marker_sha256 ?? "") ||
+    !Number.isSafeInteger(value.parent_pid) || value.parent_pid <= 1
+  ) fail("orchestrator_cleanup_unknown");
+  return Object.freeze({ ...value });
 }
 
 function canonicalUuid(value) {
@@ -3653,10 +3683,14 @@ export async function spawnOwnedProcess({
   onSpawn,
   deferIdentityOnExit = false,
   evidenceBasename = role,
+  expectedBinarySha256,
 }, context) {
   let binarySha256;
   try {
     binarySha256 = await hashFile(binary);
+    if (expectedBinarySha256 !== undefined && binarySha256 !== expectedBinarySha256) {
+      fail("orchestrator_process_binary_invalid");
+    }
   } catch {
     fail("orchestrator_process_binary_invalid");
   }
@@ -4576,6 +4610,42 @@ export function desktopEnvironment(context) {
 async function startDesktop(context, specification = {}) {
   context.nonce = specification.nonce ?? context.nonce;
   context.r8Phase = specification.r8Phase;
+  let expectedBinarySha256;
+  if (context.r8) {
+    const lifecycle = context.currentR8Lifecycle?.lifecycle;
+    const evidenceBasename = specification.evidenceBasename;
+    if (
+      ![1, 2].includes(lifecycle) || evidenceBasename !== `r8-desktop-${lifecycle}` ||
+      context.currentR8Lifecycle.nonce !== context.nonce
+    ) fail("orchestrator_r8_authority_invalid");
+    try {
+      expectedBinarySha256 = await hashFile(context.desktopBinary);
+    } catch {
+      fail("orchestrator_process_binary_invalid");
+    }
+    const claim = validateR8DesktopSpawnClaim({
+      schema_version: 1,
+      status: "claimed",
+      run_id: context.runId,
+      role: "desktop",
+      lifecycle,
+      nonce: context.nonce,
+      attempt_marker_sha256: context.attempt.markerSha256,
+      binary_sha256: expectedBinarySha256,
+      parent_pid: process.pid,
+    }, {
+      runId: context.runId,
+      lifecycle,
+      nonce: context.nonce,
+      attemptMarkerSha256: context.attempt.markerSha256,
+      binarySha256: expectedBinarySha256,
+      parentPid: process.pid,
+    });
+    await writeSecureJson(
+      resolve(context.evidenceRoot, `${evidenceBasename}-spawn-claim.v1.json`),
+      claim,
+    );
+  }
   context.processes.desktop = await spawnOwnedProcess({
     role: "desktop",
     binary: context.desktopBinary,
@@ -4585,6 +4655,7 @@ async function startDesktop(context, specification = {}) {
     evidenceBasename: specification.evidenceBasename ?? "desktop",
     extraStdio: ["pipe", "pipe"],
     deferIdentityOnExit: true,
+    expectedBinarySha256,
     onSpawn(provisional) {
       context.controlWriter = provisional.child.stdio[3];
       guardControlWriter(context.controlWriter);
@@ -6143,6 +6214,12 @@ export async function scanNoLog(context) {
         context.evidenceRoot,
         `${process_.evidenceBasename ?? process_.role}-process.v1.json`,
       ));
+      if (context.r8 && process_.role === "desktop") {
+        requiredFiles.add(resolve(
+          context.evidenceRoot,
+          `${process_.evidenceBasename}-spawn-claim.v1.json`,
+        ));
+      }
     }
   }
   for (const role of Object.keys(context.descendantProcesses ?? {})) {
@@ -6285,6 +6362,140 @@ export function r8PreOwnershipLifecycleFromEvidenceNames(evidenceNames) {
     }
   }
   return candidate;
+}
+
+export async function requireR8HostInstanceCardinality(runRoot, evidenceNames) {
+  if (typeof runRoot !== "string" || !isAbsolute(runRoot)) fail("orchestrator_cleanup_unknown");
+  try {
+    await requireOwnerDirectory(runRoot);
+    const preOwnership = r8PreOwnershipLifecycleFromEvidenceNames(evidenceNames);
+    const completeLifecycleCount = [1, 2].filter((lifecycle) => (
+      evidenceNames.includes(`r8-desktop-${lifecycle}-process.v1.json`) &&
+      evidenceNames.includes(`r8-lifecycle-${lifecycle}-host-process.v1.json`) &&
+      evidenceNames.includes(`r8-lifecycle-${lifecycle}-runtime-process.v1.json`)
+    )).length;
+    const expectedInstanceCount = completeLifecycleCount + (preOwnership === null ? 0 : 1);
+    const hostRoot = resolve(runRoot, "host");
+    let hostEntries;
+    try {
+      await requireOwnerDirectory(hostRoot);
+      hostEntries = await readdir(hostRoot, { withFileTypes: true });
+    } catch (error) {
+      if (expectedInstanceCount === 0 && error instanceof S10BO1OrchestratorError) {
+        try {
+          await lstat(hostRoot);
+        } catch (missingError) {
+          if (missingError?.code === "ENOENT") return true;
+        }
+      }
+      throw error;
+    }
+    if (
+      hostEntries.length !== expectedInstanceCount ||
+      hostEntries.some((entry) => (
+        !entry.isDirectory() || entry.isSymbolicLink() || !RUN_ID_PATTERN.test(entry.name)
+      )) || new Set(hostEntries.map((entry) => entry.name)).size !== hostEntries.length
+    ) fail("orchestrator_cleanup_unknown");
+    for (const entry of hostEntries) await requireOwnerDirectory(resolve(hostRoot, entry.name));
+    return true;
+  } catch {
+    fail("orchestrator_cleanup_unknown");
+  }
+}
+
+async function readOptionalR8DesktopSpawnClaim(path) {
+  try {
+    await lstat(path);
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    fail("orchestrator_cleanup_unknown");
+  }
+  try {
+    const bytes = await readSecureFile(path, 4096);
+    const value = JSON.parse(bytes.toString("utf8"));
+    if (!bytes.equals(canonicalJsonBytes(value))) fail("orchestrator_cleanup_unknown");
+    return value;
+  } catch {
+    fail("orchestrator_cleanup_unknown");
+  }
+}
+
+export async function requireR8DesktopSpawnClaimsClosed(runRoot, records, authority) {
+  if (
+    typeof runRoot !== "string" || !isAbsolute(runRoot) || !Array.isArray(records) ||
+    !Array.isArray(records.evidenceNames) || records.length !== records.evidenceNames.length ||
+    records.evidenceNames.some((name) => typeof name !== "string") ||
+    !DIGEST_PATTERN.test(authority?.attemptMarkerSha256 ?? "") ||
+    !Number.isSafeInteger(authority?.parentPid) || authority.parentPid <= 1
+  ) fail("orchestrator_cleanup_unknown");
+  try {
+    await requireOwnerDirectory(runRoot);
+    const runId = basename(runRoot);
+    if (!RUN_ID_PATTERN.test(runId)) fail("orchestrator_cleanup_unknown");
+    const evidenceRoot = resolve(runRoot, "orchestrator-evidence");
+    await requireOwnerDirectory(evidenceRoot);
+    const allowedClaimNames = [1, 2].map(
+      (lifecycle) => `r8-desktop-${lifecycle}-spawn-claim.v1.json`,
+    );
+    const claimEntries = (await readdir(evidenceRoot, { withFileTypes: true })).filter(
+      (entry) => entry.name.endsWith("-spawn-claim.v1.json"),
+    );
+    if (claimEntries.some((entry) => (
+      !allowedClaimNames.includes(entry.name) || !entry.isFile() || entry.isSymbolicLink()
+    ))) fail("orchestrator_cleanup_unknown");
+    const byName = new Map(records.evidenceNames.map((name, index) => [name, records[index]]));
+    const observations = [];
+    for (const lifecycle of [1, 2]) {
+      const desktopRecord = byName.get(`r8-desktop-${lifecycle}-process.v1.json`) ?? null;
+      const claim = await readOptionalR8DesktopSpawnClaim(
+        resolve(evidenceRoot, `r8-desktop-${lifecycle}-spawn-claim.v1.json`),
+      );
+      if (Boolean(desktopRecord) !== Boolean(claim)) fail("orchestrator_cleanup_unknown");
+      if (claim) observations.push({ claim, desktopRecord, lifecycle });
+    }
+    if (observations.length === 0) return Object.freeze([]);
+    const binarySha256 = await hashFile(
+      resolve(runRoot, "desktop-build/cargo-target/release/yijie-desktop"),
+    );
+    for (const { claim, desktopRecord, lifecycle } of observations) {
+      if (
+        desktopRecord.role !== "desktop" || desktopRecord.run_id !== runId ||
+        desktopRecord.ppid !== authority.parentPid ||
+        desktopRecord.binary_sha256 !== binarySha256
+      ) fail("orchestrator_cleanup_unknown");
+      validateR8DesktopSpawnClaim(claim, {
+        runId,
+        lifecycle,
+        nonce: claim.nonce,
+        attemptMarkerSha256: authority.attemptMarkerSha256,
+        binarySha256: desktopRecord.binary_sha256,
+        parentPid: desktopRecord.ppid,
+      });
+      const hostRecord = byName.get(`r8-lifecycle-${lifecycle}-host-process.v1.json`) ?? null;
+      if (hostRecord) {
+        const bytes = await readSecureFile(
+          resolve(evidenceRoot, `r8-lifecycle-${lifecycle}-host-evidence.v1.json`),
+          16 * 1024,
+        );
+        const hostEvidence = JSON.parse(bytes.toString("utf8"));
+        if (!bytes.equals(canonicalJsonBytes(hostEvidence))) fail("orchestrator_cleanup_unknown");
+        validateHostProcessEvidence(hostEvidence, {
+          runId,
+          desktopPid: desktopRecord.pid,
+          binarySha256: hostRecord.binary_sha256,
+          expectedPid: hostRecord.pid,
+          expectedNonce: claim.nonce,
+          expectedState: "ready",
+        });
+      }
+    }
+    return Object.freeze(observations.map(({ claim, lifecycle }) => Object.freeze({
+      lifecycle,
+      nonce: claim.nonce,
+    })));
+  } catch {
+    fail("orchestrator_cleanup_unknown");
+  }
 }
 
 export async function requirePreOwnershipDescendantsAbsent(runRoot) {
@@ -7318,6 +7529,20 @@ async function reconcileExistingRun(authority, runRoot, options = {}) {
     const parent = records.find((candidate) => candidate.pid === record.ppid);
     if (!parent || currentByPid.get(parent.pid) === null) unknown = true;
   }
+  let r8PreOwnership = null;
+  let r8SpawnClaims = Object.freeze([]);
+  if (expectedR8(authority)) {
+    try {
+      r8PreOwnership = r8PreOwnershipLifecycleFromEvidenceNames(records.evidenceNames);
+      r8SpawnClaims = await requireR8DesktopSpawnClaimsClosed(runRoot, records, {
+        attemptMarkerSha256: options.attemptMarkerSha256,
+        parentPid: options.attemptParentPid,
+      });
+      await requireR8HostInstanceCardinality(runRoot, records.evidenceNames);
+    } catch {
+      unknown = true;
+    }
+  }
   if (!unknown) {
     const infraOwnedRecords = records.filter((record) =>
       ["api", "desktop", "fake"].includes(record.role),
@@ -7338,20 +7563,17 @@ async function reconcileExistingRun(authority, runRoot, options = {}) {
       if (!["absent", "stopped"].includes(outcome)) unknown = true;
     }
   }
-  let r8PreOwnership = null;
-  if (expectedR8(authority)) {
-    try {
-      r8PreOwnership = r8PreOwnershipLifecycleFromEvidenceNames(records.evidenceNames);
-    } catch {
-      unknown = true;
-    }
-  }
   if (r8PreOwnership || preOwnershipDescendantAbsenceRequired(expectedRoles)) {
     try {
       if (r8PreOwnership) {
+        const currentClaim = r8SpawnClaims.find(
+          (claim) => claim.lifecycle === r8PreOwnership.lifecycle,
+        );
+        if (!currentClaim) fail("orchestrator_cleanup_unknown");
         await requirePreOwnershipTerminalHostEvidence(runRoot, {
           currentLifecycle: r8PreOwnership.lifecycle,
           expectedDesktopEvidenceName: r8PreOwnership.desktopEvidenceName,
+          expectedNonce: currentClaim.nonce,
         });
       } else {
         await requirePreOwnershipDescendantsAbsent(runRoot);
@@ -7973,6 +8195,8 @@ async function reconcileClaimedAttempt(authority, attempt) {
       requireComplete: Boolean(failure?.phase === "s10b_011" || closure?.status === "passed"),
       composeCleanupRequired: failure?.compose_cleanup_required ?? true,
       retainedVolumeNames: baselineVolumeNames,
+      attemptMarkerSha256: attempt.markerSha256,
+      attemptParentPid: attempt.marker.pid,
       scope: failure && ["preflight_failed", "preflight_context_invalid"].includes(failure.phase)
         ? "preflight_artifacts"
         : "run_artifacts",

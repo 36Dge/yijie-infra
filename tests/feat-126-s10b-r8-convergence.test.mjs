@@ -13,7 +13,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
 
@@ -208,36 +208,195 @@ async function writeRehearsalRecord(root, basename, value) {
   assert.equal((await stat(path)).mode & 0o777, 0o600);
 }
 
+function offlineCommandEnvironment(environment, authority) {
+  assert.equal(typeof environment?.PATH, "string");
+  for (const key of ["home", "tmpdir", "gopath", "moduleCache", "goCache", "xdgConfigHome"]) {
+    assert.equal(isAbsolute(authority?.[key] ?? ""), true);
+  }
+  return {
+    PATH: environment.PATH,
+    HOME: authority.home,
+    TMPDIR: authority.tmpdir,
+    GOPATH: authority.gopath,
+    GOMODCACHE: authority.moduleCache,
+    GOCACHE: authority.goCache,
+    XDG_CONFIG_HOME: authority.xdgConfigHome,
+    GIT_ATTR_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_CONFIG_COUNT: "2",
+    GIT_CONFIG_KEY_0: "commit.gpgSign",
+    GIT_CONFIG_VALUE_0: "false",
+    GIT_CONFIG_KEY_1: "core.hooksPath",
+    GIT_CONFIG_VALUE_1: "/dev/null",
+    GIT_TERMINAL_PROMPT: "0",
+    GOENV: "off",
+    GOPROXY: "off",
+    GOSUMDB: "off",
+    GOTOOLCHAIN: "local",
+    GOVCS: "*:off",
+    GOWORK: "off",
+  };
+}
+
 function runOffline(command, arguments_, options = {}) {
   const result = spawnSync(command, arguments_, {
     cwd: options.cwd,
-    env: {
-      PATH: process.env.PATH,
-      HOME: process.env.HOME,
-      TMPDIR: process.env.TMPDIR,
-      GOPATH: process.env.GOPATH,
-      GOMODCACHE: process.env.GOMODCACHE,
-    },
+    env: offlineCommandEnvironment(process.env, options.authority),
     encoding: "utf8",
     shell: false,
     windowsHide: true,
     maxBuffer: 16 * 1024 * 1024,
   });
   assert.equal(result.error, undefined);
-  assert.equal(result.status, 0, `${command} failed in offline convergence rehearsal`);
+  assert.equal(result.status, 0, "child command failed in offline convergence rehearsal");
   return result.stdout.trim();
 }
 
-async function verifyPinnedRuntimeArtifact() {
+async function resolveOfflineGoToolchain() {
+  const hostGoMod = await readFile(resolve("../yijie-agent-host/go.mod"), "utf8");
+  const version = /^go (\d+\.\d+\.\d+)$/m.exec(hostGoMod)?.[1];
+  assert.match(version ?? "", /^\d+\.\d+\.\d+$/);
+  const goos = new Map([
+    ["darwin", "darwin"],
+    ["linux", "linux"],
+    ["win32", "windows"],
+  ]).get(process.platform);
+  const goarch = new Map([
+    ["arm64", "arm64"],
+    ["x64", "amd64"],
+  ]).get(process.arch);
+  assert.ok(goos && goarch);
+  const goPath = process.env.GOPATH ?? join(process.env.HOME, "go");
+  const moduleCache = process.env.GOMODCACHE ?? join(goPath, "pkg/mod");
+  const suffix = process.platform === "win32" ? "go.exe" : "go";
+  const binary = join(
+    moduleCache,
+    `golang.org/toolchain@v0.0.1-go${version}.${goos}-${goarch}`,
+    "bin",
+    suffix,
+  );
+  const metadata = await stat(binary);
+  assert.equal(isAbsolute(binary), true);
+  assert.equal(await realpath(binary), binary);
+  assert.equal(metadata.isFile(), true);
+  assert.equal(metadata.uid, process.getuid());
+  assert.equal(metadata.nlink, 1);
+  assert.equal(metadata.mode & 0o022, 0);
+  assert.notEqual(metadata.mode & 0o111, 0);
+  return Object.freeze({ binary, moduleCache });
+}
+
+async function createOfflineCommandAuthority(root) {
+  await mkdir(root, { mode: 0o700, recursive: true });
+  const canonicalRoot = await realpath(root);
+  await chmod(canonicalRoot, 0o700);
+  const { binary: goBinary, moduleCache } = await resolveOfflineGoToolchain();
+  const authority = {
+    home: join(canonicalRoot, "home"),
+    tmpdir: join(canonicalRoot, "tmp"),
+    gopath: join(canonicalRoot, "gopath"),
+    goCache: join(canonicalRoot, "go-cache"),
+    xdgConfigHome: join(canonicalRoot, "xdg-config"),
+    moduleCache,
+    goBinary,
+  };
+  for (const path of [
+    authority.home,
+    authority.tmpdir,
+    authority.gopath,
+    authority.goCache,
+    authority.xdgConfigHome,
+  ]) {
+    await mkdir(path, { mode: 0o700 });
+    await chmod(path, 0o700);
+  }
+  const frozen = Object.freeze(authority);
+  runOffline(goBinary, ["telemetry", "off"], { authority: frozen });
+  return frozen;
+}
+
+test("R8-CONVERGENCE-000 pins every rehearsal child command to an exact offline environment", async (t) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "feat126-r8-offline-authority-")));
+  await chmod(root, 0o700);
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const authority = await createOfflineCommandAuthority(join(root, "authority"));
+  const environment = offlineCommandEnvironment({
+    PATH: "/fixture/bin",
+    HOME: "/fixture/home",
+    TMPDIR: "/fixture/tmp",
+    GOPATH: "/fixture/gopath",
+    GOMODCACHE: "/fixture/modcache",
+    GOPROXY: "https://proxy.invalid",
+    GOSUMDB: "sum.invalid",
+    GONOSUMDB: "*",
+    GOPRIVATE: "example.invalid",
+    GOENV: "/fixture/goenv",
+    GOTOOLCHAIN: "auto",
+    GIT_CONFIG_GLOBAL: "/fixture/global.gitconfig",
+    GIT_CONFIG_SYSTEM: "/fixture/system.gitconfig",
+    GIT_TERMINAL_PROMPT: "1",
+    GOTELEMETRY: "on",
+    GOWORK: "/fixture/go.work",
+    XDG_CONFIG_HOME: "/fixture/xdg",
+  }, authority);
+  assert.deepEqual(environment, {
+    PATH: "/fixture/bin",
+    HOME: authority.home,
+    TMPDIR: authority.tmpdir,
+    GOPATH: authority.gopath,
+    GOMODCACHE: authority.moduleCache,
+    GOCACHE: authority.goCache,
+    XDG_CONFIG_HOME: authority.xdgConfigHome,
+    GIT_ATTR_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_CONFIG_COUNT: "2",
+    GIT_CONFIG_KEY_0: "commit.gpgSign",
+    GIT_CONFIG_VALUE_0: "false",
+    GIT_CONFIG_KEY_1: "core.hooksPath",
+    GIT_CONFIG_VALUE_1: "/dev/null",
+    GIT_TERMINAL_PROMPT: "0",
+    GOENV: "off",
+    GOPROXY: "off",
+    GOSUMDB: "off",
+    GOTOOLCHAIN: "local",
+    GOVCS: "*:off",
+    GOWORK: "off",
+  });
+  for (const key of ["GONOSUMDB", "GOPRIVATE", "GOTELEMETRY"]) {
+    assert.equal(Object.hasOwn(environment, key), false);
+  }
+  assert.match(
+    runOffline(authority.goBinary, ["version"], { authority }),
+    /^go version go\d+\.\d+\.\d+ /,
+  );
+  assert.deepEqual(
+    runOffline(authority.goBinary, [
+      "env",
+      "GOTELEMETRY",
+      "GOWORK",
+      "GOPROXY",
+      "GOSUMDB",
+      "GOTOOLCHAIN",
+      "GOVCS",
+    ], { authority }).split("\n"),
+    ["off", "off", "off", "off", "local", "*:off"],
+  );
+});
+
+async function verifyPinnedRuntimeArtifact(offlineAuthority) {
   const hostRepositorySha = runOffline(
     "git",
     ["rev-parse", "HEAD"],
-    { cwd: resolve("../yijie-agent-host") },
+    { authority: offlineAuthority, cwd: resolve("../yijie-agent-host") },
   );
   const runtimeRepositorySha = runOffline(
     "git",
     ["rev-parse", "HEAD"],
-    { cwd: resolve("../yijie-codex") },
+    { authority: offlineAuthority, cwd: resolve("../yijie-codex") },
   );
   const artifactGate = await verifyHostRuntimeArtifactOnly({
     host: hostRepositorySha,
@@ -253,7 +412,7 @@ async function verifyPinnedRuntimeArtifact() {
   });
 }
 
-async function createRealBboltFixture(root) {
+async function createRealBboltFixture(root, offlineAuthority) {
   const sourcePath = join(root, "create-bbolt.go");
   const databasePath = join(root, "sessions.db");
   await writeFile(sourcePath, `package main
@@ -273,7 +432,8 @@ func main() {
   if err := db.Close(); err != nil { panic("close failed") }
 }
 `, { mode: 0o600 });
-  runOffline("go", ["run", sourcePath, databasePath], {
+  runOffline(offlineAuthority.goBinary, ["run", sourcePath, databasePath], {
+    authority: offlineAuthority,
     cwd: resolve("../yijie-agent-host"),
   });
   await chmod(databasePath, 0o600);
@@ -316,7 +476,7 @@ async function captureOfflineRuntimeLogScan(runRoot) {
   });
 }
 
-async function createDefaultOffRepositories(root) {
+async function createDefaultOffRepositories(root, offlineAuthority) {
   const paths = {};
   const shas = {};
   for (const role of ["api", "contracts", "desktop", "governance", "host", "infra", "runtime"]) {
@@ -328,13 +488,25 @@ async function createDefaultOffRepositories(root) {
       `${JSON.stringify({ name: `fixture-${role}`, private: true })}\n`,
       { mode: 0o600 },
     );
-    runOffline("git", ["init", "--quiet"], { cwd: repository });
-    runOffline("git", ["config", "user.name", "FEAT-126 Fixture"], { cwd: repository });
-    runOffline("git", ["config", "user.email", "fixture@invalid"], { cwd: repository });
-    runOffline("git", ["add", "package.json"], { cwd: repository });
-    runOffline("git", ["commit", "--quiet", "-m", "fixture"], { cwd: repository });
+    runOffline("git", ["init", "--quiet"], { authority: offlineAuthority, cwd: repository });
+    runOffline("git", ["config", "user.name", "FEAT-126 Fixture"], {
+      authority: offlineAuthority,
+      cwd: repository,
+    });
+    runOffline("git", ["config", "user.email", "fixture@invalid"], {
+      authority: offlineAuthority,
+      cwd: repository,
+    });
+    runOffline("git", ["add", "package.json"], { authority: offlineAuthority, cwd: repository });
+    runOffline("git", ["commit", "--quiet", "-m", "fixture"], {
+      authority: offlineAuthority,
+      cwd: repository,
+    });
     paths[role] = repository;
-    shas[role] = runOffline("git", ["rev-parse", "HEAD"], { cwd: repository });
+    shas[role] = runOffline("git", ["rev-parse", "HEAD"], {
+      authority: offlineAuthority,
+      cwd: repository,
+    });
   }
   return Object.freeze({ paths: Object.freeze(paths), shas: Object.freeze(shas) });
 }
@@ -343,14 +515,17 @@ test("R8 convergence rehearsal consumes canonical parsers and all frozen S10B-00
   const rehearsalRoot = await realpath(await mkdtemp(join(tmpdir(), "feat126-r8-rehearsal-")));
   await chmod(rehearsalRoot, 0o700);
   t.after(() => rm(rehearsalRoot, { recursive: true, force: true }));
+  const offlineAuthority = await createOfflineCommandAuthority(
+    join(rehearsalRoot, "offline-authority"),
+  );
   assert.equal(rehearsalRoot.startsWith(resolve("environments/local/generated/feat-126-s10")), false);
   assert.deepEqual(S10B_R8_FROZEN_CASE_IDS, [
     "s10b_001", "s10b_002", "s10b_003", "s10b_004", "s10b_005", "s10b_006",
     "s10b_007", "s10b_008", "s10b_009", "s10b_010", "s10b_011", "s10b_012",
   ]);
   assert.equal(desktopProductionBuildFeatures(), "feat126-s10-driver,tauri/custom-protocol");
-  const { artifactGate, authorityRepositories } = await verifyPinnedRuntimeArtifact();
-  const databasePath = await createRealBboltFixture(rehearsalRoot);
+  const { artifactGate, authorityRepositories } = await verifyPinnedRuntimeArtifact(offlineAuthority);
+  const databasePath = await createRealBboltFixture(rehearsalRoot, offlineAuthority);
   const opaqueScan = await scanOpaqueNoLogFile(
     databasePath,
     [{ name: "absent-canary", value: "never-written-canary" }],
@@ -369,7 +544,7 @@ test("R8 convergence rehearsal consumes canonical parsers and all frozen S10B-00
   assert.equal(runtimeLogScan.status, "passed");
   assert.equal(runtimeLogScan.hit_count, 0);
   const actualNoLog = noLogResult(runtimeLogScan, opaqueScan);
-  const defaultOffRepositories = await createDefaultOffRepositories(rehearsalRoot);
+  const defaultOffRepositories = await createDefaultOffRepositories(rehearsalRoot, offlineAuthority);
   const defaultOffAuthority = {
     runId,
     repositories: defaultOffRepositories.shas,

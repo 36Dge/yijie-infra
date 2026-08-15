@@ -44,6 +44,8 @@ import {
   readAttemptReconcile,
   readDesktopFrame,
   requirePreOwnershipDescendantsAbsent,
+  requireR8DesktopSpawnClaimsClosed,
+  requireR8HostInstanceCardinality,
   requirePreOwnershipTerminalHostEvidence,
   r8PreOwnershipLifecycleFromEvidenceNames,
   r8NoLogRequiredEvidenceNames,
@@ -68,6 +70,7 @@ import {
   createR8ControlFrameReader,
   validatePreflightFailureBinding,
   validateReconcileFailureProcessState,
+  validateR8DesktopSpawnClaim,
   validateRuntimeLogScan,
   validateStartupFailureControlFrame,
   writeAttemptClosure,
@@ -1377,6 +1380,244 @@ test("S10BO3 audits lifecycle-2 terminal state independently of lifecycle-1 desc
     ]),
     codeIs("orchestrator_cleanup_unknown"),
   );
+
+  const desktopBinary = Buffer.from("fixture desktop binary", "utf8");
+  const desktopBinarySha256 = createHash("sha256").update(desktopBinary).digest("hex");
+  const desktopBuildRoot = resolve(
+    fixture.runRoot,
+    "desktop-build/cargo-target/release",
+  );
+  await mkdir(desktopBuildRoot, { mode: 0o700, recursive: true });
+  for (const path of [
+    resolve(fixture.runRoot, "desktop-build"),
+    resolve(fixture.runRoot, "desktop-build/cargo-target"),
+    resolve(fixture.runRoot, "desktop-build/cargo-target/release"),
+  ]) await chmod(path, 0o700);
+  await writeFile(resolve(desktopBuildRoot, "yijie-desktop"), desktopBinary, { mode: 0o700 });
+  await chmod(resolve(desktopBuildRoot, "yijie-desktop"), 0o700);
+  const attemptMarkerSha256 = "a".repeat(64);
+  const claimPaths = new Map();
+  for (const [lifecycle, nonce] of [[1, previousNonce], [2, currentNonce]]) {
+    const claim = validateR8DesktopSpawnClaim({
+      schema_version: 1,
+      status: "claimed",
+      run_id: runId,
+      role: "desktop",
+      lifecycle,
+      nonce,
+      attempt_marker_sha256: attemptMarkerSha256,
+      binary_sha256: desktopBinarySha256,
+      parent_pid: 41001,
+    }, {
+      runId,
+      lifecycle,
+      nonce,
+      attemptMarkerSha256,
+      binarySha256: desktopBinarySha256,
+      parentPid: 41001,
+    });
+    const path = resolve(fixture.evidenceRoot, `r8-desktop-${lifecycle}-spawn-claim.v1.json`);
+    claimPaths.set(lifecycle, { claim, path });
+    await writeFile(path, `${JSON.stringify(claim)}\n`, { mode: 0o600 });
+    await chmod(path, 0o600);
+  }
+
+  const lifecycleOneDesktop = {
+    ...previousDesktop,
+    binary_sha256: desktopBinarySha256,
+  };
+  const lifecycleTwoDesktop = {
+    ...previousDesktop,
+    pid: 41012,
+    binary_sha256: desktopBinarySha256,
+    start_identity: "6".repeat(64),
+  };
+  const lifecycleOneHost = {
+    schema_version: 1,
+    run_id: runId,
+    role: "host",
+    pid: 52011,
+    ppid: lifecycleOneDesktop.pid,
+    binary_sha256: fixture.hostBinarySha256,
+    start_identity: "7".repeat(64),
+  };
+  const lifecycleOneRuntime = {
+    schema_version: 1,
+    run_id: runId,
+    role: "runtime",
+    pid: 62011,
+    ppid: lifecycleOneHost.pid,
+    binary_sha256: "8".repeat(64),
+    start_identity: "9".repeat(64),
+  };
+  const lifecycleOneReady = {
+    ...previousProcess,
+    endedAtUnixMs: null,
+    exitCode: null,
+    state: "ready",
+  };
+  await writeFile(
+    resolve(fixture.evidenceRoot, "r8-lifecycle-1-host-evidence.v1.json"),
+    `${JSON.stringify(lifecycleOneReady)}\n`,
+    { mode: 0o600 },
+  );
+  await chmod(resolve(fixture.evidenceRoot, "r8-lifecycle-1-host-evidence.v1.json"), 0o600);
+
+  const recordsWithNames = (entries) => {
+    const records = entries.map(([, record]) => record);
+    Object.defineProperty(records, "evidenceNames", {
+      enumerable: false,
+      value: Object.freeze(entries.map(([name]) => name)),
+    });
+    return records;
+  };
+  const completeLifecycleOneWithCurrentDesktop = recordsWithNames([
+    ["r8-desktop-1-process.v1.json", lifecycleOneDesktop],
+    ["r8-lifecycle-1-host-process.v1.json", lifecycleOneHost],
+    ["r8-lifecycle-1-runtime-process.v1.json", lifecycleOneRuntime],
+    ["r8-desktop-2-process.v1.json", lifecycleTwoDesktop],
+  ]);
+  assert.deepEqual(await requireR8DesktopSpawnClaimsClosed(
+    fixture.runRoot,
+    completeLifecycleOneWithCurrentDesktop,
+    { attemptMarkerSha256, parentPid: 41001 },
+  ), [
+    { lifecycle: 1, nonce: previousNonce },
+    { lifecycle: 2, nonce: currentNonce },
+  ]);
+  assert.equal(await requireR8HostInstanceCardinality(
+    fixture.runRoot,
+    completeLifecycleOneWithCurrentDesktop.evidenceNames,
+  ), true);
+
+  const withoutCurrentDesktop = recordsWithNames([
+    ["r8-desktop-1-process.v1.json", lifecycleOneDesktop],
+    ["r8-lifecycle-1-host-process.v1.json", lifecycleOneHost],
+    ["r8-lifecycle-1-runtime-process.v1.json", lifecycleOneRuntime],
+  ]);
+  await assert.rejects(
+    requireR8DesktopSpawnClaimsClosed(
+      fixture.runRoot,
+      withoutCurrentDesktop,
+      { attemptMarkerSha256, parentPid: 41001 },
+    ),
+    codeIs("orchestrator_cleanup_unknown"),
+  );
+
+  await rm(claimPaths.get(2).path);
+  await assert.rejects(
+    requireR8DesktopSpawnClaimsClosed(
+      fixture.runRoot,
+      completeLifecycleOneWithCurrentDesktop,
+      { attemptMarkerSha256, parentPid: 41001 },
+    ),
+    codeIs("orchestrator_cleanup_unknown"),
+  );
+  await writeFile(
+    claimPaths.get(2).path,
+    `${JSON.stringify(claimPaths.get(2).claim)}\n`,
+    { mode: 0o600 },
+  );
+  await chmod(claimPaths.get(2).path, 0o600);
+
+  for (const invalidRecords of [
+    recordsWithNames([
+      ["r8-desktop-1-process.v1.json", lifecycleOneDesktop],
+      ["r8-lifecycle-1-host-process.v1.json", lifecycleOneHost],
+      ["r8-lifecycle-1-runtime-process.v1.json", lifecycleOneRuntime],
+      ["r8-desktop-2-process.v1.json", { ...lifecycleTwoDesktop, ppid: 41002 }],
+    ]),
+    recordsWithNames([
+      ["r8-desktop-1-process.v1.json", lifecycleOneDesktop],
+      ["r8-lifecycle-1-host-process.v1.json", lifecycleOneHost],
+      ["r8-lifecycle-1-runtime-process.v1.json", lifecycleOneRuntime],
+      ["r8-desktop-2-process.v1.json", {
+        ...lifecycleTwoDesktop,
+        binary_sha256: "f".repeat(64),
+      }],
+    ]),
+  ]) {
+    await assert.rejects(
+      requireR8DesktopSpawnClaimsClosed(
+        fixture.runRoot,
+        invalidRecords,
+        { attemptMarkerSha256, parentPid: 41001 },
+      ),
+      codeIs("orchestrator_cleanup_unknown"),
+    );
+  }
+
+  await writeFile(
+    resolve(fixture.evidenceRoot, "r8-lifecycle-1-host-evidence.v1.json"),
+    `${JSON.stringify({ ...lifecycleOneReady, instanceNonce: currentNonce })}\n`,
+    { mode: 0o600 },
+  );
+  await assert.rejects(
+    requireR8DesktopSpawnClaimsClosed(
+      fixture.runRoot,
+      completeLifecycleOneWithCurrentDesktop,
+      { attemptMarkerSha256, parentPid: 41001 },
+    ),
+    codeIs("orchestrator_cleanup_unknown"),
+  );
+  await writeFile(
+    resolve(fixture.evidenceRoot, "r8-lifecycle-1-host-evidence.v1.json"),
+    `${JSON.stringify(lifecycleOneReady)}\n`,
+    { mode: 0o600 },
+  );
+
+  const extraClaimPath = resolve(fixture.evidenceRoot, "r8-desktop-3-spawn-claim.v1.json");
+  await writeFile(extraClaimPath, `${JSON.stringify(claimPaths.get(2).claim)}\n`, { mode: 0o600 });
+  await chmod(extraClaimPath, 0o600);
+  await assert.rejects(
+    requireR8DesktopSpawnClaimsClosed(
+      fixture.runRoot,
+      completeLifecycleOneWithCurrentDesktop,
+      { attemptMarkerSha256, parentPid: 41001 },
+    ),
+    codeIs("orchestrator_cleanup_unknown"),
+  );
+  await rm(extraClaimPath);
+
+  await chmod(claimPaths.get(1).path, 0o640);
+  await assert.rejects(
+    requireR8DesktopSpawnClaimsClosed(
+      fixture.runRoot,
+      completeLifecycleOneWithCurrentDesktop,
+      { attemptMarkerSha256, parentPid: 41001 },
+    ),
+    codeIs("orchestrator_cleanup_unknown"),
+  );
+  await chmod(claimPaths.get(1).path, 0o600);
+
+  await assert.rejects(
+    requireR8HostInstanceCardinality(fixture.runRoot, withoutCurrentDesktop.evidenceNames),
+    codeIs("orchestrator_cleanup_unknown"),
+  );
+  const source = await readFile("scripts/feat-126-s10b-orchestrator.mjs", "utf8");
+  const reconcileStart = source.indexOf("async function reconcileExistingRun");
+  const reconcileEnd = source.indexOf("async function readOptionalAttemptFailure", reconcileStart);
+  assert.match(
+    source.slice(reconcileStart, reconcileEnd),
+    /await requireR8HostInstanceCardinality\(runRoot, records\.evidenceNames\)/,
+  );
+  assert.match(
+    source.slice(reconcileStart, reconcileEnd),
+    /await requireR8DesktopSpawnClaimsClosed\(runRoot, records/,
+  );
+  const claimValidation = source.indexOf("await requireR8DesktopSpawnClaimsClosed", reconcileStart);
+  const firstProcessStop = source.indexOf("const infraOwnedRecords", reconcileStart);
+  assert.ok(claimValidation > reconcileStart && claimValidation < firstProcessStop);
+  assert.match(
+    source.slice(reconcileStart, reconcileEnd),
+    /expectedNonce: currentClaim\.nonce/,
+  );
+  const desktopStart = source.indexOf("async function startDesktop");
+  const desktopStartSource = source.slice(
+    desktopStart,
+    source.indexOf("export async function readDesktopFrame", desktopStart),
+  );
+  assert.ok(desktopStartSource.indexOf("-spawn-claim.v1.json") < desktopStartSource.indexOf("spawnOwnedProcess({"));
 });
 
 test("S10BO3-004 attempt ledger consumes a run ID exactly once with O_EXCL", async (t) => {

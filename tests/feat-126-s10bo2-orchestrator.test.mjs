@@ -1370,6 +1370,11 @@ test("S10BO2-013 scans all evidence roots and fails closed when a root is missin
           msg: "Codex Runtime unavailable",
           failure_code: "artifact_verification_failed",
         },
+        {
+          level: "ERROR",
+          msg: "yijie-agent-host stopped",
+          failure_code: "feat126_host_process_failed",
+        },
         { msg: "starting yijie-api" },
         { msg: "starting yijie-agent-host" },
       ],
@@ -1380,6 +1385,57 @@ test("S10BO2-013 scans all evidence roots and fails closed when a root is missin
   const clean = await scanNoLog(context);
   assert.equal(clean.file_count, 10);
   assert.equal(clean.hit_count, 0);
+
+  const r8DesktopRecord = {
+    schema_version: 1,
+    run_id: runId,
+    role: "desktop",
+    pid: 41001,
+    ppid: 41000,
+    binary_sha256: "1".repeat(64),
+    start_identity: "2".repeat(64),
+  };
+  const r8DesktopLog = resolve(logRoot, "r8-desktop-1.log");
+  const r8DesktopProcess = resolve(evidenceRoot, "r8-desktop-1-process.v1.json");
+  const r8DesktopClaim = resolve(evidenceRoot, "r8-desktop-1-spawn-claim.v1.json");
+  for (const [path, value] of [
+    [r8DesktopLog, ""],
+    [r8DesktopProcess, `${JSON.stringify(r8DesktopRecord)}\n`],
+    [r8DesktopClaim, `${JSON.stringify({
+      schema_version: 1,
+      status: "claimed",
+      run_id: runId,
+      role: "desktop",
+      lifecycle: 1,
+      nonce,
+      attempt_marker_sha256: "3".repeat(64),
+      binary_sha256: r8DesktopRecord.binary_sha256,
+      parent_pid: r8DesktopRecord.ppid,
+    })}\n`],
+  ]) {
+    await writeFile(path, value, { mode: 0o600 });
+    await chmod(path, 0o600);
+  }
+  const r8Context = {
+    ...context,
+    r8: true,
+    phase: "desktop_spawned",
+    processHistory: [{
+      role: "desktop",
+      record: r8DesktopRecord,
+      evidenceBasename: "r8-desktop-1",
+      logPath: r8DesktopLog,
+    }],
+  };
+  assert.equal((await scanNoLog(r8Context)).hit_count, 0);
+  await unlink(r8DesktopClaim);
+  await assert.rejects(
+    scanNoLog(r8Context),
+    (error) => errorCode(error) === "orchestrator_no_log_invalid",
+  );
+  await unlink(r8DesktopLog);
+  await unlink(r8DesktopProcess);
+
   await unlink(runtimeLogDatabase);
   createRuntimeLogDatabase(runtimeLogDatabase, { autoIncrement: false });
   await chmod(runtimeLogDatabase, 0o644);
