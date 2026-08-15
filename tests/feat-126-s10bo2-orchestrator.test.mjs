@@ -1356,6 +1356,11 @@ test("S10BO2-013 scans all evidence roots and fails closed when a root is missin
         },
       },
       process_logs: [
+        {
+          level: "ERROR",
+          msg: "Codex Runtime unavailable",
+          failure_code: "artifact_verification_failed",
+        },
         { msg: "starting yijie-api" },
         { msg: "starting yijie-agent-host" },
       ],

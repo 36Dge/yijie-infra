@@ -1352,7 +1352,15 @@ test("S10BO3-007 establishes content-free no-log evidence when preflight never c
   await assert.rejects(scanNoLog(context), codeIs("orchestrator_no_log_invalid"));
 });
 
-test("S10BO3-007 accepts only the fixed content-free Host notification warning", () => {
+test("S10BO3-007 accepts only fixed content-free Host messages", () => {
+  const runtimeUnavailable = scanNoLogBuffer(Buffer.from(`${JSON.stringify({
+    level: "ERROR",
+    msg: "Codex Runtime unavailable",
+    failure_code: "artifact_verification_failed",
+    time: 1,
+  })}\n`), [], []);
+  assert.equal(runtimeUnavailable.hitCount, 0);
+
   const fixedWarning = scanNoLogBuffer(Buffer.from(`${JSON.stringify({
     level: "WARN",
     method: "item/completed",

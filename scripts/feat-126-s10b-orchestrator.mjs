@@ -424,6 +424,7 @@ const STRUCTURED_NO_LOG_RULES = Object.freeze([
   "unclassified_sensitive_field",
 ]);
 const APPROVED_CONTEXT_MESSAGES = Object.freeze([
+  "Codex Runtime unavailable",
   "failed to map Codex notification",
   "starting yijie-agent-host",
   "starting yijie-api",
