@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
@@ -9,21 +8,29 @@ import test from "node:test";
 import {
   S10BO1_CASES,
   S10BO1OrchestratorError,
+  S10B_R8_FROZEN_CASE_IDS,
   S10B_R8_FAKE_GENERATIONS,
   S10B_R8_STATES,
+  allocateR8LifecycleNonce,
   buildOrchestratorPlan,
+  buildR8DefaultOffEvidence,
   buildR8BusinessEvidence,
   buildR8OrchestratorPlan,
   createR8ControlFrameReader,
   createR8StateMachine,
   encodeR8ControlFrame,
+  loadExistingProcessRecords,
   persistR8FakeFinalAuthority,
+  r8CaseAuthority,
+  r8ControlTimeoutFor,
   r8NoLogRequiredEvidenceNames,
   r8ProcessEvidenceNamesForPhase,
   runR8Flow,
+  scanOpaqueNoLogFile,
   validateOrchestratorInput,
   validateR8BusinessEvidence,
   validateR8CaseEvidence,
+  validateR8DefaultOffEvidence,
   validateR8OrchestratorInput,
   validateR8ProcessRecordSet,
 } from "../scripts/feat-126-s10b-orchestrator.mjs";
@@ -44,20 +51,8 @@ const environment = Object.fromEntries(Object.entries(repositories).map(
   ([role, sha]) => [`FEAT126_S10B_${role.toUpperCase()}_SHA`, sha],
 ));
 const hash = "a".repeat(64);
-const FEAT126_R8_ASSERTIONS = Object.freeze({
-  s10b_002: ["opaque_project", "single_session", "single_turn", "completed_terminal"],
-  s10b_003: ["assistant_plaintext", "reasoning_complete", "reasoning_ordered", "terminal_exact"],
-  s10b_004: ["interrupt_terminal", "incomplete_answer", "incomplete_reasoning", "terminal_once"],
-  s10b_005_planned_restart: ["history_page_20", "history_page_50", "restart_closed", "resync_same_session", "cursor_monotonic"],
-  s10b_006: ["fallback_title", "user_rename_wins", "session_pin", "project_pin", "stable_sort"],
-  s10b_007: ["gap_recovery", "reconnect", "race_closed", "no_late_commit", "cursor_resync"],
-  s10b_008: ["desktop_delete", "host_delete", "runtime_delete", "receipt_closed", "restart_unreadable"],
-  s10b_009: ["public_task_content_free", "audit_content_free", "counts_bound", "path_absent", "title_absent"],
-  s10b_010: ["log_content_free", "bbolt_content_free", "audit_content_free", "telemetry_content_free", "process_output_content_free"],
-  s10b_011: ["metadata_p95_200ms", "history_p95_300ms", "reducer_10000", "db_1m_messages", "idempotency_10000"],
-});
 const completed = Object.freeze([
-  "authority", "ports", "secret_init", "compose", "images", "dependencies",
+  "authority", "ports", "host_runtime_artifact", "secret_init", "compose", "images", "dependencies",
   "tls_oidc", "identity", "migration", "bootstrap", "api_binary", "host_binary",
   "fake_binary", "probe_binary", "api_health", "api_readiness",
   "host_owned_fake_authority", "fake_readiness", "content_free_logs",
@@ -71,6 +66,15 @@ function summary() {
     run_id: runId,
     repositories,
     api_binary_sha256: hash,
+    host_runtime_artifact_gate: {
+      schema_version: 1,
+      status: "passed",
+      verifier: "host-runtime-healthcheck-artifact-only",
+      host_repository_sha: repositories.host,
+      runtime_repository_sha: repositories.runtime,
+      runtime_binary_sha256: "c".repeat(64),
+      runtime_manifest_sha256: "d".repeat(64),
+    },
     api_runtime_authority: FEAT_126_S10_API_RUNTIME_AUTHORITY,
     fake_readiness: {
       schema_version: 1,
@@ -158,21 +162,23 @@ function closedFakeAuthority(specification, overrides = {}) {
 }
 
 function caseEvidence() {
-  return S10BO1_CASES.slice(0, -1).map((caseId, index) => ({
-    schema_version: 1,
-    status: "passed",
-    run_id: runId,
-    ordinal: index + 1,
-    case_id: caseId,
-    frame_sequence: index < 3 ? index + 2 : index - 1,
-    assertion_count: FEAT126_R8_ASSERTIONS[caseId].length,
-    assertion_set_sha256: createHash("sha256")
-      .update(`${FEAT126_R8_ASSERTIONS[caseId].join("\n")}\n`)
-      .digest("hex"),
-  }));
+  return S10BO1_CASES.slice(0, -1).map((caseId, index) => {
+    const authority = r8CaseAuthority(caseId);
+    return {
+      schema_version: 1,
+      status: "passed",
+      run_id: runId,
+      ordinal: index + 1,
+      case_id: caseId,
+      frame_sequence: index < 3 ? index + 2 : index - 1,
+      assertion_count: authority.assertionCount,
+      assertion_set_sha256: authority.assertionSetSha256,
+    };
+  });
 }
 
 function caseFrame(caseId, sequence) {
+  const authority = r8CaseAuthority(caseId);
   return JSON.stringify({
     schema_version: 1,
     run_id: runId,
@@ -181,10 +187,8 @@ function caseFrame(caseId, sequence) {
     kind: "case_result",
     case_id: caseId,
     status: "passed",
-    assertion_count: FEAT126_R8_ASSERTIONS[caseId].length,
-    assertion_set_sha256: createHash("sha256")
-      .update(`${FEAT126_R8_ASSERTIONS[caseId].join("\n")}\n`)
-      .digest("hex"),
+    assertion_count: authority.assertionCount,
+    assertion_set_sha256: authority.assertionSetSha256,
   });
 }
 
@@ -201,9 +205,23 @@ test("S10BR8-001 keeps startup and full-case authorities disjoint", () => {
   assert.equal(plan.business_cases, "frozen_s10b_002_011");
   assert.equal(plan.s10b_r8_executed, true);
   assert.equal(plan.execution, "single-authorized-fresh-r8-only");
+  for (const name of [
+    "VITE_FEAT126_S10_R8",
+    "YIJIE_FEAT126_S10_R8_ENABLED",
+    "YIJIE_FEAT126_S10_R8_PHASE",
+  ]) {
+    assert.throws(
+      () => validateR8OrchestratorInput(runId, { ...environment, [name]: "true" }),
+      (error) => error?.code === "orchestrator_override_forbidden",
+    );
+  }
 });
 
 test("S10BR8-002 freezes exact states, cases, and four fake generations", () => {
+  assert.deepEqual(S10B_R8_FROZEN_CASE_IDS, [
+    "s10b_001", "s10b_002", "s10b_003", "s10b_004", "s10b_005", "s10b_006",
+    "s10b_007", "s10b_008", "s10b_009", "s10b_010", "s10b_011", "s10b_012",
+  ]);
   assert.deepEqual(S10B_R8_STATES.slice(-12), [...S10BO1_CASES.slice(0, -1), "cleanup_passed", "closed_pass"]);
   assert.deepEqual(S10B_R8_FAKE_GENERATIONS, [
     { generation: 1, mode: "complete", callCap: 2, firstCase: "s10b_002" },
@@ -213,6 +231,21 @@ test("S10BR8-002 freezes exact states, cases, and four fake generations", () => 
   ]);
   const machine = createR8StateMachine();
   for (const state of S10B_R8_STATES.slice(1)) assert.equal(machine.transition(state), state);
+});
+
+test("S10BR8-002A allocates one fresh nonce for each lifecycle without collision retry", () => {
+  const first = "12600000-0000-4000-8000-000000000071";
+  const second = "12600000-0000-4000-8000-000000000072";
+  assert.equal(allocateR8LifecycleNonce([], () => first), first);
+  assert.equal(allocateR8LifecycleNonce([first], () => second), second);
+  assert.throws(
+    () => allocateR8LifecycleNonce([first], () => first),
+    (error) => error?.code === "orchestrator_r8_authority_invalid",
+  );
+  assert.throws(
+    () => allocateR8LifecycleNonce([first], () => "not-a-uuid"),
+    (error) => error?.code === "orchestrator_r8_authority_invalid",
+  );
 });
 
 test("S10BR8-003 encodes only monotonic fixed mode and terminal frames", () => {
@@ -262,6 +295,9 @@ test("S10BR8-004 reads ordered case results before planned restart", async () =>
 });
 
 test("S10BR8-004B gives only case results the bounded 120-second probe window", async () => {
+  const authority = r8CaseAuthority("s10b_002");
+  assert.equal(r8ControlTimeoutFor("case_result"), 120_000);
+  assert.equal(r8ControlTimeoutFor("component_ready"), 60_000);
   const control = Readable.from(`${JSON.stringify({
     schema_version: 1,
     run_id: runId,
@@ -270,10 +306,8 @@ test("S10BR8-004B gives only case results the bounded 120-second probe window", 
     kind: "case_result",
     case_id: "s10b_002",
     status: "passed",
-    assertion_count: FEAT126_R8_ASSERTIONS.s10b_002.length,
-    assertion_set_sha256: createHash("sha256")
-      .update(`${FEAT126_R8_ASSERTIONS.s10b_002.join("\n")}\n`)
-      .digest("hex"),
+    assertion_count: authority.assertionCount,
+    assertion_set_sha256: authority.assertionSetSha256,
   })}\n`);
   const reader = createR8ControlFrameReader(control, { runId, nonce });
   assert.equal((await reader.next("case_result", "s10b_002")).case_id, "s10b_002");
@@ -405,6 +439,10 @@ function r8FlowOperations(calls, overrides = {}) {
     async startDesktopLifecycle(lifecycle, phase) { calls.push(`desktop:${lifecycle}:${phase}`); },
     async readLifecycleOwnership(lifecycle) { calls.push(`ownership:${lifecycle}`); },
     async executeCase(caseId) { calls.push(`case:${caseId}`); },
+    async scanNoLogCheckpoint(caseId) {
+      calls.push(`case_no_log:${caseId}`);
+      return noLogResult();
+    },
     async completePlannedRestart() { calls.push("planned_restart"); },
     async completeAbort() { calls.push("abort"); },
     async captureNoLogAuthority() { calls.push("capture_no_log_authority"); },
@@ -429,6 +467,8 @@ test("S10BR8-007 runs one frozen order with two Desktop lifecycles and four fake
   assert.equal(calls.filter((call) => call.startsWith("fake:")).length, 4);
   assert.deepEqual(calls.filter((call) => call.startsWith("case:")),
     S10BO1_CASES.slice(0, -1).map((caseId) => `case:${caseId}`));
+  assert.deepEqual(calls.filter((call) => call.startsWith("case_no_log:")),
+    S10BO1_CASES.slice(0, -1).map((caseId) => `case_no_log:${caseId}`));
   assert.equal(calls.filter((call) => call === "planned_restart").length, 1);
   assert.deepEqual(calls.slice(-4), ["business", "cleanup", "no_log", "closure:passed:passed"]);
 });
@@ -459,6 +499,25 @@ test("S10BR8-008 keeps primary failure immutable, skips business, and closes onc
   assert.equal(closureValues[0].cleanupScope, "run_artifacts");
 });
 
+test("S10BR8-008 aborts at the first per-case no-log failure without later cases", async () => {
+  const calls = [];
+  await assert.rejects(
+    runR8Flow({ runId, repositories, r8: true }, r8FlowOperations(calls, {
+      async scanNoLogCheckpoint(caseId) {
+        calls.push(`case_no_log:${caseId}`);
+        return caseId === "s10b_003" ? { ...noLogResult(), hit_count: 1 } : noLogResult();
+      },
+    })),
+    (error) => error?.code === "orchestrator_no_log_invalid",
+  );
+  assert.deepEqual(calls.filter((call) => call.startsWith("case:")), [
+    "case:s10b_002",
+    "case:s10b_003",
+  ]);
+  assert.equal(calls.filter((call) => call === "desktop_abort").length, 1);
+  assert.equal(calls.includes("business"), false);
+});
+
 function r8ProcessRecords(names) {
   const infraPid = 42;
   const records = [];
@@ -482,7 +541,7 @@ function r8ProcessRecords(names) {
       pid: pidByName.get(name),
       ppid,
       binary_sha256: String((index % 9) + 1).repeat(64),
-      start_identity: String.fromCharCode(97 + (index % 26)).repeat(64),
+      start_identity: String.fromCharCode(97 + (index % 6)).repeat(64),
     });
   }
   return records;
@@ -519,6 +578,31 @@ test("S10BR8-009 validates partial and complete process evidence without gaps or
   assert.throws(() => validateR8ProcessRecordSet(broken, partialNames, { phase: "s10b_006" }));
 });
 
+test("S10BR8-009 complete process validation survives the persisted-record loading boundary", async (t) => {
+  const runRoot = await realpath(await mkdtemp(join(tmpdir(), "feat126-r8-complete-records-")));
+  await chmod(runRoot, 0o700);
+  t.after(() => rm(runRoot, { recursive: true, force: true }));
+  const evidenceRoot = join(runRoot, "orchestrator-evidence");
+  await mkdir(evidenceRoot, { mode: 0o700 });
+  await chmod(evidenceRoot, 0o700);
+  const partialNames = r8ProcessEvidenceNamesForPhase("s10b_006");
+  const partialRecords = r8ProcessRecords(partialNames);
+  for (const [index, name] of partialNames.entries()) {
+    const evidencePath = join(evidenceRoot, name);
+    await writeFile(evidencePath, `${JSON.stringify(partialRecords[index])}\n`, { mode: 0o600 });
+    await chmod(evidencePath, 0o600);
+  }
+  await assert.rejects(
+    loadExistingProcessRecords(
+      runRoot,
+      runId,
+      ["api", "desktop", "fake", "host", "runtime"],
+      { r8: true, phase: "s10b_011", requireComplete: true },
+    ),
+    (error) => error?.code === "orchestrator_existing_evidence_incomplete",
+  );
+});
+
 test("S10BR8-010 derives no-log evidence from the reached prefix and requires full success", () => {
   const partial = r8NoLogRequiredEvidenceNames({
     r8: true,
@@ -532,6 +616,8 @@ test("S10BR8-010 derives no-log evidence from the reached prefix and requires fu
   assert.equal(partial.includes("r8-fake-3-final.v1.json"), false);
   assert.equal(partial.includes("r8-case-04.v1.json"), true);
   assert.equal(partial.includes("r8-case-05.v1.json"), false);
+  assert.equal(partial.includes("r8-runtime-log-scan-04.v1.json"), true);
+  assert.equal(partial.includes("r8-no-log-04.v1.json"), true);
 
   const complete = r8NoLogRequiredEvidenceNames({
     r8: true,
@@ -545,5 +631,61 @@ test("S10BR8-010 derives no-log evidence from the reached prefix and requires fu
   assert.equal(complete.includes("r8-api-verifier-after.v1.json"), true);
   assert.equal(complete.includes("r8-business-boundary.v1.json"), true);
   assert.equal(complete.filter((name) => /^r8-case-/.test(name)).length, 10);
+  assert.equal(complete.filter((name) => /^r8-runtime-log-scan-/.test(name)).length, 10);
+  assert.equal(complete.filter((name) => /^r8-no-log-/.test(name)).length, 10);
   assert.equal(complete.filter((name) => /^r8-fake-\d+-final/.test(name)).length, 4);
+});
+
+test("S10BR8-010 scans opaque Host bbolt bytes without requiring UTF-8", async (t) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "feat126-r8-bbolt-scan-")));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const databasePath = join(root, "sessions.db");
+  await writeFile(databasePath, Buffer.from([0xff, 0x00, ...Buffer.from("closed-state")]));
+  await chmod(databasePath, 0o600);
+  assert.deepEqual(
+    await scanOpaqueNoLogFile(databasePath, [{ name: "canary", value: "never-present" }], [], true),
+    { present: true, rowCount: 1, hitCount: 0 },
+  );
+  await writeFile(databasePath, Buffer.from([0xff, 0x00, ...Buffer.from("fixed-canary")]));
+  await chmod(databasePath, 0o600);
+  assert.equal(
+    (await scanOpaqueNoLogFile(
+      databasePath,
+      [{ name: "canary", value: "fixed-canary" }],
+      [],
+      true,
+    )).hitCount,
+    1,
+  );
+});
+
+test("S10BR8-012 binds final default-off evidence to run and repository authority", () => {
+  const authority = { runId, repositories, r8: true };
+  const evidence = buildR8DefaultOffEvidence(authority, {
+    ambientSetCount: 0,
+    trackedConfigCount: 7,
+    trackedConfigSetSha256: "e".repeat(64),
+    trackedDefaultOnCount: 0,
+    untrackedConfigCount: 0,
+    liveProcessCount: 0,
+  });
+  assert.equal(evidence.schema_version, 2);
+  assert.deepEqual(validateR8DefaultOffEvidence(evidence, authority), evidence);
+  const {
+    tracked_config_count: _trackedConfigCount,
+    tracked_config_set_sha256: _trackedConfigSetSha256,
+    ...legacy
+  } = evidence;
+  assert.equal(validateR8DefaultOffEvidence({ ...legacy, schema_version: 1 }, authority).schema_version, 1);
+  for (const invalid of [
+    { ambient_set_count: 1 },
+    { tracked_config_count: 0 },
+    { tracked_config_set_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" },
+    { tracked_default_on_count: 1 },
+    { untracked_config_count: 1 },
+    { live_process_count: 1 },
+    { repository_authority_sha256: "f".repeat(64) },
+  ]) {
+    assert.throws(() => validateR8DefaultOffEvidence({ ...evidence, ...invalid }, authority));
+  }
 });

@@ -5,9 +5,13 @@ import test from "node:test";
 
 import {
   S10BPreflightError,
+  buildHostRuntimeArtifactGateEvidence,
+  buildHostRuntimeArtifactCheckPlan,
   buildPrevalidatedDependencyArguments,
   readExpectedSHAs,
+  validateHostRuntimeArtifactGateEvidence,
   validateProbeResult,
+  verifyHostRuntimeArtifactOnly,
 } from "../scripts/feat-126-s10b-preflight.mjs";
 import {
   buildApiRuntimeEnvironment,
@@ -19,6 +23,15 @@ import {
 
 const RUN_ID = "12600000-0000-4000-8000-000000000057";
 const DATASET_SHA = "a".repeat(64);
+const REPOSITORIES = Object.freeze({
+  governance: "1".repeat(40),
+  contracts: "2".repeat(40),
+  api: "3".repeat(40),
+  host: "4".repeat(40),
+  desktop: "5".repeat(40),
+  runtime: "6".repeat(40),
+  infra: "7".repeat(40),
+});
 
 function validProbe(overrides = {}) {
   return {
@@ -132,6 +145,75 @@ test("S10BF1-004 combines accepted S10E, identity, migration, bootstrap, API and
   );
 });
 
+test("S10BF1-004A verifies exact Host/Runtime artifacts before secret or Compose setup", async () => {
+  const plan = buildHostRuntimeArtifactCheckPlan();
+  assert.equal(plan.command, "go");
+  assert.equal(plan.cwd, resolve("../yijie-agent-host"));
+  assert.deepEqual(plan.arguments_, [
+    "run",
+    "./cmd/runtime-healthcheck",
+    "--artifact-only",
+    resolve("../yijie-codex/.yijie/build/macos/aarch64-apple-darwin/codex"),
+    resolve("../yijie-codex/.yijie/build/macos/aarch64-apple-darwin/runtime-manifest.json"),
+  ]);
+
+  let observed;
+  const evidence = await verifyHostRuntimeArtifactOnly(
+    REPOSITORIES,
+    (label, command, arguments_, options) => {
+      observed = { label, command, arguments_, options };
+    },
+    async (path) => path === plan.arguments_[3] ? "8".repeat(64) : "9".repeat(64),
+  );
+  assert.equal(observed.label, "host_runtime_artifact");
+  assert.equal(observed.command, plan.command);
+  assert.deepEqual(observed.arguments_, plan.arguments_);
+  assert.equal(observed.options.cwd, plan.cwd);
+  assert.equal(observed.options.env.GOPROXY, "off");
+  assert.equal(Object.hasOwn(observed.options.env, "GOSUMDB"), false);
+  assert.deepEqual(validateHostRuntimeArtifactGateEvidence(evidence, REPOSITORIES), evidence);
+  assert.deepEqual(evidence, buildHostRuntimeArtifactGateEvidence(REPOSITORIES, {
+    runtimeBinarySha256: "8".repeat(64),
+    runtimeManifestSha256: "9".repeat(64),
+  }));
+  assert.throws(
+    () => validateHostRuntimeArtifactGateEvidence({
+      ...evidence,
+      host_repository_sha: "0".repeat(40),
+    }, REPOSITORIES),
+    codeIs("preflight_host_runtime_artifact_evidence_invalid"),
+  );
+  await assert.rejects(
+    verifyHostRuntimeArtifactOnly(REPOSITORIES, () => {
+      throw new Error("path and verifier details stay closed");
+    }),
+    codeIs("preflight_host_runtime_artifact_failed"),
+  );
+  let hashCalls = 0;
+  await assert.rejects(
+    verifyHostRuntimeArtifactOnly(
+      REPOSITORIES,
+      () => {},
+      async () => String(++hashCalls).repeat(64),
+    ),
+    codeIs("preflight_host_runtime_artifact_failed"),
+  );
+
+  const runner = await readFile("scripts/feat-126-s10b-preflight.mjs", "utf8");
+  const artifactGate = runner.indexOf(
+    "hostRuntimeArtifactGate = await verifyHostRuntimeArtifactOnly(expectedSHAs);",
+  );
+  const secretInit = runner.indexOf('runCommand("secret_init"');
+  const composeConfig = runner.indexOf('runCommand("compose_config"');
+  const dependencyStart = runner.indexOf("attemptPrevalidatedDependencyStart(\n      dependencyState");
+  assert.ok(artifactGate > 0 && artifactGate < secretInit);
+  assert.ok(secretInit < composeConfig && composeConfig < dependencyStart);
+
+  const hostSource = await readFile("../yijie-agent-host/cmd/runtime-healthcheck/main.go", "utf8");
+  assert.match(hostSource, /codex\.VerifyArtifact/);
+  assert.doesNotMatch(hostSource, /Manager|app-server|StartThread|StartTurn|provider|session/);
+});
+
 test("S10B runtime profile authority is closed to the dedicated FEAT-126 profile", () => {
   assert.equal(
     FEAT_126_S10_API_RUNTIME_AUTHORITY.service_profile,
@@ -217,6 +299,7 @@ test("S10B preflight and continuation environment derive from one runtime author
   ]);
   assert.match(runner, /buildApiRuntimeEnvironment/);
   assert.match(runner, /api_binary_sha256: result\.apiBinarySha256/);
+  assert.match(runner, /host_runtime_artifact_gate: result\.hostRuntimeArtifactGate/);
   assert.match(runner, /inspectApiBinary/);
   assert.match(runner, /api_runtime_authority: result\.apiRuntimeAuthority/);
   assert.doesNotMatch(runner, /feat-125-local-lab/);

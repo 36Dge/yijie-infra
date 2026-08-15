@@ -44,6 +44,8 @@ import {
   readAttemptReconcile,
   readDesktopFrame,
   requirePreOwnershipDescendantsAbsent,
+  requirePreOwnershipTerminalHostEvidence,
+  r8PreOwnershipLifecycleFromEvidenceNames,
   r8NoLogRequiredEvidenceNames,
   r8OwnershipStoppedEvidenceRequired,
   r8PersistedStoppedEvidenceRequired,
@@ -400,6 +402,16 @@ test("S10BO3 corrective derives no-log requirements from the reached R8 phase", 
     "r8-fake-2-before.v1.json",
     "r8-fake-2-final.v1.json",
     "r8-fake-3-before.v1.json",
+    "r8-no-log-01.v1.json",
+    "r8-no-log-02.v1.json",
+    "r8-no-log-03.v1.json",
+    "r8-no-log-04.v1.json",
+    "r8-no-log-05.v1.json",
+    "r8-runtime-log-scan-01.v1.json",
+    "r8-runtime-log-scan-02.v1.json",
+    "r8-runtime-log-scan-03.v1.json",
+    "r8-runtime-log-scan-04.v1.json",
+    "r8-runtime-log-scan-05.v1.json",
   ]);
   assert.equal(r8OwnershipStoppedEvidenceRequired(runtimeReady, 1), false);
   const lifecycleOneStopped = {
@@ -452,7 +464,7 @@ test("S10BO3 corrective derives no-log requirements from the reached R8 phase", 
 });
 
 const completed = Object.freeze([
-  "authority", "ports", "secret_init", "compose", "images", "dependencies",
+  "authority", "ports", "host_runtime_artifact", "secret_init", "compose", "images", "dependencies",
   "tls_oidc", "identity", "migration", "bootstrap", "api_binary", "host_binary",
   "fake_binary", "probe_binary", "api_health", "api_readiness",
   "host_owned_fake_authority", "fake_readiness", "content_free_logs",
@@ -472,6 +484,76 @@ async function canonicalTemporaryRoot(t, name) {
   await chmod(root, 0o700);
   t.after(async () => { await rm(root, { recursive: true, force: true }); });
   return root;
+}
+
+async function writePreOwnershipTerminalHostFixture(t, state, overrides = {}) {
+  const parent = await canonicalTemporaryRoot(t, `feat126-s10bo3-terminal-${state}-`);
+  const runRoot = resolve(parent, runId);
+  const evidenceRoot = resolve(runRoot, "orchestrator-evidence");
+  const binRoot = resolve(runRoot, "bin");
+  const hostRoot = resolve(runRoot, "host");
+  const instanceNonce = overrides.instanceNonce ?? "12600000-0000-4000-8000-000000000071";
+  const instanceRoot = resolve(hostRoot, instanceNonce);
+  for (const path of [runRoot, evidenceRoot, binRoot, hostRoot, instanceRoot]) {
+    await mkdir(path, { mode: 0o700 });
+    await chmod(path, 0o700);
+  }
+  const hostBinary = Buffer.from("synthetic-host-binary", "utf8");
+  const hostBinaryPath = resolve(binRoot, "yijie-agent-host");
+  await writeFile(hostBinaryPath, hostBinary, { mode: 0o700 });
+  await chmod(hostBinaryPath, 0o700);
+  const hostBinarySha256 = createHash("sha256").update(hostBinary).digest("hex");
+  const desktopPid = overrides.desktopPid ?? 41002;
+  const desktopRecord = {
+    schema_version: 1,
+    run_id: runId,
+    role: "desktop",
+    pid: desktopPid,
+    ppid: 41001,
+    binary_sha256: "3".repeat(64),
+    start_identity: "4".repeat(64),
+  };
+  const desktopEvidenceName = overrides.desktopEvidenceName ?? "r8-desktop-1-process.v1.json";
+  const desktopPath = resolve(evidenceRoot, desktopEvidenceName);
+  await writeFile(desktopPath, `${JSON.stringify(desktopRecord)}\n`, { mode: 0o600 });
+  await chmod(desktopPath, 0o600);
+  const spawnFailed = state === "spawn_failed";
+  const stdout = spawnFailed ? Buffer.alloc(0) : Buffer.from("abc", "utf8");
+  const stderr = Buffer.alloc(0);
+  const processEvidence = {
+    schemaVersion: 1,
+    runId,
+    role: "agent_host_child",
+    pid: spawnFailed ? null : 52002,
+    ppid: desktopPid,
+    binarySha256: hostBinarySha256,
+    instanceNonce,
+    startedAtUnixMs: 1,
+    endedAtUnixMs: 2,
+    state,
+    exitCode: spawnFailed ? null : 0,
+    stdoutBytes: stdout.length,
+    stderrBytes: stderr.length,
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    logLimitBytes: 256 * 1024,
+    ...overrides.processEvidence,
+  };
+  for (const [name, bytes] of [["stdout.log", stdout], ["stderr.log", stderr]]) {
+    const path = resolve(instanceRoot, name);
+    await writeFile(path, bytes, { mode: 0o600 });
+    await chmod(path, 0o600);
+  }
+  const processPath = resolve(instanceRoot, "process.json");
+  await writeFile(processPath, `${JSON.stringify(processEvidence)}\n`, { mode: 0o600 });
+  await chmod(processPath, 0o600);
+  return {
+    runRoot,
+    evidenceRoot,
+    instanceRoot,
+    processEvidence,
+    hostBinarySha256,
+  };
 }
 
 async function claimTemporaryAttempt(t, name = "feat126-s10bo3-attempt-") {
@@ -588,6 +670,15 @@ function summary() {
     run_id: runId,
     repositories,
     api_binary_sha256: "d".repeat(64),
+    host_runtime_artifact_gate: {
+      schema_version: 1,
+      status: "passed",
+      verifier: "host-runtime-healthcheck-artifact-only",
+      host_repository_sha: repositories.host,
+      runtime_repository_sha: repositories.runtime,
+      runtime_binary_sha256: "f".repeat(64),
+      runtime_manifest_sha256: "a".repeat(64),
+    },
     api_runtime_authority: FEAT_126_S10_API_RUNTIME_AUTHORITY,
     fake_readiness: {
       schema_version: 1,
@@ -1059,7 +1150,7 @@ test("S10BO3 corrective persists every closed Desktop login leaf without continu
   assert.equal(calls.includes("desktop_exit"), false);
 });
 
-test("S10BO3 corrective fails closed when pre-ownership sidecar artifacts exist", async (t) => {
+test("S10BO3 corrective fails closed on unbound pre-ownership sidecar artifacts", async (t) => {
   const runRoot = await canonicalTemporaryRoot(t, "feat126-s10bo3-descendant-absence-");
   assert.equal(await requirePreOwnershipDescendantsAbsent(runRoot), true);
 
@@ -1109,6 +1200,182 @@ test("S10BO3 corrective fails closed when pre-ownership sidecar artifacts exist"
   assert.doesNotMatch(
     source.slice(reconcileStart, reconcileEnd),
     /readOwnershipEvidence|requestRuntimeEvidence/,
+  );
+});
+
+test("S10BO3 accepts only a closed and fully bound pre-ownership Host terminal", async (t) => {
+  for (const state of [
+    "exited_during_startup", "startup_timeout", "stopped", "unexpected_exit", "spawn_failed",
+  ]) {
+    await t.test(state, async (subtest) => {
+      const fixture = await writePreOwnershipTerminalHostFixture(subtest, state);
+      let inspections = 0;
+      assert.equal(await requirePreOwnershipTerminalHostEvidence(fixture.runRoot, {
+        async inspect(pid) {
+          inspections += 1;
+          assert.equal(pid, fixture.processEvidence.pid);
+          return null;
+        },
+      }), true);
+      assert.equal(inspections, state === "spawn_failed" ? 0 : 1);
+    });
+  }
+
+  for (const exitCode of [9, null]) {
+    await t.test(`closed child exit ${String(exitCode)}`, async (subtest) => {
+      const fixture = await writePreOwnershipTerminalHostFixture(
+        subtest,
+        "exited_during_startup",
+        { processEvidence: { exitCode } },
+      );
+      assert.equal(await requirePreOwnershipTerminalHostEvidence(fixture.runRoot, {
+        async inspect() { return null; },
+      }), true);
+    });
+  }
+
+  await t.test("live Host identity", async (subtest) => {
+    const fixture = await writePreOwnershipTerminalHostFixture(subtest, "startup_timeout");
+    await assert.rejects(
+      requirePreOwnershipTerminalHostEvidence(fixture.runRoot, {
+        async inspect(pid) { return { pid }; },
+      }),
+      codeIs("orchestrator_cleanup_unknown"),
+    );
+  });
+
+  await t.test("Runtime ownership evidence", async (subtest) => {
+    const fixture = await writePreOwnershipTerminalHostFixture(subtest, "startup_timeout");
+    const runtimePath = resolve(
+      fixture.evidenceRoot,
+      "r8-lifecycle-1-runtime-process.v1.json",
+    );
+    await writeFile(runtimePath, "{}\n", { mode: 0o600 });
+    await chmod(runtimePath, 0o600);
+    await assert.rejects(
+      requirePreOwnershipTerminalHostEvidence(fixture.runRoot, { async inspect() { return null; } }),
+      codeIs("orchestrator_cleanup_unknown"),
+    );
+  });
+
+  for (const state of [
+    "spawn_identity_unknown", "startup_status_unknown", "startup_timeout_cleanup_unknown",
+    "stop_outcome_unknown", "status_unknown",
+  ]) {
+    await t.test(`unknown child state ${state}`, async (subtest) => {
+      const fixture = await writePreOwnershipTerminalHostFixture(subtest, state, {
+        processEvidence: { endedAtUnixMs: null, exitCode: null },
+      });
+      await assert.rejects(
+        requirePreOwnershipTerminalHostEvidence(fixture.runRoot, { async inspect() { return null; } }),
+        codeIs("orchestrator_cleanup_unknown"),
+      );
+    });
+  }
+});
+
+test("S10BO3 audits lifecycle-2 terminal state independently of lifecycle-1 descendants", async (t) => {
+  const currentNonce = "12600000-0000-4000-8000-000000000072";
+  const fixture = await writePreOwnershipTerminalHostFixture(t, "startup_timeout", {
+    instanceNonce: currentNonce,
+    desktopPid: 41012,
+    desktopEvidenceName: "r8-desktop-2-process.v1.json",
+    processEvidence: { pid: 52012 },
+  });
+  const previousNonce = "12600000-0000-4000-8000-000000000071";
+  const previousDesktop = {
+    schema_version: 1,
+    run_id: runId,
+    role: "desktop",
+    pid: 41011,
+    ppid: 41001,
+    binary_sha256: "3".repeat(64),
+    start_identity: "5".repeat(64),
+  };
+  const previousDesktopPath = resolve(
+    fixture.evidenceRoot,
+    "r8-desktop-1-process.v1.json",
+  );
+  await writeFile(previousDesktopPath, `${JSON.stringify(previousDesktop)}\n`, { mode: 0o600 });
+  await chmod(previousDesktopPath, 0o600);
+  const previousRoot = resolve(fixture.runRoot, "host", previousNonce);
+  await mkdir(previousRoot, { mode: 0o700 });
+  await chmod(previousRoot, 0o700);
+  const previousProcess = {
+    schemaVersion: 1,
+    runId,
+    role: "agent_host_child",
+    pid: 52011,
+    ppid: previousDesktop.pid,
+    binarySha256: fixture.hostBinarySha256,
+    instanceNonce: previousNonce,
+    startedAtUnixMs: 1,
+    endedAtUnixMs: 2,
+    state: "stopped",
+    exitCode: 0,
+    stdoutBytes: 0,
+    stderrBytes: 0,
+    stdoutTruncated: false,
+    stderrTruncated: false,
+    logLimitBytes: 256 * 1024,
+  };
+  for (const [name, bytes] of [
+    ["process.json", Buffer.from(`${JSON.stringify(previousProcess)}\n`)],
+    ["stdout.log", Buffer.alloc(0)],
+    ["stderr.log", Buffer.alloc(0)],
+  ]) {
+    const path = resolve(previousRoot, name);
+    await writeFile(path, bytes, { mode: 0o600 });
+    await chmod(path, 0o600);
+  }
+  for (const name of [
+    "r8-lifecycle-1-host-process.v1.json",
+    "r8-lifecycle-1-runtime-process.v1.json",
+    "r8-lifecycle-1-host-evidence.v1.json",
+    "r8-lifecycle-1-runtime-evidence.v1.json",
+    "r8-lifecycle-1-host-stopped-evidence.v1.json",
+  ]) {
+    const path = resolve(fixture.evidenceRoot, name);
+    await writeFile(path, "{}\n", { mode: 0o600 });
+    await chmod(path, 0o600);
+  }
+
+  const inspected = [];
+  assert.equal(await requirePreOwnershipTerminalHostEvidence(fixture.runRoot, {
+    currentLifecycle: 2,
+    expectedDesktopEvidenceName: "r8-desktop-2-process.v1.json",
+    expectedNonce: currentNonce,
+    async inspect(pid) {
+      inspected.push(pid);
+      return null;
+    },
+  }), true);
+  assert.deepEqual(inspected.sort((left, right) => left - right), [52011, 52012]);
+  await assert.rejects(
+    requirePreOwnershipTerminalHostEvidence(fixture.runRoot, {
+      currentLifecycle: 2,
+      expectedDesktopEvidenceName: "r8-desktop-2-process.v1.json",
+      expectedNonce: previousNonce,
+      async inspect() { return null; },
+    }),
+    codeIs("orchestrator_cleanup_unknown"),
+  );
+
+  assert.deepEqual(r8PreOwnershipLifecycleFromEvidenceNames([
+    "r8-desktop-1-process.v1.json",
+    "r8-lifecycle-1-host-process.v1.json",
+    "r8-lifecycle-1-runtime-process.v1.json",
+    "r8-desktop-2-process.v1.json",
+  ]), {
+    lifecycle: 2,
+    desktopEvidenceName: "r8-desktop-2-process.v1.json",
+  });
+  assert.throws(
+    () => r8PreOwnershipLifecycleFromEvidenceNames([
+      "r8-desktop-1-process.v1.json",
+      "r8-lifecycle-1-host-process.v1.json",
+    ]),
+    codeIs("orchestrator_cleanup_unknown"),
   );
 });
 

@@ -13,7 +13,7 @@ import {
 } from "node:fs/promises";
 import http from "node:http";
 import net from "node:net";
-import { isAbsolute, resolve } from "node:path";
+import { basename, isAbsolute, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -29,6 +29,7 @@ import {
   buildPrevalidatedDependencyArguments,
   PREFLIGHT_FAILURE_EVIDENCE_FILE,
   readExpectedSHAs,
+  validateHostRuntimeArtifactGateEvidence,
   validatePreflightFailureEvidence,
   validateProbeResult,
 } from "./feat-126-s10b-preflight.mjs";
@@ -209,6 +210,24 @@ const RUNTIME_LOG_SCAN_V4_KEYS = Object.freeze([
   "hit_origin_rule_field_class_reason_class_set_sha256",
   "hit_reason_class_set_sha256",
 ]);
+const R8_DEFAULT_OFF_EVIDENCE_V1_KEYS = Object.freeze([
+  "ambient_set_count",
+  "flag_count",
+  "flag_name_set_sha256",
+  "live_process_count",
+  "repository_authority_sha256",
+  "repository_count",
+  "run_id",
+  "schema_version",
+  "status",
+  "tracked_default_on_count",
+  "untracked_config_count",
+]);
+const R8_DEFAULT_OFF_EVIDENCE_V2_KEYS = Object.freeze([
+  ...R8_DEFAULT_OFF_EVIDENCE_V1_KEYS,
+  "tracked_config_count",
+  "tracked_config_set_sha256",
+]);
 const BUSINESS_BOUNDARY_KEYS = Object.freeze([
   "api_after_sha256",
   "api_before_sha256",
@@ -242,6 +261,32 @@ const R8_ASSERTIONS = Object.freeze({
   s10b_010: Object.freeze(["log_content_free", "bbolt_content_free", "audit_content_free", "telemetry_content_free", "process_output_content_free"]),
   s10b_011: Object.freeze(["metadata_p95_200ms", "history_p95_300ms", "reducer_10000", "db_1m_messages", "idempotency_10000"]),
 });
+export const S10B_R8_FROZEN_CASE_IDS = Object.freeze(
+  Array.from({ length: 12 }, (_, index) => `s10b_${String(index + 1).padStart(3, "0")}`),
+);
+
+export function r8CaseAuthority(caseId) {
+  const assertions = R8_ASSERTIONS[caseId];
+  if (!assertions) fail("orchestrator_case_evidence_invalid");
+  return Object.freeze({
+    caseId,
+    assertionCount: assertions.length,
+    assertionSetSha256: sha256(`${assertions.join("\n")}\n`),
+  });
+}
+
+export function allocateR8LifecycleNonce(previousNonces, generate = randomUUID) {
+  if (
+    !Array.isArray(previousNonces) || typeof generate !== "function" ||
+    previousNonces.some((nonce) => !RUN_ID_PATTERN.test(nonce ?? "")) ||
+    new Set(previousNonces).size !== previousNonces.length
+  ) fail("orchestrator_r8_authority_invalid");
+  const nonce = generate();
+  if (!RUN_ID_PATTERN.test(nonce ?? "") || previousNonces.includes(nonce)) {
+    fail("orchestrator_r8_authority_invalid");
+  }
+  return nonce;
+}
 const FROZEN_R8_CANARY_PATTERNS = Object.freeze([
   { name: "canary:prompt", value: "请为合成任务000整理订单风险并给出只读检查清单。" },
   { name: "canary:assistant_title", value: "订单风险检查 000" },
@@ -272,6 +317,7 @@ const SUMMARY_KEYS = Object.freeze([
   "cleanup",
   "completed",
   "fake_readiness",
+  "host_runtime_artifact_gate",
   "repositories",
   "run_id",
   "s10b_r5_executed",
@@ -282,6 +328,7 @@ const SUMMARY_KEYS = Object.freeze([
 const REQUIRED_COMPLETED = Object.freeze([
   "authority",
   "ports",
+  "host_runtime_artifact",
   "secret_init",
   "compose",
   "images",
@@ -468,9 +515,12 @@ const FORBIDDEN_ENV = Object.freeze([
   "FEAT126_S10B_ORCHESTRATOR_RETRY",
   "FEAT126_S10B_ORCHESTRATOR_CLEANUP",
   "VITE_FEAT126_S10_DRIVER",
+  "VITE_FEAT126_S10_R8",
   "YIJIE_FEAT126_S10_TEST_PROFILE_ENABLED",
   "YIJIE_FEAT126_S10_DRIVER_ENABLED",
   "YIJIE_FEAT126_S10_DRIVER_NONCE",
+  "YIJIE_FEAT126_S10_R8_ENABLED",
+  "YIJIE_FEAT126_S10_R8_PHASE",
   "YIJIE_FEAT126_S10_RUN_ID",
   "YIJIE_FEAT126_S10_RUN_ROOT",
   "YIJIE_FEAT126_S10P3_REAL_MAIN_CHAIN",
@@ -949,6 +999,7 @@ export function validateRepositorySummary(summary, runId, repositories) {
   }
   try {
     validateProbeResult(summary.fake_readiness, runId);
+    validateHostRuntimeArtifactGateEvidence(summary.host_runtime_artifact_gate, repositories);
     readApiRuntimeAuthorityFromPreflightSummary(summary, runId);
   } catch {
     fail("orchestrator_preflight_authority_invalid");
@@ -1221,7 +1272,7 @@ export function createR8ControlFrameReader(stream, authority) {
     async next(
       expectedKind,
       expectedCaseId = null,
-      timeoutMs = expectedKind === "case_result" ? R8_CASE_TIMEOUT_MS : CONTROL_TIMEOUT_MS,
+      timeoutMs = r8ControlTimeoutFor(expectedKind),
     ) {
       if (closed) fail("orchestrator_control_eof");
       while (buffered.indexOf(0x0a) === -1) {
@@ -1283,6 +1334,10 @@ export function createR8ControlFrameReader(stream, authority) {
     },
     destroy() { closed = true; stream.destroy(); },
   });
+}
+
+export function r8ControlTimeoutFor(kind) {
+  return kind === "case_result" ? R8_CASE_TIMEOUT_MS : CONTROL_TIMEOUT_MS;
 }
 
 async function withTimeout(promise, timeoutMs, code) {
@@ -1525,6 +1580,55 @@ export function validateNoLogResult(value) {
   return true;
 }
 
+function repositoryAuthoritySha256(repositories) {
+  if (!validateAttemptRepositories(repositories, repositories)) {
+    fail("orchestrator_default_off_invalid");
+  }
+  return sha256(REPOSITORY_KEYS.map((role) => `${role}:${repositories[role]}`).join("\n"));
+}
+
+export function validateR8DefaultOffEvidence(value, authority) {
+  const versionOne = value?.schema_version === 1 &&
+    exactKeys(value, R8_DEFAULT_OFF_EVIDENCE_V1_KEYS);
+  const versionTwo = value?.schema_version === 2 &&
+    exactKeys(value, R8_DEFAULT_OFF_EVIDENCE_V2_KEYS);
+  if (
+    value === null || Array.isArray(value) || typeof value !== "object" ||
+    (!versionOne && !versionTwo) ||
+    value.status !== "passed" || value.run_id !== authority?.runId ||
+    value.repository_count !== REPOSITORY_KEYS.length ||
+    value.repository_authority_sha256 !== repositoryAuthoritySha256(authority?.repositories) ||
+    value.flag_count !== FORBIDDEN_ENV.length ||
+    value.flag_name_set_sha256 !== sha256([...FORBIDDEN_ENV].sort(asciiCompare).join("\n")) ||
+    (versionTwo && (
+      !Number.isSafeInteger(value.tracked_config_count) || value.tracked_config_count <= 0 ||
+      !DIGEST_PATTERN.test(value.tracked_config_set_sha256 ?? "") ||
+      value.tracked_config_set_sha256 === sha256("")
+    )) ||
+    value.ambient_set_count !== 0 || value.tracked_default_on_count !== 0 ||
+    value.untracked_config_count !== 0 || value.live_process_count !== 0
+  ) fail("orchestrator_default_off_invalid");
+  return Object.freeze({ ...value });
+}
+
+export function buildR8DefaultOffEvidence(authority, metrics) {
+  return validateR8DefaultOffEvidence({
+    schema_version: 2,
+    status: "passed",
+    run_id: authority?.runId,
+    repository_count: REPOSITORY_KEYS.length,
+    repository_authority_sha256: repositoryAuthoritySha256(authority?.repositories),
+    flag_count: FORBIDDEN_ENV.length,
+    flag_name_set_sha256: sha256([...FORBIDDEN_ENV].sort(asciiCompare).join("\n")),
+    tracked_config_count: metrics?.trackedConfigCount,
+    tracked_config_set_sha256: metrics?.trackedConfigSetSha256,
+    ambient_set_count: metrics?.ambientSetCount,
+    tracked_default_on_count: metrics?.trackedDefaultOnCount,
+    untracked_config_count: metrics?.untrackedConfigCount,
+    live_process_count: metrics?.liveProcessCount,
+  }, authority);
+}
+
 export function validateRuntimeLogScan(value, runId) {
   const versionOne = value?.schema_version === 1;
   const versionTwo = value?.schema_version === 2;
@@ -1711,8 +1815,7 @@ export function buildR8OrchestratorPlan(input) {
 
 export function validateR8CaseEvidence(value, authority) {
   const expectedCase = S10BO1_CASES[value?.ordinal - 1];
-  const expectedAssertions = R8_ASSERTIONS[expectedCase];
-  const expectedAssertionDigest = sha256(`${expectedAssertions.join("\n")}\n`);
+  const expectedAuthority = r8CaseAuthority(expectedCase);
   if (
     value === null || Array.isArray(value) || typeof value !== "object" ||
     !exactKeys(value, R8_CASE_EVIDENCE_KEYS) || value.schema_version !== 1 ||
@@ -1720,8 +1823,8 @@ export function validateR8CaseEvidence(value, authority) {
     !Number.isSafeInteger(value.ordinal) || value.ordinal < 1 || value.ordinal > 10 ||
     value.case_id !== expectedCase || !Number.isSafeInteger(value.frame_sequence) ||
     value.frame_sequence < 2 || value.frame_sequence > 8 ||
-    value.assertion_count !== expectedAssertions.length ||
-    value.assertion_set_sha256 !== expectedAssertionDigest
+    value.assertion_count !== expectedAuthority.assertionCount ||
+    value.assertion_set_sha256 !== expectedAuthority.assertionSetSha256
   ) fail("orchestrator_case_evidence_invalid");
   return Object.freeze({ ...value });
 }
@@ -2082,11 +2185,16 @@ export function r8NoLogRequiredEvidenceNames(context) {
   const caseCount = Math.min(context.r8CaseEvidence?.length ?? 0, completedCases);
   for (let ordinal = 1; ordinal <= caseCount; ordinal += 1) {
     names.add(`r8-case-${String(ordinal).padStart(2, "0")}.v1.json`);
+    names.add(`r8-runtime-log-scan-${String(ordinal).padStart(2, "0")}.v1.json`);
+    if (ordinal !== context.r8NoLogCheckpointInProgressOrdinal) {
+      names.add(`r8-no-log-${String(ordinal).padStart(2, "0")}.v1.json`);
+    }
   }
   if (context.r8Business && reachedPhase === "s10b_011" && caseCount === 10) {
     names.add("r8-api-verifier-after.v1.json");
     names.add("r8-business-boundary.v1.json");
   }
+  if (context.r8DefaultOffEvidence) names.add("r8-default-off.v1.json");
   return Object.freeze([...names].sort(asciiCompare));
 }
 
@@ -2429,6 +2537,12 @@ export async function runR8Flow(authority, operations) {
   const failAs = (error, fallback) => error instanceof S10BO1OrchestratorError
     ? error
     : new S10BO1OrchestratorError(fallback);
+  const executeAndScanCase = async (caseId) => {
+    await operations.executeCase(caseId);
+    machine.transition(caseId);
+    const checkpoint = await operations.scanNoLogCheckpoint(caseId);
+    validateNoLogResult(checkpoint);
+  };
   try {
     machine.transition("preflight_running");
     const summary = await operations.runPreflight();
@@ -2448,13 +2562,11 @@ export async function runR8Flow(authority, operations) {
     machine.transition("host_ready");
     machine.transition("runtime_ready");
     for (const caseId of ["s10b_002", "s10b_003"]) {
-      await operations.executeCase(caseId);
-      machine.transition(caseId);
+      await executeAndScanCase(caseId);
     }
     await operations.startFakeGeneration(S10B_R8_FAKE_GENERATIONS[1]);
     for (const caseId of ["s10b_004"]) {
-      await operations.executeCase(caseId);
-      machine.transition(caseId);
+      await executeAndScanCase(caseId);
     }
     await operations.completePlannedRestart();
     await operations.startFakeGeneration(S10B_R8_FAKE_GENERATIONS[2]);
@@ -2463,12 +2575,10 @@ export async function runR8Flow(authority, operations) {
     for (const caseId of [
       "s10b_005_planned_restart", "s10b_006", "s10b_007", "s10b_008", "s10b_009", "s10b_010",
     ]) {
-      await operations.executeCase(caseId);
-      machine.transition(caseId);
+      await executeAndScanCase(caseId);
     }
     await operations.startFakeGeneration(S10B_R8_FAKE_GENERATIONS[3]);
-    await operations.executeCase("s10b_011");
-    machine.transition("s10b_011");
+    await executeAndScanCase("s10b_011");
     await operations.completeAbort();
   } catch (error) {
     primaryFailure = failAs(error, "orchestrator_internal_failure");
@@ -3871,6 +3981,7 @@ async function loadRunContext(authority, attempt) {
     processHistory: [],
     descendantProcessHistory: [],
     ownershipHistory: [],
+    r8LifecycleNonces: [],
     r8CaseEvidence: [],
     r8FakeAuthorities: [],
   };
@@ -3995,6 +4106,114 @@ async function verifyRepositoryAuthority(repositories, signal) {
     if (head !== repositories[role]) fail(`orchestrator_${role}_sha_mismatch`);
     if (status.length !== 0) fail(`orchestrator_${role}_worktree_dirty`);
   }
+}
+
+function defaultOffConfigPath(relativePath) {
+  const normalized = relativePath.replaceAll("\\", "/");
+  const basename = normalized.split("/").at(-1) ?? "";
+  return basename === "package.json" || basename === "Cargo.toml" ||
+    basename === "tauri.conf.json" || basename.startsWith(".env") ||
+    normalized.startsWith(".github/workflows/") ||
+    /(?:^|\/)(?:docker-)?compose(?:[.-][^/]*)?\.(?:ya?ml|json)$/.test(normalized) ||
+    /(?:^|\/)(?:vite|tauri|runtime|feature)[.-]config\.(?:js|mjs|cjs|ts|json|ya?ml|toml)$/.test(
+      normalized,
+    );
+}
+
+function defaultOnAssignmentCount(content) {
+  let count = 0;
+  for (const name of FORBIDDEN_ENV) {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = new RegExp(
+      `(?:^|[\\s,{])['\"]?${escaped}['\"]?\\s*(?:=|:)\\s*['\"]?true['\"]?(?=$|[\\s,}#;])`,
+      "gm",
+    );
+    if (pattern.test(content)) count += 1;
+  }
+  return count;
+}
+
+async function readTrackedDefaultConfig(repository, relativePath) {
+  if (
+    typeof relativePath !== "string" || relativePath.length === 0 || isAbsolute(relativePath) ||
+    relativePath.split("/").includes("..")
+  ) fail("orchestrator_default_off_invalid");
+  let handle;
+  try {
+    handle = await open(resolve(repository, relativePath), constants.O_RDONLY | constants.O_NOFOLLOW);
+    const metadata = await handle.stat();
+    if (!metadata.isFile() || metadata.size > 4 * 1024 * 1024) {
+      fail("orchestrator_default_off_invalid");
+    }
+    return new TextDecoder("utf-8", { fatal: true }).decode(await handle.readFile());
+  } catch (error) {
+    if (error instanceof S10BO1OrchestratorError) throw error;
+    fail("orchestrator_default_off_invalid");
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+export async function verifyR8DefaultOff(context, cleanup, operations = {}) {
+  if (!expectedR8(context) || !validateCleanupClosure(cleanup)) {
+    fail("orchestrator_default_off_invalid");
+  }
+  const repositories = operations.repositories ?? REPOSITORIES;
+  const runner = operations.run ?? runCommand;
+  const environment = operations.environment ?? process.env;
+  if (
+    repositories === null || Array.isArray(repositories) || typeof repositories !== "object" ||
+    !exactKeys(repositories, REPOSITORY_KEYS) ||
+    REPOSITORY_KEYS.some((role) => (
+      typeof repositories[role] !== "string" || !isAbsolute(repositories[role])
+    ))
+  ) fail("orchestrator_default_off_invalid");
+  let trackedDefaultOnCount = 0;
+  let untrackedConfigCount = 0;
+  const trackedConfigSet = [];
+  for (const role of REPOSITORY_KEYS) {
+    const repository = repositories[role];
+    const head = (await runner("default_off", "git", ["-C", repository, "rev-parse", "HEAD"], {
+      signal: context.parentSignal,
+    })).trim();
+    const status = await runner("default_off", "git", [
+      "-C", repository, "status", "--porcelain", "--untracked-files=all",
+    ], { signal: context.parentSignal });
+    if (head !== context.repositories[role] || status.length !== 0) {
+      fail("orchestrator_default_off_invalid");
+    }
+    const tracked = (await runner("default_off", "git", ["-C", repository, "ls-files", "-z"], {
+      signal: context.parentSignal,
+    })).split("\0").filter(Boolean).filter(defaultOffConfigPath).sort(asciiCompare);
+    const untracked = (await runner("default_off", "git", [
+      "-C", repository, "ls-files", "--others", "--exclude-standard", "-z",
+    ], { signal: context.parentSignal })).split("\0").filter(Boolean).filter(defaultOffConfigPath);
+    untrackedConfigCount += untracked.length;
+    for (const relativePath of tracked) {
+      trackedConfigSet.push(`${role}:${relativePath}`);
+      trackedDefaultOnCount += defaultOnAssignmentCount(
+        await readTrackedDefaultConfig(repository, relativePath),
+      );
+    }
+    const finalHead = (await runner(
+      "default_off",
+      "git",
+      ["-C", repository, "rev-parse", "HEAD"],
+      { signal: context.parentSignal },
+    )).trim();
+    const finalStatus = await runner("default_off", "git", [
+      "-C", repository, "status", "--porcelain", "--untracked-files=all",
+    ], { signal: context.parentSignal });
+    if (finalHead !== head || finalStatus.length !== 0) fail("orchestrator_default_off_invalid");
+  }
+  return buildR8DefaultOffEvidence(context, {
+    ambientSetCount: FORBIDDEN_ENV.filter((name) => Object.hasOwn(environment, name)).length,
+    trackedConfigCount: trackedConfigSet.length,
+    trackedConfigSetSha256: sha256(trackedConfigSet.sort(asciiCompare).join("\n")),
+    trackedDefaultOnCount,
+    untrackedConfigCount,
+    liveProcessCount: cleanup.processes,
+  });
 }
 
 async function buildDesktop(context) {
@@ -5548,6 +5767,36 @@ async function scanNoLogFiles(files, literalPatterns, forbiddenPatterns) {
   return Object.freeze({ rowCount, hitCount });
 }
 
+export async function scanOpaqueNoLogFile(path, literalPatterns, forbiddenPatterns, required) {
+  let metadata;
+  try {
+    metadata = await lstat(path);
+  } catch (error) {
+    if (!required && error?.code === "ENOENT") {
+      return Object.freeze({ present: false, rowCount: 0, hitCount: 0 });
+    }
+    fail("orchestrator_no_log_invalid");
+  }
+  if (
+    !metadata.isFile() || metadata.isSymbolicLink() || !ownedByCurrentUser(metadata) ||
+    metadata.nlink !== 1 || (metadata.mode & 0o777) !== 0o600 ||
+    metadata.size > 16 * 1024 * 1024 || (await realpath(path)) !== path
+  ) fail("orchestrator_no_log_invalid");
+  const content = await readSecureFile(path, 16 * 1024 * 1024, [0o600], 0);
+  const byteText = content.toString("latin1");
+  const folded = byteText.toLowerCase();
+  const hits = new Set();
+  for (const { name, value } of literalPatterns) {
+    const encoded = Buffer.from(value, "utf8").toString("latin1").toLowerCase();
+    if (encoded.length > 0 && folded.includes(encoded)) hits.add(name);
+  }
+  for (const [name, pattern] of forbiddenPatterns) {
+    pattern.lastIndex = 0;
+    if (pattern.test(byteText)) hits.add(name);
+  }
+  return Object.freeze({ present: true, rowCount: 1, hitCount: hits.size });
+}
+
 async function scanRuntimeLogDatabase(path, literalPatterns, forbiddenPatterns, required) {
   let metadata;
   try {
@@ -5928,12 +6177,13 @@ export async function scanNoLog(context) {
     }
   }
   const preflightOnly = ["preflight_failed", "preflight_context_invalid"].includes(context.phase);
+  const runtimeLogScanEvidenceName = context.runtimeLogScanEvidenceName ?? "runtime-log-scan.v1.json";
   let runtimeLogScan = context.runtimeLogScan;
   if (!preflightOnly && !runtimeLogScan) {
     try {
       runtimeLogScan = validateRuntimeLogScan(
         JSON.parse((await readSecureFile(
-          resolve(context.evidenceRoot, "runtime-log-scan.v1.json"),
+          resolve(context.evidenceRoot, runtimeLogScanEvidenceName),
           4096,
         )).toString("utf8")),
         context.runId,
@@ -5942,7 +6192,7 @@ export async function scanNoLog(context) {
       fail("orchestrator_no_log_invalid");
     }
   }
-  if (!preflightOnly) requiredFiles.add(resolve(context.evidenceRoot, "runtime-log-scan.v1.json"));
+  if (!preflightOnly) requiredFiles.add(resolve(context.evidenceRoot, runtimeLogScanEvidenceName));
   if (context.apiVerifierBefore) {
     const names = context.r8 ? r8NoLogRequiredEvidenceNames(context) : [
       "api-verifier-before.v1.json",
@@ -5963,6 +6213,12 @@ export async function scanNoLog(context) {
     forbiddenPatterns,
     Boolean(context.runtimeEvidence || context.descendantProcesses?.runtime),
   );
+  const hostDatabaseScan = await scanOpaqueNoLogFile(
+    resolve(context.runRoot, "host-home", "sessions.db"),
+    literalPatterns,
+    forbiddenPatterns,
+    Boolean(context.hostEvidence || context.descendantProcesses?.host),
+  );
   const scan = await scanNoLogFiles(files, literalPatterns, forbiddenPatterns);
   return Object.freeze({
     schema_version: 1,
@@ -5970,9 +6226,12 @@ export async function scanNoLog(context) {
     coverage: preflightOnly
       ? "all_preflight_log_and_evidence_sources"
       : "all_run_log_and_evidence_sources",
-    file_count: files.length + (runtimeDatabaseScan.present ? 1 : 0),
-    row_count: scan.rowCount + runtimeDatabaseScan.rowCount + (runtimeLogScan?.row_count ?? 0),
-    hit_count: scan.hitCount + runtimeDatabaseScan.hitCount + (runtimeLogScan?.hit_count ?? 0),
+    file_count: files.length + (runtimeDatabaseScan.present ? 1 : 0) +
+      (hostDatabaseScan.present ? 1 : 0),
+    row_count: scan.rowCount + runtimeDatabaseScan.rowCount + hostDatabaseScan.rowCount +
+      (runtimeLogScan?.row_count ?? 0),
+    hit_count: scan.hitCount + runtimeDatabaseScan.hitCount + hostDatabaseScan.hitCount +
+      (runtimeLogScan?.hit_count ?? 0),
     external_source_count: runtimeLogScan?.source_count ?? 0,
     external_row_count: runtimeLogScan?.row_count ?? 0,
     external_source_set_sha256: runtimeLogScan?.source_set_sha256 ?? sha256(""),
@@ -6002,19 +6261,216 @@ function preOwnershipDescendantAbsenceRequired(roles) {
   return roles.includes("desktop") && !["host", "runtime"].every((role) => roles.includes(role));
 }
 
+export function r8PreOwnershipLifecycleFromEvidenceNames(evidenceNames) {
+  if (!Array.isArray(evidenceNames) || evidenceNames.some((name) => typeof name !== "string")) {
+    fail("orchestrator_cleanup_unknown");
+  }
+  let candidate = null;
+  for (const lifecycle of [1, 2]) {
+    const desktopName = `r8-desktop-${lifecycle}-process.v1.json`;
+    const hostName = `r8-lifecycle-${lifecycle}-host-process.v1.json`;
+    const runtimeName = `r8-lifecycle-${lifecycle}-runtime-process.v1.json`;
+    const desktop = evidenceNames.includes(desktopName);
+    const host = evidenceNames.includes(hostName);
+    const runtime = evidenceNames.includes(runtimeName);
+    if (host !== runtime || ((host || runtime) && !desktop)) fail("orchestrator_cleanup_unknown");
+    if (desktop && !host) {
+      if (candidate !== null) fail("orchestrator_cleanup_unknown");
+      candidate = Object.freeze({
+        lifecycle,
+        desktopEvidenceName: desktopName,
+      });
+    } else if (candidate !== null && desktop) {
+      fail("orchestrator_cleanup_unknown");
+    }
+  }
+  return candidate;
+}
+
 export async function requirePreOwnershipDescendantsAbsent(runRoot) {
+  return await requirePreOwnershipTerminalHostEvidence(runRoot);
+}
+
+async function secureFileMetadata(path, maximumBytes) {
+  let handle;
+  try {
+    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const metadata = await handle.stat();
+    if (
+      !metadata.isFile() || metadata.isSymbolicLink() || !ownedByCurrentUser(metadata) ||
+      metadata.nlink !== 1 || (metadata.mode & 0o777) !== 0o600 ||
+      metadata.size > maximumBytes || (await realpath(path)) !== path
+    ) fail("orchestrator_cleanup_unknown");
+    return metadata;
+  } finally {
+    await handle?.close();
+  }
+}
+
+function preOwnershipTerminalHostEvidenceValid(value, authority) {
+  const common = value !== null && !Array.isArray(value) && typeof value === "object" &&
+    exactKeys(value, HOST_PROCESS_EVIDENCE_KEYS) && value.schemaVersion === 1 &&
+    value.runId === authority.runId && value.role === "agent_host_child" &&
+    value.ppid === authority.desktopPid && value.binarySha256 === authority.binarySha256 &&
+    RUN_ID_PATTERN.test(value.instanceNonce ?? "") &&
+    Number.isSafeInteger(value.startedAtUnixMs) && value.startedAtUnixMs > 0 &&
+    Number.isSafeInteger(value.endedAtUnixMs) &&
+    value.endedAtUnixMs >= value.startedAtUnixMs &&
+    Number.isSafeInteger(value.stdoutBytes) && value.stdoutBytes >= 0 &&
+    Number.isSafeInteger(value.stderrBytes) && value.stderrBytes >= 0 &&
+    value.stdoutBytes <= 256 * 1024 && value.stderrBytes <= 256 * 1024 &&
+    value.stdoutTruncated === false && value.stderrTruncated === false &&
+    value.logLimitBytes === 256 * 1024;
+  if (!common) return false;
+  if (value.state === "spawn_failed") {
+    return value.pid === null && value.exitCode === null &&
+      value.stdoutBytes === 0 && value.stderrBytes === 0;
+  }
+  return ["exited_during_startup", "startup_timeout", "stopped", "unexpected_exit"]
+    .includes(value.state) && Number.isSafeInteger(value.pid) && value.pid > 1 &&
+    (value.exitCode === null || Number.isSafeInteger(value.exitCode));
+}
+
+async function requireNoPreOwnershipOwnershipEvidence(evidenceRoot, currentLifecycle = null) {
+  let entries;
+  try {
+    entries = await readdir(evidenceRoot, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+  await requireOwnerDirectory(evidenceRoot);
+  const unscopedOwnershipName = /^(?:host|runtime)-(?:process|evidence|stopped-evidence)\.v1\.json$/;
+  const scopedOwnershipName = /^r8-lifecycle-(\d+)-(?:host|runtime)-(?:process|evidence|stopped-evidence)\.v1\.json$/;
+  for (const entry of entries) {
+    if (unscopedOwnershipName.test(entry.name)) fail("orchestrator_cleanup_unknown");
+    const scoped = scopedOwnershipName.exec(entry.name);
+    if (scoped && (currentLifecycle === null || Number(scoped[1]) >= currentLifecycle)) {
+      fail("orchestrator_cleanup_unknown");
+    }
+  }
+  return entries;
+}
+
+export async function requirePreOwnershipTerminalHostEvidence(runRoot, options = {}) {
   if (typeof runRoot !== "string" || !isAbsolute(runRoot)) fail("orchestrator_cleanup_unknown");
   try {
+    const scopedLifecycle = options.currentLifecycle !== undefined;
+    const currentLifecycle = scopedLifecycle ? options.currentLifecycle : null;
+    const expectedDesktopEvidenceName = scopedLifecycle
+      ? `r8-desktop-${currentLifecycle}-process.v1.json`
+      : null;
+    if (
+      scopedLifecycle && (
+        ![1, 2].includes(currentLifecycle) ||
+        (options.expectedNonce !== undefined && !RUN_ID_PATTERN.test(options.expectedNonce ?? "")) ||
+        (options.expectedDesktopEvidenceName !== undefined &&
+          options.expectedDesktopEvidenceName !== expectedDesktopEvidenceName)
+      )
+    ) fail("orchestrator_cleanup_unknown");
     await requireOwnerDirectory(runRoot);
+    const runId = basename(runRoot);
+    const evidenceRoot = resolve(runRoot, "orchestrator-evidence");
+    const evidenceEntries = await requireNoPreOwnershipOwnershipEvidence(
+      evidenceRoot,
+      currentLifecycle,
+    );
+    const hostRoot = resolve(runRoot, "host");
+    let hostMetadata;
+    try {
+      hostMetadata = await lstat(hostRoot);
+    } catch (error) {
+      if (error?.code === "ENOENT" && !scopedLifecycle) return true;
+      throw error;
+    }
+    if (!RUN_ID_PATTERN.test(runId)) fail("orchestrator_cleanup_unknown");
+    if (!hostMetadata.isDirectory() || hostMetadata.isSymbolicLink()) {
+      fail("orchestrator_cleanup_unknown");
+    }
+    await requireOwnerDirectory(hostRoot);
+    const hostEntries = await readdir(hostRoot, { withFileTypes: true });
+    const expectedInstanceCount = scopedLifecycle ? currentLifecycle : 1;
+    if (
+      hostEntries.length !== expectedInstanceCount ||
+      hostEntries.some((entry) => (
+        !entry.isDirectory() || entry.isSymbolicLink() || !RUN_ID_PATTERN.test(entry.name)
+      )) || new Set(hostEntries.map((entry) => entry.name)).size !== hostEntries.length
+    ) fail("orchestrator_cleanup_unknown");
+
+    const desktopCandidates = new Map();
+    for (const entry of evidenceEntries) {
+      if (!/^(?:desktop-process|r8-desktop-\d+-process)\.v1\.json$/.test(entry.name)) continue;
+      const record = validateProcessRecord(
+        JSON.parse((await readSecureFile(resolve(evidenceRoot, entry.name), 4096)).toString("utf8")),
+        runId,
+        "desktop",
+      );
+      if (desktopCandidates.has(record.pid)) fail("orchestrator_cleanup_unknown");
+      desktopCandidates.set(record.pid, Object.freeze({ evidenceName: entry.name, record }));
+    }
+    let hostBinarySha256;
+    try {
+      hostBinarySha256 = await hashFile(resolve(runRoot, "bin/yijie-agent-host"));
+    } catch {
+      fail("orchestrator_cleanup_unknown");
+    }
+    let currentEvidence = null;
+    for (const entry of hostEntries) {
+      const instanceRoot = resolve(hostRoot, entry.name);
+      await requireOwnerDirectory(instanceRoot);
+      const instanceEntries = await readdir(instanceRoot, { withFileTypes: true });
+      const expectedFiles = ["process.json", "stderr.log", "stdout.log"];
+      if (
+        instanceEntries.length !== expectedFiles.length ||
+        instanceEntries.some((instanceEntry) => (
+          !instanceEntry.isFile() || instanceEntry.isSymbolicLink()
+        )) ||
+        JSON.stringify(instanceEntries.map((instanceEntry) => instanceEntry.name).sort(asciiCompare)) !==
+          JSON.stringify(expectedFiles)
+      ) fail("orchestrator_cleanup_unknown");
+      const processBytes = await readSecureFile(resolve(instanceRoot, "process.json"), 16 * 1024);
+      const processEvidence = JSON.parse(processBytes.toString("utf8"));
+      if (!processBytes.equals(Buffer.from(`${JSON.stringify(processEvidence)}\n`, "utf8"))) {
+        fail("orchestrator_cleanup_unknown");
+      }
+      const desktop = desktopCandidates.get(processEvidence.ppid);
+      if (
+        !desktop || entry.name !== processEvidence.instanceNonce ||
+        !preOwnershipTerminalHostEvidenceValid(processEvidence, {
+          runId,
+          desktopPid: desktop.record.pid,
+          binarySha256: hostBinarySha256,
+        })
+      ) fail("orchestrator_cleanup_unknown");
+      const stdoutMetadata = await secureFileMetadata(
+        resolve(instanceRoot, "stdout.log"),
+        256 * 1024,
+      );
+      const stderrMetadata = await secureFileMetadata(
+        resolve(instanceRoot, "stderr.log"),
+        256 * 1024,
+      );
+      if (
+        stdoutMetadata.size !== processEvidence.stdoutBytes ||
+        stderrMetadata.size !== processEvidence.stderrBytes
+      ) fail("orchestrator_cleanup_unknown");
+      if (processEvidence.pid !== null) {
+        const inspect = options.inspect ?? inspectProcessIdentityWithRetry;
+        if (await inspect(processEvidence.pid) !== null) fail("orchestrator_cleanup_unknown");
+      }
+      if (!scopedLifecycle || desktop.evidenceName === expectedDesktopEvidenceName) {
+        if (currentEvidence !== null) fail("orchestrator_cleanup_unknown");
+        currentEvidence = processEvidence;
+      }
+    }
+    if (
+      currentEvidence === null ||
+      (options.expectedNonce !== undefined && currentEvidence.instanceNonce !== options.expectedNonce)
+    ) fail("orchestrator_cleanup_unknown");
+    return true;
   } catch {
     fail("orchestrator_cleanup_unknown");
   }
-  try {
-    await lstat(resolve(runRoot, "host"));
-  } catch (error) {
-    if (error?.code === "ENOENT") return true;
-  }
-  fail("orchestrator_cleanup_unknown");
 }
 
 async function cleanupLiveContext(context) {
@@ -6022,8 +6478,9 @@ async function cleanupLiveContext(context) {
   if (context.composeLogsRequired) {
     try {
       context.runtimeLogScan = await captureRuntimeLogScan(context);
+      context.runtimeLogScanEvidenceName = "runtime-log-scan.v1.json";
       await writeSecureJson(
-        resolve(context.evidenceRoot, "runtime-log-scan.v1.json"),
+        resolve(context.evidenceRoot, context.runtimeLogScanEvidenceName),
         context.runtimeLogScan,
       );
     } catch {
@@ -6049,13 +6506,25 @@ async function cleanupLiveContext(context) {
   }
   cleanupUnknown ||= outcomes.includes("unknown") || outcomes.includes("foreign_identity_preserved");
 
+  const currentR8Lifecycle = expectedR8(context) &&
+    context.currentR8Lifecycle?.ownershipObserved === false
+    ? context.currentR8Lifecycle
+    : null;
   const observedRoles = [
     ...Object.keys(context.processes ?? {}),
     ...Object.keys(context.descendantProcesses ?? {}),
   ];
-  if (preOwnershipDescendantAbsenceRequired(observedRoles)) {
+  if (currentR8Lifecycle || preOwnershipDescendantAbsenceRequired(observedRoles)) {
     try {
-      await requirePreOwnershipDescendantsAbsent(context.runRoot);
+      if (currentR8Lifecycle) {
+        await requirePreOwnershipTerminalHostEvidence(context.runRoot, {
+          currentLifecycle: currentR8Lifecycle.lifecycle,
+          expectedDesktopEvidenceName: currentR8Lifecycle.desktopEvidenceName,
+          expectedNonce: currentR8Lifecycle.nonce,
+        });
+      } else {
+        await requirePreOwnershipDescendantsAbsent(context.runRoot);
+      }
     } catch {
       cleanupUnknown = true;
     }
@@ -6232,8 +6701,10 @@ function createLiveOperations(authority, attempt, parentGuard = createParentIden
     processHistory: [],
     descendantProcessHistory: [],
     ownershipHistory: [],
+    r8LifecycleNonces: [],
     r8CaseEvidence: [],
     r8FakeAuthorities: [],
+    r8NoLogCheckpointInProgressOrdinal: null,
     parentSignal: parentController.signal,
   };
   let parentDead = false;
@@ -6399,7 +6870,15 @@ function createLiveOperations(authority, attempt, parentGuard = createParentIden
         fail("orchestrator_r8_authority_invalid");
       }
       const priorPhase = context.phase;
-      context.nonce = randomUUID();
+      context.r8LifecycleNonces ??= [];
+      context.nonce = allocateR8LifecycleNonce(context.r8LifecycleNonces);
+      context.r8LifecycleNonces.push(context.nonce);
+      context.currentR8Lifecycle = {
+        lifecycle,
+        nonce: context.nonce,
+        desktopEvidenceName: `r8-desktop-${lifecycle}-process.v1.json`,
+        ownershipObserved: false,
+      };
       context.r8ControlSequence = 0;
       if (lifecycle === 1) context.phase = "desktop_starting";
       await Promise.race([startDesktop(context, {
@@ -6432,6 +6911,12 @@ function createLiveOperations(authority, attempt, parentGuard = createParentIden
         hostStoppedEvidenceName: `${suffix}-host-stopped-evidence.v1.json`,
       });
       validateOwnership(ownership);
+      if (
+        context.currentR8Lifecycle?.lifecycle !== lifecycle ||
+        context.currentR8Lifecycle.nonce !== context.nonce ||
+        context.ownershipHistory.at(-1)?.hostEvidence?.instanceNonce !== context.nonce
+      ) fail("orchestrator_ownership_invalid");
+      context.currentR8Lifecycle.ownershipObserved = true;
       context.phase = lifecycle === 1 ? "runtime_ready" : priorPhase;
       requireParentAlive();
       return ownership;
@@ -6462,6 +6947,31 @@ function createLiveOperations(authority, attempt, parentGuard = createParentIden
       context.r8CaseEvidence.push(evidence);
       context.phase = caseId;
       requireParentAlive();
+    },
+    async scanNoLogCheckpoint(caseId) {
+      requireParentAlive();
+      const ordinal = S10BO1_CASES.slice(0, -1).indexOf(caseId) + 1;
+      if (
+        ordinal !== context.r8CaseEvidence.length ||
+        context.r8CaseEvidence.at(-1)?.case_id !== caseId
+      ) fail("orchestrator_control_order_invalid");
+      await captureRunScopedNoLogAuthority(context);
+      const suffix = String(ordinal).padStart(2, "0");
+      context.r8NoLogCheckpointInProgressOrdinal = ordinal;
+      context.runtimeLogScanEvidenceName = `r8-runtime-log-scan-${suffix}.v1.json`;
+      context.runtimeLogScan = await captureRuntimeLogScan(context);
+      await writeSecureJson(
+        resolve(context.evidenceRoot, context.runtimeLogScanEvidenceName),
+        context.runtimeLogScan,
+      );
+      const result = await scanNoLog(context);
+      await writeSecureJson(resolve(context.evidenceRoot, `r8-no-log-${suffix}.v1.json`), result);
+      validateNoLogResult(result);
+      context.r8NoLogCheckpointInProgressOrdinal = null;
+      context.runtimeLogScan = undefined;
+      context.runtimeLogScanEvidenceName = undefined;
+      requireParentAlive();
+      return result;
     },
     async completePlannedRestart() {
       requireParentAlive();
@@ -6587,6 +7097,13 @@ function createLiveOperations(authority, attempt, parentGuard = createParentIden
     async cleanup() {
       if (!context) fail("orchestrator_cleanup_unknown");
       const result = await cleanupLiveContext(context);
+      if (expectedR8(authority) && context.runRootPresent) {
+        context.r8DefaultOffEvidence = await verifyR8DefaultOff(context, result);
+        await writeSecureJson(
+          resolve(context.evidenceRoot, "r8-default-off.v1.json"),
+          context.r8DefaultOffEvidence,
+        );
+      }
       requireParentAlive();
       return result;
     },
@@ -6735,7 +7252,10 @@ export async function loadExistingProcessRecords(
     if (JSON.stringify(roles) !== JSON.stringify(expectedRoles)) {
       fail("orchestrator_existing_evidence_incomplete");
     }
-    validateR8ProcessRecordSet(records, observedNames, options.requireComplete === true);
+    validateR8ProcessRecordSet(records, observedNames, {
+      phase: options.phase ?? "s10b_011",
+      complete: options.requireComplete === true,
+    });
   } else {
     validateExistingProcessRecordSet(records, expectedRoles);
   }
@@ -6818,9 +7338,24 @@ async function reconcileExistingRun(authority, runRoot, options = {}) {
       if (!["absent", "stopped"].includes(outcome)) unknown = true;
     }
   }
-  if (preOwnershipDescendantAbsenceRequired(expectedRoles)) {
+  let r8PreOwnership = null;
+  if (expectedR8(authority)) {
     try {
-      await requirePreOwnershipDescendantsAbsent(runRoot);
+      r8PreOwnership = r8PreOwnershipLifecycleFromEvidenceNames(records.evidenceNames);
+    } catch {
+      unknown = true;
+    }
+  }
+  if (r8PreOwnership || preOwnershipDescendantAbsenceRequired(expectedRoles)) {
+    try {
+      if (r8PreOwnership) {
+        await requirePreOwnershipTerminalHostEvidence(runRoot, {
+          currentLifecycle: r8PreOwnership.lifecycle,
+          expectedDesktopEvidenceName: r8PreOwnership.desktopEvidenceName,
+        });
+      } else {
+        await requirePreOwnershipDescendantsAbsent(runRoot);
+      }
     } catch {
       unknown = true;
     }
@@ -7282,6 +7817,14 @@ async function loadReconcileNoLogContext(authority, attempt, failure, closure, r
         authority.runId,
       );
       if (JSON.stringify(reconstructed) !== JSON.stringify(context.r8Business)) {
+        fail("orchestrator_existing_evidence_incomplete");
+      }
+      try {
+        context.r8DefaultOffEvidence = validateR8DefaultOffEvidence(
+          await readSecureJson(resolve(evidenceRoot, "r8-default-off.v1.json")),
+          authority,
+        );
+      } catch {
         fail("orchestrator_existing_evidence_incomplete");
       }
     }

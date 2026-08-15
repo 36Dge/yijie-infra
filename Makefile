@@ -1,4 +1,4 @@
-.PHONY: dev-up dev-down dev-status feat-125-nonprod-template feat-125-nonprod-ready feat-125-nonprod-online feat-125-local-template feat-125-local-worktree-reference feat-125-local-init-secrets feat-125-local-up feat-125-local-stop feat-125-local-status feat-125-local-provision-users feat-125-local-api-db feat-125-local-prepare feat-125-local-trust-ca feat-125-local-ca-status feat-125-local-untrust-ca feat-125-local-ready feat-125-local-online feat-125-s7-bearer-matrix feat-126-s10-init-secrets feat-126-s10-config feat-126-s10-verify-images feat-126-s10-up feat-126-s10-stop feat-126-s10-status feat-126-s10-export-ca feat-126-s10-verify-runtime feat-126-s10-provision-users feat-126-s10-api-migrate feat-126-s10-api-bootstrap feat-126-s10-api-runtime-profile feat-126-s10b-preflight feat-126-s10b-api-continuation feat-126-s10b-orchestrator feat-126-s10b-r8 lint test plan apply deploy rollback
+.PHONY: dev-up dev-down dev-status feat-125-nonprod-template feat-125-nonprod-ready feat-125-nonprod-online feat-125-local-template feat-125-local-worktree-reference feat-125-local-init-secrets feat-125-local-up feat-125-local-stop feat-125-local-status feat-125-local-provision-users feat-125-local-api-db feat-125-local-prepare feat-125-local-trust-ca feat-125-local-ca-status feat-125-local-untrust-ca feat-125-local-ready feat-125-local-online feat-125-s7-bearer-matrix feat-126-s10-init-secrets feat-126-s10-config feat-126-s10-verify-images feat-126-s10-up feat-126-s10-stop feat-126-s10-status feat-126-s10-export-ca feat-126-s10-verify-runtime feat-126-s10-provision-users feat-126-s10-api-migrate feat-126-s10-api-bootstrap feat-126-s10-api-runtime-profile feat-126-s10b-preflight feat-126-s10b-api-continuation feat-126-s10b-orchestrator feat-126-s10b-r8-rehearsal feat-126-s10b-r8 lint test plan apply deploy rollback
 
 dev-up:
 	docker compose -f docker-compose.local.yml up -d --wait
@@ -217,6 +217,9 @@ feat-126-s10b-r8:
 	FEAT126_S10B_RUNTIME_SHA="$(RUNTIME_SHA)" \
 	FEAT126_S10B_INFRA_SHA="$(INFRA_SHA)" \
 		"$$NODE_PATH" scripts/feat-126-s10b-orchestrator.mjs --r8 "$(RUN_ID)"
+
+feat-126-s10b-r8-rehearsal:
+	node --test tests/feat-126-s10b-r8-convergence.test.mjs
 
 lint:
 	./scripts/plan.sh

@@ -21,6 +21,7 @@ const DATASET_SHA = "a".repeat(64);
 const COMPLETED = [
   "authority",
   "ports",
+  "host_runtime_artifact",
   "secret_init",
   "compose",
   "images",
@@ -70,6 +71,15 @@ function summaryFor(runId, apiBinarySha256, overrides = {}) {
     run_id: runId,
     repositories: REPOSITORIES,
     api_binary_sha256: apiBinarySha256,
+    host_runtime_artifact_gate: {
+      schema_version: 1,
+      status: "passed",
+      verifier: "host-runtime-healthcheck-artifact-only",
+      host_repository_sha: REPOSITORIES.host,
+      runtime_repository_sha: REPOSITORIES.runtime,
+      runtime_binary_sha256: "b".repeat(64),
+      runtime_manifest_sha256: "c".repeat(64),
+    },
     api_runtime_authority: FEAT_126_S10_API_RUNTIME_AUTHORITY,
     fake_readiness: {
       schema_version: 1,

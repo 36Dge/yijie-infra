@@ -77,7 +77,7 @@ const environment = Object.fromEntries(
   Object.entries(repositories).map(([role, sha]) => [`FEAT126_S10B_${role.toUpperCase()}_SHA`, sha]),
 );
 const completed = Object.freeze([
-  "authority", "ports", "secret_init", "compose", "images", "dependencies",
+  "authority", "ports", "host_runtime_artifact", "secret_init", "compose", "images", "dependencies",
   "tls_oidc", "identity", "migration", "bootstrap", "api_binary", "host_binary",
   "fake_binary", "probe_binary", "api_health", "api_readiness",
   "host_owned_fake_authority", "fake_readiness", "content_free_logs",
@@ -91,6 +91,15 @@ function summary() {
     run_id: runId,
     repositories,
     api_binary_sha256: "a".repeat(64),
+    host_runtime_artifact_gate: {
+      schema_version: 1,
+      status: "passed",
+      verifier: "host-runtime-healthcheck-artifact-only",
+      host_repository_sha: repositories.host,
+      runtime_repository_sha: repositories.runtime,
+      runtime_binary_sha256: "c".repeat(64),
+      runtime_manifest_sha256: "d".repeat(64),
+    },
     api_runtime_authority: FEAT_126_S10_API_RUNTIME_AUTHORITY,
     fake_readiness: {
       schema_version: 1,
@@ -1369,7 +1378,7 @@ test("S10BO2-013 scans all evidence roots and fails closed when a root is missin
   );
   await chmod(safeAuthorityFixture, 0o600);
   const clean = await scanNoLog(context);
-  assert.equal(clean.file_count, 9);
+  assert.equal(clean.file_count, 10);
   assert.equal(clean.hit_count, 0);
   await unlink(runtimeLogDatabase);
   createRuntimeLogDatabase(runtimeLogDatabase, { autoIncrement: false });
@@ -1665,6 +1674,8 @@ test("S10BO2-014 source uses direct feature Desktop with FD3/FD4 and keeps busin
     caPath: "/tmp/feat126-ca.pem",
     caSha256: "a".repeat(64),
   });
+  assert.equal(projected.YIJIE_FEAT126_S10_RUN_ID, runId);
+  assert.equal(projected.YIJIE_FEAT126_S10_DRIVER_NONCE, nonce);
   assert.equal(projected.YIJIE_FEAT126_S10_SECURE_STORAGE_ENABLED, "false");
   assert.equal(projected.YIJIE_FEAT126_S10_EPHEMERAL_SECRET_BACKEND_ENABLED, "true");
 });

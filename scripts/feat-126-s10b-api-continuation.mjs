@@ -13,7 +13,11 @@ import {
 } from "./feat-126-s10-api-runtime-profile.mjs";
 import { inspectApiBinary, sameApiBinarySnapshot } from "./feat-126-s10-api-binary.mjs";
 import { parseFeat126S10Secrets } from "./feat-126-s10-secrets.mjs";
-import { readExpectedSHAs, validateProbeResult } from "./feat-126-s10b-preflight.mjs";
+import {
+  readExpectedSHAs,
+  validateHostRuntimeArtifactGateEvidence,
+  validateProbeResult,
+} from "./feat-126-s10b-preflight.mjs";
 
 const INFRA_ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -23,6 +27,7 @@ const SUMMARY_KEYS = Object.freeze([
   "cleanup",
   "completed",
   "fake_readiness",
+  "host_runtime_artifact_gate",
   "repositories",
   "run_id",
   "s10b_r5_executed",
@@ -42,6 +47,7 @@ const REPOSITORY_KEYS = Object.freeze([
 const REQUIRED_COMPLETED = Object.freeze([
   "authority",
   "ports",
+  "host_runtime_artifact",
   "secret_init",
   "compose",
   "images",
@@ -186,6 +192,10 @@ export function validateContinuationSummary(summary, runId, expectedRepositories
   }
   try {
     validateProbeResult(summary.fake_readiness, runId);
+    validateHostRuntimeArtifactGateEvidence(
+      summary.host_runtime_artifact_gate,
+      expectedRepositories,
+    );
     return Object.freeze({
       authority: readApiRuntimeAuthorityFromPreflightSummary(summary, runId),
       apiBinarySha256: summary.api_binary_sha256,

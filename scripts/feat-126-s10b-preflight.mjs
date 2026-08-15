@@ -73,6 +73,15 @@ const PROBE_KEYS = Object.freeze([
   "schema_version",
   "status",
 ]);
+const HOST_RUNTIME_ARTIFACT_GATE_KEYS = Object.freeze([
+  "host_repository_sha",
+  "runtime_binary_sha256",
+  "runtime_manifest_sha256",
+  "runtime_repository_sha",
+  "schema_version",
+  "status",
+  "verifier",
+]);
 const PREFLIGHT_FAILURE_KEYS = Object.freeze([
   "cleanup_state",
   "compose_attempted",
@@ -172,6 +181,34 @@ export function validateProbeResult(value, runId) {
     fail("fake_readiness_authority_invalid");
   }
   return Object.freeze({ ...value });
+}
+
+export function validateHostRuntimeArtifactGateEvidence(value, repositories) {
+  if (
+    value === null || Array.isArray(value) || typeof value !== "object" ||
+    JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(HOST_RUNTIME_ARTIFACT_GATE_KEYS) ||
+    value.schema_version !== 1 || value.status !== "passed" ||
+    value.verifier !== "host-runtime-healthcheck-artifact-only" ||
+    value.host_repository_sha !== repositories?.host ||
+    value.runtime_repository_sha !== repositories?.runtime ||
+    !FULL_SHA_PATTERN.test(value.host_repository_sha ?? "") ||
+    !FULL_SHA_PATTERN.test(value.runtime_repository_sha ?? "") ||
+    !DIGEST_PATTERN.test(value.runtime_binary_sha256 ?? "") ||
+    !DIGEST_PATTERN.test(value.runtime_manifest_sha256 ?? "")
+  ) fail("preflight_host_runtime_artifact_evidence_invalid");
+  return Object.freeze({ ...value });
+}
+
+export function buildHostRuntimeArtifactGateEvidence(repositories, digests) {
+  return validateHostRuntimeArtifactGateEvidence({
+    schema_version: 1,
+    status: "passed",
+    verifier: "host-runtime-healthcheck-artifact-only",
+    host_repository_sha: repositories?.host,
+    runtime_repository_sha: repositories?.runtime,
+    runtime_binary_sha256: digests?.runtimeBinarySha256,
+    runtime_manifest_sha256: digests?.runtimeManifestSha256,
+  }, repositories);
 }
 
 export function readExpectedSHAs(environment = process.env) {
@@ -558,6 +595,81 @@ export function attemptPrevalidatedDependencyStart(state, start) {
   return start();
 }
 
+export function buildHostRuntimeArtifactCheckPlan() {
+  return Object.freeze({
+    command: "go",
+    arguments_: Object.freeze([
+      "run",
+      "./cmd/runtime-healthcheck",
+      "--artifact-only",
+      resolve(REPOSITORIES.runtime, ".yijie/build/macos/aarch64-apple-darwin/codex"),
+      resolve(
+        REPOSITORIES.runtime,
+        ".yijie/build/macos/aarch64-apple-darwin/runtime-manifest.json",
+      ),
+    ]),
+    cwd: REPOSITORIES.host,
+  });
+}
+
+async function hashArtifact(path) {
+  let handle;
+  try {
+    handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const metadata = await handle.stat();
+    if (
+      !metadata.isFile() || metadata.isSymbolicLink() || metadata.uid !== process.getuid() ||
+      metadata.size <= 0 || (await realpath(path)) !== path
+    ) fail("preflight_host_runtime_artifact_failed");
+    const digest = createHash("sha256");
+    for await (const chunk of handle.createReadStream({ autoClose: false })) digest.update(chunk);
+    return digest.digest("hex");
+  } catch {
+    fail("preflight_host_runtime_artifact_failed");
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+export async function verifyHostRuntimeArtifactOnly(
+  repositories,
+  runner = runCommand,
+  hasher = hashArtifact,
+) {
+  const plan = buildHostRuntimeArtifactCheckPlan();
+  let before;
+  try {
+    before = Object.freeze({
+      runtimeBinarySha256: await hasher(plan.arguments_[3]),
+      runtimeManifestSha256: await hasher(plan.arguments_[4]),
+    });
+  } catch {
+    fail("preflight_host_runtime_artifact_failed");
+  }
+  try {
+    runner("host_runtime_artifact", plan.command, plan.arguments_, {
+      cwd: plan.cwd,
+      env: commandEnvironment({ GOPROXY: "off" }),
+    });
+  } catch {
+    fail("preflight_host_runtime_artifact_failed");
+  }
+  try {
+    const after = Object.freeze({
+      runtimeBinarySha256: await hasher(plan.arguments_[3]),
+      runtimeManifestSha256: await hasher(plan.arguments_[4]),
+    });
+    if (
+      before.runtimeBinarySha256 !== after.runtimeBinarySha256 ||
+      before.runtimeManifestSha256 !== after.runtimeManifestSha256
+    ) fail("preflight_host_runtime_artifact_failed");
+    return buildHostRuntimeArtifactGateEvidence(repositories, after);
+  } catch (error) {
+    if (error instanceof S10BPreflightError) throw error;
+    fail("preflight_host_runtime_artifact_failed");
+  }
+}
+
 async function execute(runId, expectedSHAs) {
   if (!RUN_ID_PATTERN.test(runId ?? "")) fail("preflight_run_id_invalid");
   let apiRuntimeAuthority;
@@ -585,6 +697,7 @@ async function execute(runId, expectedSHAs) {
   let phase = "authority";
   let cleanupState = "not_applicable";
   const completed = [];
+  let hostRuntimeArtifactGate;
 
   try {
     try {
@@ -593,6 +706,7 @@ async function execute(runId, expectedSHAs) {
     } catch (error) {
       if (error instanceof S10BPreflightError || error?.code !== "ENOENT") throw error;
     }
+    hostRuntimeArtifactGate = await verifyHostRuntimeArtifactOnly(expectedSHAs);
     runCommand("secret_init", "make", ["feat-126-s10-init-secrets", `RUN_ID=${runId}`]);
     const runRootMetadata = await lstat(runRoot);
     if (
@@ -609,7 +723,7 @@ async function execute(runId, expectedSHAs) {
     await mkdir(binRoot, { mode: 0o700 });
     await mkdir(logRoot, { mode: 0o700 });
     await mkdir(evidenceRoot, { mode: 0o700 });
-    completed.push("authority", "ports", "secret_init");
+    completed.push("authority", "ports", "host_runtime_artifact", "secret_init");
 
     phase = "compose_config";
     runCommand("compose_config", "make", ["feat-126-s10-config", `RUN_ID=${runId}`]);
@@ -762,6 +876,7 @@ async function execute(runId, expectedSHAs) {
       readiness,
       apiRuntimeAuthority,
       apiBinarySha256: launchBinarySnapshot.sha256,
+      hostRuntimeArtifactGate,
       completed,
       runRoot,
       logRoot,
@@ -850,6 +965,7 @@ async function main() {
     run_id: runId,
     repositories: expectedSHAs,
     api_binary_sha256: result.apiBinarySha256,
+    host_runtime_artifact_gate: result.hostRuntimeArtifactGate,
     api_runtime_authority: result.apiRuntimeAuthority,
     fake_readiness: result.readiness,
     completed: result.completed,
