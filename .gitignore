@@ -8,3 +8,6 @@ environments/nonproduction/feat-125.local.yaml
 environments/local/feat-125.secrets.env
 environments/local/feat-125.local-lab.yaml
 environments/local/generated/
+
+# Python lifecycle controller cache
+__pycache__/

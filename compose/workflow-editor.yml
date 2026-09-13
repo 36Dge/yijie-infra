@@ -1,0 +1,15 @@
+# FEAT-153 opt-in static editor. The controller adds this file only after a
+# normally stopped, canonical bundle registration; the six-service base is unchanged.
+services:
+  workflow-api:
+    environment:
+      YIJIE_WORKFLOW_EDITOR_ENABLED: "true"
+      YIJIE_WORKFLOW_EDITOR_BUNDLE_DIR: /opt/yijie/workflow-editor
+      YIJIE_WORKFLOW_EDITOR_MANIFEST_SHA256: ${WORKFLOW_EDITOR_MANIFEST_SHA256:?registered editor required}
+    volumes:
+      - type: bind
+        source: ${WORKFLOW_EDITOR_BUNDLE:?registered editor required}
+        target: /opt/yijie/workflow-editor
+        read_only: true
+        bind:
+          create_host_path: false

@@ -152,3 +152,14 @@ make rollback   # 当前只停止本地 Compose，不是数据回滚
 - `make lint`、`make test` 及与改动相关的运行验证通过；
 - 部署、回滚和 readiness 没有被占位脚本或单一退出码夸大；
 - 未配置的云、备份、观测、生产安全和恢复能力被如实说明。
+
+## FEAT-153 opt-in workflow local 栈
+
+已批准需求 FEAT-153 第4步增加 `compose/workflow-local.yml` 和专用 `yijie-feat153-workflow` project；它不替代旧默认 Compose。只运行 PostgreSQL、MySQL、Redis、MinIO、Coze 私有 workflow 入口和 API，唯一 host 端口为 `127.0.0.1:18888`；镜像来源、版本、digest 以 `config/workflow-local/images.lock.json` 为准。应用 schema/migration 仍由服务仓持有。
+
+生命周期唯一入口为 `make workflow-init/workflow-build/workflow-up/workflow-status/workflow-stop`。配置与机密在 ignored `environments/local/generated/feat-153`，现有数据集不可隐式重置。up 显式执行服务 migration 后等待真实带凭据 readiness；API、Coze、依赖按顺序 SIGTERM、无限 grace 正常停止，观察超时返回 STOP_PENDING，不强杀或删卷。Coze 同源专用入口复用真实领域和持久库，只初始化本期实际需要的 Redis/MinIO/MySQL；不启用知识库、搜索、MQ、模型或商家调用。
+
+本需求静态与安全正常测试入口为 `make workflow-check`；实库验证使用正常 HTTP 合成流程和 `make workflow-qualify-pg EVIDENCE=<该流程证据绝对路径>`，后者仅在私有网络运行精确构建的测试镜像。用户长期安全条款优先于历史 `make test` 要求：含攻击 fixture、权限破坏、强杀或二进制替换的旧测试不得执行，须记录跳过与影响，不伪报全仓通过。
+
+
+第4步真实运行纠正：Docker29在API仅连接internal网络时没有实际发布host端口（容器内ready不足以证明可用）。因此API同时连接独立project的workflow-edge桥，仅发布127.0.0.1:18888；其余Coze/数据库/Redis/MinIO与测试runner仅internal。API无通用外部代理或provider入口，所有当前业务请求固定私有Coze地址。不得把API边缘桥描述为物理禁止任何出站的网络。ready还需从宿主以K_NA确认真实API状态，且其他容器均healthy。

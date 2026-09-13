@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "feature": "FEAT-153",
+  "images": {
+    "go": {
+      "reference": "golang:1.26.5-bookworm@sha256:53eeac89074db483fdf0ab3be1df32bf6e47562263d2d0d6baa7f26acb4957dd",
+      "image_id": "sha256:53eeac89074db483fdf0ab3be1df32bf6e47562263d2d0d6baa7f26acb4957dd",
+      "architecture": "arm64",
+      "os": "linux"
+    },
+    "postgres": {
+      "reference": "postgres:16.13-alpine@sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50",
+      "image_id": "sha256:4e6e670bb069649261c9c18031f0aded7bb249a5b6664ddec29c013a89310d50",
+      "architecture": "arm64",
+      "os": "linux"
+    },
+    "mysql": {
+      "reference": "mysql:8.4.5@sha256:679e7e924f38a3cbb62a3d7df32924b83f7321a602d3f9f967c01b3df18495d6",
+      "image_id": "sha256:679e7e924f38a3cbb62a3d7df32924b83f7321a602d3f9f967c01b3df18495d6",
+      "architecture": "arm64",
+      "os": "linux"
+    },
+    "redis": {
+      "reference": "redis:8.0.3-alpine@sha256:25c0ae32c6c2301798579f5944af53729766a18eff5660bbef196fc2e6214a9c",
+      "image_id": "sha256:25c0ae32c6c2301798579f5944af53729766a18eff5660bbef196fc2e6214a9c",
+      "architecture": "arm64",
+      "os": "linux"
+    },
+    "minio": {
+      "reference": "quay.io/minio/minio:RELEASE.2025-06-13T11-33-47Z@sha256:064117214caceaa8d8a90ef7caa58f2b2aeb316b5156afe9ee8da5b4d83e12c8",
+      "image_id": "sha256:064117214caceaa8d8a90ef7caa58f2b2aeb316b5156afe9ee8da5b4d83e12c8",
+      "architecture": "arm64",
+      "os": "linux"
+    }
+  },
+  "source_notes": {
+    "mysql": "Pinned Coze upstream docker/docker-compose.yml 8.4.5",
+    "redis": "Official 8.0 patch family replacing legacy/privileged upstream packaging; normal client compatibility verified at runtime",
+    "postgres": "Existing official dedicated 16.13 image; separate volume/database",
+    "minio": "Vendor Quay image and same upstream release; https://min.io/docs/minio/container/operations/install-deploy-manage/deploy-minio-single-node-multi-drive.html",
+    "go": "Go module minimum1.26.5 and actual registry pull digest"
+  }
+}

@@ -1,0 +1,171 @@
+name: yijie-feat153-workflow
+x-owned: &owned
+  restart: "no"
+  stop_signal: SIGTERM
+  labels:
+    ai.yijie.feature: FEAT-153
+    ai.yijie.dataset: workflow-local-v1
+    ai.yijie.run-epoch: ${WORKFLOW_EPOCH:?required}
+  networks: [workflow-private]
+  security_opt: [no-new-privileges:true]
+
+services:
+  workflow-postgres:
+    <<: *owned
+    image: ${POSTGRES_IMAGE:?verified image required}
+    environment:
+      POSTGRES_DB: yijie_workflow_local
+      POSTGRES_USER: workflow
+      POSTGRES_PASSWORD_FILE: /run/private/postgres-password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ${WORKFLOW_PRIVATE:?required}/postgres-password:/run/private/postgres-password:ro
+    healthcheck:
+      test: [CMD, pg_isready, -h, 127.0.0.1, -U, workflow, -d, yijie_workflow_local]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    mem_limit: 1g
+
+  coze-workflow-mysql:
+    <<: *owned
+    image: ${MYSQL_IMAGE:?verified image required}
+    environment:
+      MYSQL_DATABASE: coze_workflow_local
+      MYSQL_USER: workflow
+      MYSQL_ROOT_PASSWORD_FILE: /run/private/mysql-root-password
+      MYSQL_PASSWORD_FILE: /run/private/mysql-password
+    command: [mysqld, --character-set-server=utf8mb4, --collation-server=utf8mb4_unicode_ci]
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ${WORKFLOW_PRIVATE:?required}/mysql-root-password:/run/private/mysql-root-password:ro
+      - ${WORKFLOW_PRIVATE:?required}/mysql-password:/run/private/mysql-password:ro
+      - ${WORKFLOW_GENERATED:?required}/upstream-schema.sql:/docker-entrypoint-initdb.d/001-upstream.sql:ro
+    healthcheck:
+      test: [CMD, mysqladmin, ping, -h, 127.0.0.1, --protocol=TCP, --silent]
+      interval: 3s
+      timeout: 3s
+      retries: 50
+      start_period: 30s
+    mem_limit: 2g
+
+  coze-workflow-redis:
+    <<: *owned
+    image: ${REDIS_IMAGE:?verified image required}
+    user: "0:0"
+    entrypoint: [redis-server]
+    command: [/run/private/redis.conf]
+    cap_drop: [ALL]
+    cap_add: [DAC_OVERRIDE]
+    volumes:
+      - redis-data:/data
+      - ${WORKFLOW_PRIVATE:?required}/redis.conf:/run/private/redis.conf:ro
+      - ${WORKFLOW_PRIVATE:?required}/redis-password:/run/private/redis-password:ro
+    healthcheck:
+      test: [CMD-SHELL, 'REDISCLI_AUTH="$$(cat /run/private/redis-password)" redis-cli ping | grep -qx PONG']
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    mem_limit: 512m
+
+  coze-workflow-minio:
+    <<: *owned
+    image: ${MINIO_IMAGE:?verified image required}
+    environment:
+      MINIO_ROOT_USER_FILE: /run/private/minio-access
+      MINIO_ROOT_PASSWORD_FILE: /run/private/minio-secret
+    command: [server, /data, --address, ':9000']
+    volumes:
+      - minio-data:/data
+      - ${WORKFLOW_PRIVATE:?required}/minio-access:/run/private/minio-access:ro
+      - ${WORKFLOW_PRIVATE:?required}/minio-secret:/run/private/minio-secret:ro
+    healthcheck:
+      test: [CMD, curl, --max-time, "2", -f, http://localhost:9000/minio/health/live]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    mem_limit: 1g
+
+  coze-workflow:
+    <<: *owned
+    image: ${COZE_IMAGE:?local verified build required}
+    user: ${WORKFLOW_UID:?required}:${WORKFLOW_GID:?required}
+    read_only: true
+    cap_drop: [ALL]
+    tmpfs: ['/tmp:rw,noexec,nosuid,size=64m']
+    environment:
+      YIJIE_ENV: local
+      YIJIE_LOCAL_PROFILE: demo_fast
+      YIJIE_WORKFLOW_ENABLED: 'true'
+      YIJIE_WORKFLOW_NETWORK_SCOPE: container
+      YIJIE_WORKFLOW_COZE_LISTEN_ADDR: 0.0.0.0:18889
+      YIJIE_WORKFLOW_COZE_CREDENTIAL_FILE: /run/workflow-private/k-ac.json
+      YIJIE_WORKFLOW_MYSQL_DSN_FILE: /run/workflow-private/mysql-dsn
+      YIJIE_WORKFLOW_REDIS_PASSWORD_FILE: /run/workflow-private/redis-password
+      YIJIE_WORKFLOW_MINIO_ACCESS_FILE: /run/workflow-private/minio-access
+      YIJIE_WORKFLOW_MINIO_SECRET_FILE: /run/workflow-private/minio-secret
+      REDIS_ADDR: coze-workflow-redis:6379
+      MINIO_ENDPOINT: coze-workflow-minio:9000
+      STORAGE_BUCKET: coze-workflow-local
+    volumes:
+      - ${WORKFLOW_PRIVATE:?required}/k-ac.json:/run/workflow-private/k-ac.json:ro
+      - ${WORKFLOW_PRIVATE:?required}/mysql-dsn:/run/workflow-private/mysql-dsn:ro
+      - ${WORKFLOW_PRIVATE:?required}/redis-password:/run/workflow-private/redis-password:ro
+      - ${WORKFLOW_PRIVATE:?required}/minio-access:/run/workflow-private/minio-access:ro
+      - ${WORKFLOW_PRIVATE:?required}/minio-secret:/run/workflow-private/minio-secret:ro
+    depends_on:
+      coze-workflow-mysql: {condition: service_healthy}
+      coze-workflow-redis: {condition: service_healthy}
+      coze-workflow-minio: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, /workflow-local-server, -check-ready]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+    mem_limit: 2g
+
+  workflow-api:
+    <<: *owned
+    networks: [workflow-private, workflow-edge]
+    image: ${API_IMAGE:?local verified build required}
+    user: ${WORKFLOW_UID:?required}:${WORKFLOW_GID:?required}
+    read_only: true
+    cap_drop: [ALL]
+    tmpfs: ['/tmp:rw,noexec,nosuid,size=32m']
+    environment:
+      YIJIE_ENV: local
+      YIJIE_LOCAL_PROFILE: demo_fast
+      YIJIE_WORKFLOW_ENABLED: 'true'
+      YIJIE_API_SERVICE_PROFILE: feat-153-workflow-local
+      YIJIE_WORKFLOW_NETWORK_SCOPE: container
+      YIJIE_WORKFLOW_CREDENTIAL_FILE: /run/workflow-private/k-na.json
+      YIJIE_WORKFLOW_COZE_CREDENTIAL_FILE: /run/workflow-private/k-ac.json
+      YIJIE_WORKFLOW_POSTGRES_DSN_FILE: /run/workflow-private/postgres-dsn
+      YIJIE_WORKFLOW_COZE_URL: http://coze-workflow:18889
+    volumes:
+      - ${WORKFLOW_PRIVATE:?required}/k-na.json:/run/workflow-private/k-na.json:ro
+      - ${WORKFLOW_PRIVATE:?required}/k-ac.json:/run/workflow-private/k-ac.json:ro
+      - ${WORKFLOW_PRIVATE:?required}/postgres-dsn:/run/workflow-private/postgres-dsn:ro
+    ports: ['127.0.0.1:18888:18888']
+    depends_on:
+      workflow-postgres: {condition: service_healthy}
+      coze-workflow: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, /usr/local/bin/workflow-local-server, --check-ready]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+    mem_limit: 512m
+
+networks:
+  workflow-private:
+    internal: true
+  workflow-edge:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.host_binding_ipv4: 127.0.0.1
+volumes:
+  postgres-data:
+  mysql-data:
+  redis-data:
+  minio-data:

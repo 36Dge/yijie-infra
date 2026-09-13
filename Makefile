@@ -239,3 +239,24 @@ deploy:
 
 rollback:
 	./scripts/rollback.sh
+
+# FEAT-153 is opt-in and uses its own project, credentials and persistent volumes.
+.PHONY: workflow-check workflow-init workflow-editor workflow-build workflow-up workflow-status workflow-stop workflow-qualify-pg
+workflow-check:
+	node scripts/workflow-local-model.mjs
+	node --test tests/workflow-local.test.mjs
+workflow-init:
+	python3 scripts/workflow-local.py init
+workflow-editor:
+	python3 scripts/workflow-local.py editor
+workflow-build:
+	python3 scripts/workflow-local.py build
+workflow-up:
+	python3 scripts/workflow-local.py up
+workflow-status:
+	python3 scripts/workflow-local.py status
+workflow-stop:
+	python3 scripts/workflow-local.py stop
+workflow-qualify-pg:
+	@test -n "$(EVIDENCE)" || (echo "EVIDENCE is required" >&2; exit 2)
+	python3 scripts/workflow-local.py qualify-pg --evidence "$(EVIDENCE)"

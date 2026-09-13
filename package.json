@@ -15,7 +15,9 @@
     "validate:feat-125-local-template": "node scripts/validate-feat-125-local.mjs --mode template environments/local/feat-125.local-lab.template.yaml",
     "validate:feat-125-template": "node scripts/validate-feat-125-nonprod.mjs --mode template environments/nonproduction/feat-125.template.yaml",
     "validate:feat-126-s10": "node scripts/validate-feat-126-s10.mjs",
-    "test": "node --test tests/*.test.mjs"
+    "test": "node --test tests/*.test.mjs",
+    "validate:workflow": "node scripts/workflow-local-model.mjs",
+    "test:workflow": "node --test tests/workflow-local.test.mjs"
   },
   "devDependencies": {
     "yaml": "2.9.0"
