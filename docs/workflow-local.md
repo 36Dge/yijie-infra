@@ -36,7 +36,7 @@ PG验证容器只连本内部网络，使用构建时固定的依赖缓存和真
 
 状态、精确container ID、epoch、镜像、私文件和本地日志位于 `environments/local/generated/feat-153/`，全部ignored。正常停止依次API→Coze→依赖，SIGTERM并无限grace；观察超过20秒返回STOP_PENDING，保留依赖和状态。不要用默认有限Docker stop、Ctrl-C转发、强杀或删除volume绕过。再次up仅移除已记录且正常停止的自有容器，不删除volume；重建服务容器时更换epoch/K_NA/K_AC，数据库密码与持久数据保留。
 
-不支持自动清理、故障恢复、生产多租户、在途任务重启或向下migration。未知容器、镜像/源码变动、端口冲突均停止后续动作并保留事实；不领用其他项目。私日志需脱敏后才可复制进需求证据。默认历史故障/攻击测试按用户长期安全条款跳过，不能称全仓测试通过。
+不支持自动清理、自动故障恢复、生产多租户、在途任务重启或向下migration。用户明确批准的同数据集受控恢复见 [workflow-local-recovery.md](workflow-local-recovery.md)，普通启停门禁保持。未知容器、镜像/源码变动、端口冲突均停止后续动作并保留事实；不领用其他项目。私日志需脱敏后才可复制进需求证据。默认历史故障/攻击测试按用户长期安全条款跳过，不能称全仓测试通过。
 
 
 第4步真实运行纠正：Docker29在API仅连接internal网络时没有实际发布host端口（容器内ready不足以证明可用）。因此API同时连接独立project的workflow-edge桥，仅发布127.0.0.1:18888；其余Coze/数据库/Redis/MinIO与测试runner仅internal。API无通用外部代理或provider入口，所有当前业务请求固定私有Coze地址。不得把API边缘桥描述为物理禁止任何出站的网络。ready还需从宿主以K_NA确认真实API状态，且其他容器均healthy。

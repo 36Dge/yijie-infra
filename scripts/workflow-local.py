@@ -577,9 +577,13 @@ def stop():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['init', 'editor', 'build', 'up', 'status', 'stop', 'qualify-pg'])
+    parser.add_argument('action', choices=['init', 'editor', 'build', 'up', 'status', 'stop', 'qualify-pg', 'recovery-plan', 'recover', 'recovery-revise'])
     parser.add_argument('--evidence', help='absolute completed normal HTTP qualification artifact; only for qualify-pg')
+    parser.add_argument('--source-sha256', help='reviewed source manifest digest, only for recovery-revise')
+    parser.add_argument('--recovery-id', help='exact UUID printed by recovery-plan')
     args = parser.parse_args()
+    require(bool(args.recovery_id) == (args.action in ['recover', 'recovery-revise']), '--recovery-id is required only for recover/recovery-revise')
+    require(bool(args.source_sha256) == (args.action == 'recovery-revise'), '--source-sha256 is required only for recovery-revise')
     require(Path(DOCKER).is_file() and Path(COMPOSE).is_file(), 'Original Docker Desktop tools were not found in either Applications location')
     require(bool(args.evidence) == (args.action == 'qualify-pg'), '--evidence is required only for qualify-pg')
     GENERATED.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -589,7 +593,17 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise WorkflowError('Another workflow lifecycle command is active')
-        if args.action == 'qualify-pg':
+        if STATE.exists() and read_state().get('recovery_active'):
+            require(args.action in ['status', 'recover', 'recovery-revise'], 'Recovery is active; use its exact recover command, other lifecycle actions remain blocked')
+        if args.action in ['recovery-plan', 'recover', 'recovery-revise']:
+            import workflow_recovery
+            if args.action == 'recovery-plan':
+                workflow_recovery.plan(sys.modules[__name__])
+            elif args.action == 'recovery-revise':
+                workflow_recovery.revise(sys.modules[__name__], args.recovery_id, args.source_sha256)
+            else:
+                workflow_recovery.recover(sys.modules[__name__], args.recovery_id)
+        elif args.action == 'qualify-pg':
             qualify_pg(args.evidence)
         else:
             globals()[args.action]()

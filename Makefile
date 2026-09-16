@@ -260,3 +260,17 @@ workflow-stop:
 workflow-qualify-pg:
 	@test -n "$(EVIDENCE)" || (echo "EVIDENCE is required" >&2; exit 2)
 	python3 scripts/workflow-local.py qualify-pg --evidence "$(EVIDENCE)"
+
+.PHONY: workflow-recovery-plan workflow-recover workflow-recovery-check
+workflow-recovery-plan:
+	python3 scripts/workflow-local.py recovery-plan
+workflow-recover:
+	@test -n "$(RECOVERY_ID)" || (echo "RECOVERY_ID is required" >&2; exit 2)
+	python3 scripts/workflow-local.py recover --recovery-id "$(RECOVERY_ID)"
+workflow-recovery-check:
+	python3 -m unittest discover -s tests -p workflow_recovery_test.py
+
+.PHONY: workflow-recovery-revise
+workflow-recovery-revise:
+	@test -n "$(RECOVERY_ID)" && test -n "$(SOURCE_SHA256)"
+	python3 scripts/workflow-local.py recovery-revise --recovery-id "$(RECOVERY_ID)" --source-sha256 "$(SOURCE_SHA256)"
