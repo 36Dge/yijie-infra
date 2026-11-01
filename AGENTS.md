@@ -1,5 +1,11 @@
 # AGENTS.md
 
+2026-10-31 用户追加批准的日常开发入口：Desktop 的“易界.app”可调用
+`scripts/workflow-session.py ensure/stop` 自动启动和正常停止原工作流服务。
+此私有部署接口复用 controller 锁、原容器身份和服务仓只读存储核验，不创建数据副本、
+不重放任务、不迁移、不重建容器。原始退出码保持；真实异常保留并报告。
+边界见 `docs/workflow-desktop-session.md`，旧显式事故恢复流程及保护副本规则保持不变。
+
 ## 适用范围
 
 本文件适用于 `yijie-infra` 整个仓库。环境或部署目录中若出现更具体的 `AGENTS.md`，修改对应目录时以更具体的规则为准。
