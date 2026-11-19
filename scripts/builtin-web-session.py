@@ -107,16 +107,21 @@ def ready():
     except (OSError,ValueError,RuntimeError):return False
 def ensure():
     require((STATE/'native.json').is_file(),'本机网页服务尚未 prepare；普通启动不会隐式迁移数据库。')
-    require(postgres()==6,'本机 API schema 尚未迁移到 6；请执行显式 prepare。')
+    require(postgres()==8,'本机 API schema 尚未迁移到 8；请执行显式 prepare。')
     build();state=owned();running=active(state)
-    if len(running)==2 and ready():print('BUILTIN_WEB_READY');return
+    worker=json.loads((CONNECTORS/'bin/market-worker/current.json').read_text())['sha256']
+    if len(running)==2 and ready():
+        require(state['web-executor'].get('worker_sha256')==worker,'运行中的网页执行器使用旧版 worker，请通过易界正常退出后启动。')
+        print('BUILTIN_WEB_READY');return
     require(not running,'本机网页服务尚未正常结束；不会覆盖或重放。')
     api,executor=configuration()
     for name,env in [('web-executor',executor),('web-local-server',api)]:
         log=os.open(STATE/(name+'.log'),os.O_WRONLY|os.O_CREAT|os.O_APPEND|os.O_NOFOLLOW,0o600)
         process=subprocess.Popen([str(STATE/'bin'/name)],env=env,stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=True);os.close(log)
         observed=identity(process.pid);require(observed is not None,'服务启动未完成，请查看受管日志。')
-        state[name]={'pid':process.pid,'identity':observed};write(RECORD,json.dumps(state))
+        state[name]={'pid':process.pid,'identity':observed}
+        if name=='web-executor':state[name]['worker_sha256']=worker
+        write(RECORD,json.dumps(state))
     deadline=time.monotonic()+20
     while time.monotonic()<deadline:
         if ready():print('BUILTIN_WEB_READY');return
