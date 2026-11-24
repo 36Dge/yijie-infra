@@ -107,7 +107,7 @@ def ready():
     except (OSError,ValueError,RuntimeError):return False
 def ensure():
     require((STATE/'native.json').is_file(),'本机网页服务尚未 prepare；普通启动不会隐式迁移数据库。')
-    require(postgres()==8,'本机 API schema 尚未迁移到 8；请执行显式 prepare。')
+    require(postgres()==9,'本机 API schema 尚未迁移到 9；请执行显式 prepare。')
     build();state=owned();running=active(state)
     worker=json.loads((CONNECTORS/'bin/market-worker/current.json').read_text())['sha256']
     if len(running)==2 and ready():
